@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/agent-lore/lithos-loom/blob/main/docs/result-schema.json",
+  "title": "lithos-loom plugin result.json",
+  "description": "Atomic JSON file every plugin writes on exit. See docs/prd/mvp.md US-3.",
+  "type": "object",
+  "required": ["schema_version", "task_id", "status", "exit_code"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Bumped on incompatible changes."
+    },
+    "task_id": {
+      "type": "string",
+      "description": "The Lithos task ID this run claimed."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["succeeded", "failed", "interrupted"]
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "Process exit code. 0=succeeded, 1=generic failure, 20=bad input/config (do not retry), 30=interrupted by signal."
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finished_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "worktree": {
+      "type": ["string", "null"],
+      "description": "Absolute path to the worktree the plugin used, or null if no worktree was created."
+    },
+    "artifacts": {
+      "type": "object",
+      "description": "Map of artifact key to path. Paths are relative to worktree when worktree is non-null, else absolute.",
+      "additionalProperties": {"type": "string"}
+    },
+    "commits": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+      "description": "Full SHAs of commits this run produced, in chronological order."
+    },
+    "spawned_tasks": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Lithos task IDs the plugin created (e.g. prd-decompose's child story tasks)."
+    },
+    "metadata_updates": {
+      "type": "object",
+      "description": "Patch applied to task.metadata via lithos_task_update on success.",
+      "additionalProperties": true
+    },
+    "error": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["category", "message"],
+          "additionalProperties": false,
+          "properties": {
+            "category": {
+              "type": "string",
+              "enum": ["config", "environment", "input", "agent", "git", "github", "lithos", "internal"]
+            },
+            "message": {"type": "string"},
+            "retriable": {"type": "boolean"}
+          }
+        }
+      ]
+    }
+  }
+}

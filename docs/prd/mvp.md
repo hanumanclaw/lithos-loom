@@ -42,7 +42,7 @@ Single workstation. Project-affinity in TOML config. No A2A, no SSE, no brain, n
 
 Vertical-slice, ordered by build sequence. Each is independently grabbable.
 
-1. As a developer, I want a uv-managed Python package skeleton with a `lithos-loom` console entry point, so that subsequent stories have a place to land code with a reproducible toolchain.
+1. As a developer, I want to bootstrap the repo from `~/projects/templates/python` (rename `influx` → `lithos-loom` / `lithos_loom`, set description, register the console entry point, **drop the `docker/` directory** because Loom runs on the host, retain `python-dotenv` for per-host config), so that subsequent stories inherit the standard uv + Python 3.12 + `src/` layout + ruff + pyright + pytest + Makefile + GitHub Actions CI scaffolding without rebuilding it by hand.
 2. As the daemon, I want a thin async client over Lithos's HTTP MCP surface covering tasks, knowledge writes/reads, findings, and agent registration, so that every other story interacts with Lithos through one tested module.
 3. As a plugin author, I want a single documented JSON schema and an atomic-write helper for `result.json`, so that the daemon can rely on never observing a partial result file.
 4. As an operator, I want a TOML config file with sections for orchestrator settings, project registry, and routes, so that machine-specific repo paths and Claude config dirs stay out of Lithos and out of project repos.
@@ -72,11 +72,17 @@ Vertical-slice, ordered by build sequence. Each is independently grabbable.
 28. As the operator, I want every meaningful state transition (task claimed, agent finished, PR opened, review pending, review merged, review rejected, blocker failed) to post a tagged Lithos finding with a stable prefix (e.g. `[Implemented]`, `[ReviewMerged]`), so that I can scan task history in lithos-lens and reconstruct what happened without reading subprocess logs.
 29. As the operator, I want the daemon to handle SIGTERM gracefully — finish in-flight plugins, release any newly-orphaned claims, then exit — so that I can restart the daemon during a long PRD run without losing work.
 30. As the operator, I want artifact upload from `result.json` to be additive: each artifact uploaded to Lithos has its `derived_from_ids` populated from the route's outputs config supporting interpolation of prior artifact doc IDs, so that provenance chains (story doc → ADR → run-log) are linked correctly.
+31. As the operator, I want per-task staging directories under `{loom.work_dir}/{task.id}/` to be auto-cleaned on successful completion and retained on failure (configurable via `orchestrator.retain_failed_workdirs`, default true), so that successful runs don't accumulate disk clutter while failed runs remain debuggable.
+32. As the operator, I want every Loom log line emitted in structured JSON with `task_id`, `route`, `agent_id`, `plugin`, `level`, and `event` fields, so that I can pipe logs to any aggregator and grep meaningfully across concurrent runs.
+33. As a plugin author, I want a versioned `result.schema.json` shipped at `docs/result-schema.json` and used by the plugin runner for validation, so that schema changes are tracked in git and external plugin authors have a checkable contract.
+34. As the operator, I want each route to declare a `max_runtime_seconds` (default 3600) and the daemon to send SIGTERM to a plugin that exceeds it, so that a runaway agent or wedged subprocess cannot consume resources indefinitely.
+35. As the operator, I want `lithos-loom doctor` (run on first boot) to verify the connected Lithos server supports the `task.metadata` field by writing a probe task with metadata and asserting it round-trips, so that incompatibility with an old Lithos surfaces immediately rather than failing mid-PRD.
 
 ## Implementation Decisions
 
 **Modules to build (deep modules where possible — testable in isolation, simple interfaces, rarely-changing):**
 
+- **Repo bootstrapping** — the scaffolding (pyproject.toml, Makefile, ruff/pyright config, src-layout, tests/conftest.py, Dockerfile, CI workflow) comes from `~/projects/templates/python`. Rename and minimal config edits only; do not re-derive these conventions.
 - **Lithos client** — async wrapper over the Lithos HTTP MCP surface. Surfaces `{status: "error", code, message}` envelopes as typed exceptions with the `code` preserved. This is a deep module: simple interface (one function per Lithos tool), encapsulates retries, error normalization, and JSON shape contracts. Will not change as plugins are added.
 - **Plugin runner** — invokes a plugin subprocess, validates the resulting `result.json` against the schema, returns a typed `PluginResult`. Owns the subprocess lifecycle (start, send SIGTERM on daemon shutdown, wait, parse). Deep module: invariant interface across all current and future plugins.
 - **Result-file IO** — atomic write helper (temp + fsync + rename), schema validator, parser. Deep module: trivial interface, encapsulates the atomicity contract that everything else depends on.
@@ -128,6 +134,10 @@ Vertical-slice, ordered by build sequence. Each is independently grabbable.
 - Multiple tasks may run concurrently if they belong to different projects or are explicitly `parallelizable`
 - Within a project, default is one in-flight task at a time (project-affinity = T3 from PLAN.md)
 - Configurable `orchestrator.max_concurrency` (default 4)
+
+**Lithos version pre-requisite:**
+
+- Loom requires a Lithos server with the `task.metadata` field on tasks (added in `agent-lore/lithos#215`). The daemon's `doctor` subcommand (US-35) probes this on first boot and refuses to run against an incompatible Lithos. Any earlier Lithos must be upgraded before Loom can run.
 
 ## Testing Decisions
 
@@ -191,3 +201,4 @@ The following are explicitly deferred to the full PRD (`docs/prd/full.md`) and m
 - **Why no `lithos-coding-mcp` in MVP** — pulling it in would couple the MVP to a separate uvx-installable package and require Claude config dir surgery. The MVP works without Claude knowing Lithos exists; story briefs are passed in the prompt. Adding `lithos-coding-mcp` later is a strict improvement.
 - **The 4-day target** assumes focused work and that the lithos-lens M1 PRD's own decomposability is reasonable. If the first decompose run produces obviously-bad story briefs, the MVP slips by ~1 day for prompt iteration on `prd_decompose/prompt.md`.
 - **Manual escape hatches** preserved throughout: any failed task can be hand-edited in Lithos, re-tagged, and re-claimed. This MVP is built to fail safely, not to be unfailable.
+- **Why Loom runs on the host, not in docker.** Lithos and Influx run as docker services because they are services — long-lived, stable protocols, no host filesystem coupling. Loom is different: it creates git worktrees the operator can `cd` into, invokes `claude` / `codex` / `gh` CLIs that authenticate against per-user dotfiles in `~/`, and spawns plugin subprocesses that need the same access. Containerizing Loom would require bind-mounting `~/.claude/`, `~/.codex/`, `~/.config/gh/`, every project repo's parent dir, and `/var/run/docker.sock` (so it could spawn the A10 sandbox containers) — at which point the container is a thin wrapper around "run on the host" with extra restart machinery. The MVP runs Loom manually via `uv run lithos-loom run` in a terminal or tmux. A systemd `--user` unit is a deferred polish item, not part of the MVP.

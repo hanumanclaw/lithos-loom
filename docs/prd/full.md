@@ -64,6 +64,10 @@ Ordered by ambitious-roadmap layer, build sequence within each layer.
 3. As an operator, I want a built-in `bash-runner` plugin that takes a shell command from the route TOML and wires its stdout/stderr/exit code into a `result.json`, so that I can express a one-off plugin entirely from config without writing Python.
 4. As an operator, I want `bash-runner` to support optional `outputs` declarations in the route — globbing files relative to the work-dir and uploading them to Lithos with configured tags and access scopes — so that simple file-producing plugins (e.g. data extraction scripts) need no code at all.
 5. As an operator, I want `lithos-loom validate-config` to typecheck the TOML against the route schema, surface unknown plugins, and list which interpolation variables a route uses, so that I find errors before running.
+5a. As an operator, I want `lithos-loom --dry-run` to poll for open tasks, evaluate route matching, render interpolated commands, and print a summary without claiming, executing, or writing anything to Lithos, so that I can validate a new route configuration against live task state before risking real runs.
+5b. As an operator, I want routes to support an optional `[routes.match.conditions]` block that gates matching on metadata predicates (e.g. `task.meta.prd_lines_lt = 500`), so that a single tag can fan out to different plugins based on task content without writing a brain plugin.
+5c. As a plugin, I want to optionally write a JSONL event stream at `{work_dir}/{task.id}/events.jsonl` with timestamped, ordered events (`step.started`, `step.finished`, `agent.turn`, `commit.detected`, `pr.opened`), so that lithos-lens (or any other observer) can subscribe to live progress instead of waiting for the final `result.json`.
+5d. As an operator, I want plugins to accept an optional `--idempotency-key` from the daemon (defaulting to `task.id`) and short-circuit with the prior `result.json` if a run with that key has already completed in the work-dir, so that duplicate triggers (manual re-run, A2A `run task` race with poller) do not produce duplicate side effects.
 
 ### A2 — `prd-generate` + `prd-review-agent` + `prd-review-human` (weeks 1–2)
 
@@ -95,6 +99,10 @@ Ordered by ambitious-roadmap layer, build sequence within each layer.
 25. As the operator, I want `story-implement` to inject `LITHOS_TASK_ID`, `LITHOS_AGENT_ID=claude-code`, `LITHOS_PRD_ID`, and `LITHOS_URL` env vars when invoking Claude, so that `lithos-coding-mcp` can attribute the agent's writes correctly without the agent needing to know the IDs.
 26. As the operator, I want project repo `CLAUDE.md` / `AGENTS.md` files to remain free of any Lithos-specific content, with all Lithos integration coming from `~/.claude-lithos/`, so that the integration is invisible to the project repos themselves (exception: projects in the Lithos ecosystem itself).
 27. As a coding agent, I want `write_adr` to set provenance correctly (path `architecture/`, `note_type: concept`, `derived_from_ids: [LITHOS_PRD_ID]`, `source_task: LITHOS_TASK_ID`, `tags: [adr, project:<x>]`), so that ADRs land in the KB with their lineage intact.
+27a. As the operator, I want `lithos-coding-mcp` to ship an `AGENTS-LITHOS.md` skill file alongside `CLAUDE-LITHOS.md` for Codex sessions, so that both coding agents have equivalent guidance on when and how to use the five tools.
+27b. As the operator, I want both skill files to encode the conveyor context-budget rule ("after a sub-skill or tool call returns, the very next token must be a tool call, not narration") and other prompt hygiene patterns, so that agent runs are predictable and cheap to debug.
+27c. As the operator, I want unrecognised `LITHOS_AGENT_ID` values (anything other than `claude-code` / `codex`) to be auto-registered with type `unknown` and the raw value as display name, so that custom or experimental coding agents work without server-side allowlists.
+27d. As the operator running ad-hoc coding sessions (outside Loom), I want a `lithos-coding-mcp launch <agent>` subcommand (e.g. `lithos-coding-mcp launch claude my-task`) that handles env-var injection, agent ID hardcoding (via internal dispatch table), task lookup by UUID or title fragment, optional task creation via `--new`, and pre-launch agent registration, so that I can run KB-aware coding sessions without remembering which env var controls which thing or hand-creating tasks first. The package ships a single binary with subcommands rather than separate per-agent launchers; users add their own shell aliases (`alias cdl='lithos-coding-mcp launch claude'`) for ergonomic short forms. Specified in detail in `lithos-coding-mcp-requirements.md` FR-7.
 
 ### A4 — `decide-next` brain plugin (weeks 2–3)
 
@@ -111,6 +119,8 @@ Ordered by ambitious-roadmap layer, build sequence within each layer.
 35. As the operator, I want every plugin to be able to emit `[Friction] <description>` findings when it hits something painful (unclear story brief, ambiguous PRD section, repeated test failure), so that pain points are captured as data.
 36. As the operator, I want a recurring `loom-improve` task (created on a configurable schedule) that aggregates `[Friction]` findings since last run, classifies them by theme using Claude, and creates Lithos tasks for the top themes tagged `improvement`, so that pain feeds back into the system as work.
 37. As the operator, I want `loom-improve` outputs to be reviewable in lithos-lens (improvement tasks tagged distinctly), so that I can triage and prioritise process improvements alongside feature work.
+37a. As the operator, I want `story-implement` (and any plugin that runs a coding agent) to install an exit hook that auto-commits any uncommitted changes in the worktree if the agent process dies mid-turn, with commit message `loom: salvage WIP from <task_id>`, so that a crash or timeout does not lose work that was in progress.
+37b. As the operator, I want the daemon's startup orphan-claim cleanup to additionally check for worktrees holding salvage commits and post an `[Recovery] WIP salvaged at <commit>` finding pointing at the SHA, so that the next worker (or I) can decide whether to continue from the salvage or start clean.
 
 ### A8 — `merge-stories` (week 3)
 
@@ -136,6 +146,8 @@ Ordered by ambitious-roadmap layer, build sequence within each layer.
 51. As the operator, I want host-affinity to be releasable post-merge (the integration branch is on GitHub, any host can clone fresh worktrees off `main`), so that a project's next PRD can run on the other host.
 52. As the operator, I want a `lithos-loom webhook` mode that runs an HTTP receiver listening for GitHub `pull_request` events, validates the GitHub webhook signature, and posts an internal event that `story-review-human` and `merge-stories` can subscribe to, so that PR state changes are reflected in Loom within seconds rather than the polling interval.
 53. As the operator, I want the webhook receiver to fall back to polling cleanly when no webhook event has arrived in a configurable timeout, so that a misconfigured webhook doesn't strand a task.
+53a. As the operator, I want each Loom instance to subscribe to Lithos's `GET /events` SSE stream filtered to `task.created` / `task.updated` / `task.completed`, react to relevant events immediately by re-evaluating route matching, and fall back to polling when SSE is unavailable, so that interactive task creation (e.g. via A2A from Agent Zero) does not wait for the next poll interval.
+53b. As the operator, I want SSE event handling to be idempotent against the existing poll loop (events trigger the same matcher; double-evaluation is harmless because claim is collision-safe), so that having both signals active is safe and can be toggled without code changes.
 
 ### A10 — Docker sandbox option (later)
 
@@ -147,9 +159,13 @@ Ordered by ambitious-roadmap layer, build sequence within each layer.
 ### Cross-cutting
 
 58. As the operator, I want token / cost / turn-count metrics from each Claude invocation to be parsed from stream-json output and posted as a `[Cost]` finding on the task, so that I can see what each task cost and identify expensive patterns.
+58a. As the operator, I want `story-implement` (and any other implementation-shaped plugin) to post a `[Plan]` finding before invoking the coding agent, summarising what the plugin understands the task to be (story brief excerpt, integration branch, base SHA, target acceptance criteria), so that I can sanity-check the plugin's framing before any code runs.
+58b. As the operator, I want `story-implement` to post a `[Drift]` finding after the coding agent exits, comparing what was actually built (commit messages, files touched, lines of test added) against the story brief's acceptance criteria via a brief structured Claude call, so that under- and over-delivery are surfaced without me reading the diff.
+58c. As the operator, I want `[Drift]` findings to be queryable as a class so that periodic `loom-improve` aggregations can spot systemic over-/under-delivery patterns, so that the system can suggest prompt-template improvements over time.
 59. As the operator, I want a `lithos-loom dashboard` CLI command that prints a summary of in-flight tasks per host, recent findings, and aggregate cost over the last 24h, so that I can do a daily glance check from the terminal.
 60. As the operator, I want a `lithos-loom replay <task_id>` command that re-runs a task with the same plugin and inputs, useful after `story-fix` lands or after a flake, so that I can re-trigger work without recreating tasks.
 61. As the operator, I want all plugin invocations to emit OpenTelemetry traces matching the Lithos telemetry config, so that the workflow shows up in the same observability stack as Lithos itself.
+62. As the operator, I want a `systemd --user` unit shipped with Loom (e.g. `contrib/lithos-loom.service`) plus install / uninstall instructions, so that I can graduate Loom from manual `uv run` invocation to a managed background service once I trust the daemon's stability. The unit must restart on failure, forward logs to journald (which the existing OTel stack picks up), and respect SIGTERM for graceful shutdown.
 
 ## Implementation Decisions
 
@@ -162,12 +178,16 @@ Ordered by ambitious-roadmap layer, build sequence within each layer.
 - **Host-affinity resolver** — given a task and the local host's project registry, decides whether this Loom should claim. Pure function. Deep module: tested exhaustively, used at every poll cycle.
 - **Sandbox runner** (`lithos_loom.runner.sandbox`) — lifted from Ralph++'s docker sandbox code, exposes `run_in_sandbox(image, mounts, command)`. Deep module that other plugins compose with.
 - **Stream-json metrics parser** — given a stream-json log file, returns cost/turn/tool-call counts. Deep module, pure function.
+- **JSONL plugin event writer** — append-only writer for `events.jsonl` with monotonic sequence numbers and UTC timestamps. Deep module, pure function.
+- **SSE event subscriber** — long-running async client over Lithos `GET /events` with reconnect, backoff, and dedup against the in-memory ring buffer. Deep module, isolates SSE protocol from the matcher.
+- **Worktree salvage helper** — exit-hook-installable function that detects uncommitted changes on plugin termination and creates a salvage commit. Deep module composed by every plugin that runs an agent.
+- **Drift summariser** — given a story brief + the diff a plugin produced, calls Claude with a small structured-output prompt and returns `{built: [...], not_built: [...], extra: [...]}`. Deep module, reusable across `story-implement`, `story-fix`, `merge-stories`.
 
 **Config schema additions:**
 
 - `[orchestrator]` gains `mode = "polling" | "webhook"`, `webhook_port`, `a2a_port`
 - `[projects.<name>]` gains `review_policy`, `sandbox`, `claude_config`, `host_affinity` (override)
-- `[[routes]]` gains `next_route` (chaining), optional `conditions` (metadata-based gating), optional `decide_via_brain = true`
+- `[[routes]]` gains `next_route` (chaining), optional `[routes.match.conditions]` block (metadata-based gating), optional `decide_via_brain = true`, optional `max_runtime_seconds` (overrides MVP default), optional `idempotency_key` template
 - New `[loom_improve]` section with `schedule_cron`, `friction_lookback_hours`, `max_themes`
 
 **Task metadata additions (orchestration-only):**

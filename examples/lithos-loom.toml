@@ -1,0 +1,60 @@
+# Example lithos-loom configuration.
+#
+# Copy to ~/.config/lithos-loom/config.toml (or one of the per-environment
+# variants like config.dev.toml / config.prod.toml) and adjust paths to
+# match your machine.
+#
+# Selection rules:
+#   - LITHOS_LOOM_CONFIG=/abs/path.toml takes absolute precedence
+#   - else, LITHOS_LOOM_ENVIRONMENT=dev picks config.dev.toml
+#   - else, plain config.toml is loaded
+
+[orchestrator]
+agent_id = "lithos-orchestrator-samsara"
+lithos_url = "http://localhost:8765"
+poll_interval_seconds = 30
+work_dir = "/tmp/lithos-loom"
+max_concurrency = 4
+log_level = "info"
+retain_failed_workdirs = true
+
+[projects.lithos-lens]
+repo = "/home/you/projects/lithos/code/lithos-lens"
+claude_config = "/home/you/.claude-lithos"
+codex_config = "/home/you/.codex-lithos"
+
+[projects.lithos-loom]
+repo = "/home/you/projects/lithos/code/lithos-loom"
+claude_config = "/home/you/.claude-lithos"
+codex_config = "/home/you/.codex-lithos"
+
+# ── Routes ────────────────────────────────────────────────────────────
+#
+# Three bundled MVP plugins. Each route's `command` is invoked as a
+# subprocess; substitution tokens {{task_json}}, {{work_dir}},
+# {{result_file}} are filled in by the daemon.
+
+[[routes]]
+name = "prd-decompose"
+command = "uv run python -m lithos_loom.plugins.prd_decompose --task-json {{task_json}} --work-dir {{work_dir}} --result-file {{result_file}}"
+max_runtime_seconds = 1800
+
+[routes.match]
+tags = ["trigger:prd-decompose"]
+
+[[routes]]
+name = "story-implement"
+command = "uv run python -m lithos_loom.plugins.story_implement --task-json {{task_json}} --work-dir {{work_dir}} --result-file {{result_file}}"
+max_runtime_seconds = 7200
+
+[routes.match]
+tags = ["trigger:story-implement"]
+
+[[routes]]
+name = "story-review-human"
+command = "uv run python -m lithos_loom.plugins.story_review_human --task-json {{task_json}} --work-dir {{work_dir}} --result-file {{result_file}}"
+# Long max_runtime — this plugin can run for days waiting on a human merge.
+max_runtime_seconds = 604800
+
+[routes.match]
+tags = ["trigger:story-review-human"]

@@ -35,6 +35,7 @@ This is the orchestration layer that connects Lithos (knowledge + task store) to
 | Story storage | Each story is its own Lithos doc (S2): `note_type: task_record`, `derived_from_ids: [prd_id]`. |
 | GitHub | `watch-pr` polling in MVP; webhook receiver later. PRs target a per-PRD integration branch (`loom/<prd-slug>`). |
 | Sandbox | Direct Claude invocation in MVP. Docker sandbox is a deferred A10 enhancement. |
+| Deployment | Loom runs as a **host process**, not a docker service. Lithos and Influx are services (well-defined protocols, no shelling-out, no host filesystem coupling); Loom is an orchestrator with deep host integration (git worktrees, `claude`/`codex`/`gh` CLI auth in `~/`, plugin subprocess spawning). MVP runs manually via `uv run lithos-loom run` in terminal or tmux. Systemd `--user` unit is a deferred polish item. The template's `docker/` directory is dropped during bootstrap; `python-dotenv` and `.env`-style config from the template are retained for per-host paths (Lithos URL, work_dir, Claude config dir). |
 | Agent identity | Loom registers as `lithos-orchestrator-<host>`; coding sub-agents are `claude-code` / `codex` per the existing agent identity model. |
 
 ## Bundled plugins
@@ -142,7 +143,7 @@ Critical path: take `lithos-lens/docs/prd/milestone-1-operator-view.md`, decompo
 
 ### Build order (4 days of focused work)
 
-1. **Repo skeleton + result.json contract** — half day. `pyproject.toml` (uv), `lithos_loom/` package, MCP HTTP client, `result.json` schema validator, claim/poll/release loop, TOML config loader, project-affinity resolution.
+1. **Repo skeleton from `~/projects/templates/python` + result.json contract** — ~half day (the template handles uv / pyproject / Makefile / ruff / pyright / pytest / Docker / CI; rename `influx` → `lithos_loom`, register the console entry, then build MCP HTTP client, `result.json` schema validator + checked-in `docs/result-schema.json`, claim/poll/release loop, TOML config loader, project-affinity resolution).
 2. **Salvage from Ralph++** — half day. Extract `worktree.py`, `agents.py` (claude/codex subprocess + stream-json capture), `git.py` (base SHA + commit list since base) into `lithos_loom/runner/`.
 3. **`story-implement` plugin** — one day (start here, gives end-to-end signal first). Worktree off integration branch, prompt template (PRD body + story brief + project AGENTS.md), Claude run, commit detection, `gh pr create`.
 4. **`story-review-human` plugin** — half day. `gh pr view` poller; on `MERGED` post `[ReviewMerged]` finding and complete; on `CLOSED` post `[ReviewRejected]` and fail.
@@ -153,31 +154,39 @@ Critical path: take `lithos-lens/docs/prd/milestone-1-operator-view.md`, decompo
 
 ## Repo layout
 
+Bootstrapped from `~/projects/templates/python` (uv + Python 3.12 + src-layout + ruff + pyright + pytest + Makefile + CI). The skeleton handles `pyproject.toml`, `Makefile`, `.github/workflows/ci.yml`, `tests/conftest.py`, `.gitignore`, dotenv-based config, etc. The template's `docker/` directory is **dropped** during bootstrap because Loom runs on the host (see deployment decision above). Only the application tree below is project-specific:
+
 ```
 lithos-loom/
-├── pyproject.toml                    # uv-managed
-├── lithos_loom/
-│   ├── daemon.py                     # poll loop, claim/release
-│   ├── config.py                     # TOML loader
-│   ├── lithos_client.py              # MCP HTTP client
-│   ├── route.py                      # tag matching, dep resolution
-│   ├── plugin_runner.py              # subprocess + result.json
-│   ├── runner/                       # Salvaged from Ralph++
-│   │   ├── worktree.py
-│   │   ├── agents.py                 # claude/codex subprocess + stream-json
-│   │   └── git.py
-│   └── plugins/                      # Bundled plugins
-│       ├── prd_decompose/
-│       │   ├── __main__.py
-│       │   └── prompt.md             # adapted from Pocock to-issues
-│       ├── story_implement/
-│       │   ├── __main__.py
-│       │   └── prompt.md
-│       └── story_review_human/
-│           └── __main__.py
+├── (template scaffolding: pyproject.toml, Makefile, .python-version,
+│   .github/workflows/ci.yml, docker/, tests/conftest.py, .gitignore, ...)
+├── src/
+│   └── lithos_loom/
+│       ├── __init__.py
+│       ├── __main__.py
+│       ├── main.py                   # CLI entry: lithos-loom run / doctor / validate-config
+│       ├── daemon.py                 # poll loop, claim/release
+│       ├── config.py                 # TOML loader
+│       ├── lithos_client.py          # MCP HTTP client
+│       ├── route.py                  # tag matching, dep resolution
+│       ├── plugin_runner.py          # subprocess + result.json
+│       ├── runner/                   # Salvaged from Ralph++
+│       │   ├── worktree.py
+│       │   ├── agents.py             # claude/codex subprocess + stream-json
+│       │   └── git.py
+│       └── plugins/                  # Bundled plugins
+│           ├── prd_decompose/
+│           │   ├── __main__.py
+│           │   └── prompt.md         # adapted from Pocock to-issues
+│           ├── story_implement/
+│           │   ├── __main__.py
+│           │   └── prompt.md
+│           └── story_review_human/
+│               └── __main__.py
 ├── docs/
 │   ├── PLAN.md                       # this document
 │   ├── plugin-contract.md            # result.json schema
+│   ├── result-schema.json            # versioned JSON Schema (US-33)
 │   ├── routing.md                    # tag → route + dep resolution semantics
 │   ├── mvp-walkthrough.md            # lithos-lens milestone-1 worked example
 │   └── prd/
