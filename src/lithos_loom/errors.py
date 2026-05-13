@@ -34,3 +34,17 @@ class PluginContractError(LithosLoomError):
 
 class ClaimError(LithosLoomError):
     """Raised when a Lithos task claim attempt fails."""
+
+
+class LithosClientError(LithosLoomError):
+    """Raised when a Lithos MCP tool returns a ``{status: "error", ...}`` envelope.
+
+    ``code`` mirrors the canonical ``code`` discriminator on the envelope
+    (e.g. ``"task_not_found"``, ``"invalid_input"``, ``"claim_failed"``).
+    ``message`` carries the human-readable explanation.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
