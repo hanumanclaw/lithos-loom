@@ -22,6 +22,7 @@ queues.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -150,11 +151,23 @@ class EventBus:
         ``event_types`` is the allow-list of dotted event types; only those
         events are considered. ``match`` is the structural filter table;
         ``where`` is an optional Python predicate evaluated last.
+
+        ``queue_size`` must be >= 1 — unbounded queues defeat the
+        fire-and-forget bounded-buffer guarantee (D12).
+
+        ``match`` is deep-copied so subsequent mutation of the caller's
+        dict (or any nested dict/list within it) cannot silently change
+        routing behaviour after subscribe-time.
         """
+        if queue_size < 1:
+            raise ValueError(
+                f"queue_size must be >= 1 (got {queue_size}); unbounded "
+                "queues are not allowed (D12 fire-and-forget bounded buffers)"
+            )
         sub = Subscription(
             event_types=frozenset(event_types),
             queue=asyncio.Queue(maxsize=queue_size),
-            match=MatchFilter(dict(match)) if match else None,
+            match=MatchFilter(copy.deepcopy(dict(match))) if match else None,
             where=where,
             name=name,
         )

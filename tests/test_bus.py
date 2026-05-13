@@ -223,6 +223,48 @@ async def test_bus_publish_does_not_block_on_full_subscriber() -> None:
     await asyncio.wait_for(hammer(), timeout=1.0)
 
 
+# ── subscribe-time validation + isolation ──────────────────────────────
+
+
+def test_subscribe_rejects_zero_queue_size() -> None:
+    """``queue_size=0`` would mean unbounded in asyncio — disallowed by D12."""
+    bus = EventBus()
+    with pytest.raises(ValueError, match="queue_size must be >= 1"):
+        bus.subscribe(event_types=["lithos.task.created"], queue_size=0)
+
+
+def test_subscribe_rejects_negative_queue_size() -> None:
+    bus = EventBus()
+    with pytest.raises(ValueError, match="queue_size must be >= 1"):
+        bus.subscribe(event_types=["lithos.task.created"], queue_size=-1)
+
+
+async def test_subscribe_isolates_match_from_caller_mutation() -> None:
+    """Mutating the caller's match dict (incl. nested) must not change routing."""
+    bus = EventBus()
+    match = {"metadata": {"project": "lithos-loom"}, "tags": ["trigger:a"]}
+    listener = bus.subscribe(event_types=["lithos.task.created"], match=match)
+
+    # Mutate every level the caller could plausibly reach into.
+    match["metadata"]["project"] = "lithos-lens"
+    match["tags"].append("trigger:b")
+    match["new_top_level"] = "should-not-appear"
+
+    matching = _evt(
+        payload={"metadata": {"project": "lithos-loom"}, "tags": ["trigger:a"]}
+    )
+    poisoned = _evt(
+        payload={"metadata": {"project": "lithos-lens"}, "tags": ["trigger:a"]}
+    )
+    await bus.publish(matching)
+    await bus.publish(poisoned)
+
+    # Only the original-config event matches; the post-subscribe mutation
+    # of the caller's dict had no effect on routing.
+    assert listener.queue.qsize() == 1
+    assert listener.queue.get_nowait() is matching
+
+
 # ── event immutability ─────────────────────────────────────────────────
 
 
