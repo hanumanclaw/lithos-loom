@@ -87,3 +87,28 @@ tags = ["trigger:story-review-human"]
 # backoff = "exponential"        # or "linear"
 # initial_delay_seconds = 0.5
 # max_delay_seconds = 30.0
+
+# ── Obsidian sync (vault host only) ───────────────────────────────────
+#
+# Presence of this section is the supervisor's spawn gate for the
+# obsidian-sync child: include it on the host that owns the vault
+# (typically samsara), omit it everywhere else. The child sleeps until
+# SIGTERM in US7; US8 onwards adds the projection subscription, US15
+# adds the `lithos-loom doctor` vault probe.
+#
+# tasks_file is relative to vault_path. resolved_ttl_days controls how
+# long completed/cancelled tasks linger in tasks_file before being
+# dropped (US13).
+#
+# Projection filter knobs (operator-level):
+#   include_blocked — project tasks whose metadata.depends_on is set
+#                     (default true; opt-out for a tighter daily view)
+#   exclude_tags    — list of tags that suppress projection when present
+#                     on a task (e.g. ["debug:trace", "internal"])
+
+# [obsidian_sync]
+# vault_path = "/home/you/Obsidian/Vault"
+# tasks_file = "_lithos/tasks.md"
+# resolved_ttl_days = 7
+# include_blocked = true
+# exclude_tags = []

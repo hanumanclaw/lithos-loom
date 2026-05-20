@@ -17,9 +17,13 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from lithos_loom.config import LoomConfig, OrchestratorConfig
+from lithos_loom.config import (
+    LoomConfig,
+    ObsidianSyncConfig,
+    OrchestratorConfig,
+)
 from lithos_loom.main import app
-from lithos_loom.supervisor import CategorySpec, Supervisor
+from lithos_loom.supervisor import CategorySpec, Supervisor, default_categories
 
 runner = CliRunner()
 
@@ -362,3 +366,35 @@ def test_supervisor_signal_handler_exists() -> None:
 
     assert hasattr(mod, "Supervisor")
     assert hasattr(mod, "CategorySpec")
+
+
+# ── default_categories() / obsidian-sync gate (Slice 1 US7) ────────────
+
+
+def _obs_sync_cfg(tmp_path: Path) -> LoomConfig:
+    return replace(
+        _minimal_cfg(tmp_path),
+        obsidian_sync=ObsidianSyncConfig(vault_path=tmp_path / "vault"),
+    )
+
+
+def test_default_categories_includes_obsidian_sync_spec(tmp_path: Path) -> None:
+    """The obsidian-sync category is registered; the supervisor gates it on
+    cfg.obsidian_sync presence rather than dropping it from the list."""
+    names = [c.name for c in default_categories()]
+    assert "obsidian-sync" in names
+    assert "route-runner" in names
+
+
+def test_obsidian_sync_disabled_when_section_absent(tmp_path: Path) -> None:
+    """With no [obsidian_sync] in config, the spec's enabled() returns False."""
+    cfg = _minimal_cfg(tmp_path)
+    obs_spec = next(c for c in default_categories() if c.name == "obsidian-sync")
+    assert obs_spec.enabled(cfg) is False
+
+
+def test_obsidian_sync_enabled_when_section_present(tmp_path: Path) -> None:
+    """With [obsidian_sync] in config, the spec's enabled() returns True."""
+    cfg = _obs_sync_cfg(tmp_path)
+    obs_spec = next(c for c in default_categories() if c.name == "obsidian-sync")
+    assert obs_spec.enabled(cfg) is True

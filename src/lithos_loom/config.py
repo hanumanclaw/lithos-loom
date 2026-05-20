@@ -47,10 +47,13 @@ __all__ = [
     "DEFAULT_CONFIG_FILENAME",
     "DEFAULT_LOG_LEVEL",
     "DEFAULT_MAX_CONCURRENCY",
+    "DEFAULT_OBSIDIAN_RESOLVED_TTL_DAYS",
+    "DEFAULT_OBSIDIAN_TASKS_FILE",
     "DEFAULT_WORK_DIR",
     "Backoff",
     "LogLevel",
     "LoomConfig",
+    "ObsidianSyncConfig",
     "OnPersistentFailure",
     "OrchestratorConfig",
     "ProjectConfig",
@@ -80,6 +83,8 @@ DEFAULT_CONFIG_FILENAME = "config.toml"
 DEFAULT_WORK_DIR = Path("/tmp/lithos-loom")
 DEFAULT_MAX_CONCURRENCY = 4
 DEFAULT_LOG_LEVEL: LogLevel = "info"
+DEFAULT_OBSIDIAN_TASKS_FILE = Path("_lithos/tasks.md")
+DEFAULT_OBSIDIAN_RESOLVED_TTL_DAYS = 7
 
 
 def parse_log_level(value: str) -> LogLevel:
@@ -152,11 +157,44 @@ class SubscriptionConfig:
 
 
 @dataclass(frozen=True)
+class ObsidianSyncConfig:
+    """Vault-host configuration for the obsidian-sync child (Slice 1+).
+
+    Presence of this section on a host's TOML declares "this is the
+    vault host." The supervisor uses ``cfg.obsidian_sync is not None``
+    as its spawn gate; operators omit the section on headless hosts.
+
+    ``tasks_file`` is stored as a relative path and joined with
+    ``vault_path`` only at use time. Existence of the vault is not
+    checked at parse time — that's ``lithos-loom doctor`` (US15).
+
+    Projection filter knobs (``include_blocked``, ``exclude_tags``) are
+    operator-level controls that ``is_human_actionable`` (US8) will
+    read alongside the route-author's ``human_blocking`` flag. These
+    are deliberately a small starter set; we expect the list to grow
+    as Slice 1 stories surface real filtering needs rather than
+    speculating now.
+    """
+
+    vault_path: Path
+    tasks_file: Path = field(default=DEFAULT_OBSIDIAN_TASKS_FILE)
+    resolved_ttl_days: int = DEFAULT_OBSIDIAN_RESOLVED_TTL_DAYS
+    include_blocked: bool = True
+    """Project tasks whose ``metadata.depends_on`` is non-empty (US12 /
+    D6 revised default). Operators who don't want blocked work in
+    their daily view can set this to ``false``."""
+    exclude_tags: tuple[str, ...] = ()
+    """Tags whose presence on a task suppresses projection. Generic
+    operator-level denylist; matched against ``task.tags`` membership."""
+
+
+@dataclass(frozen=True)
 class LoomConfig:
     orchestrator: OrchestratorConfig
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     routes: tuple[RouteConfig, ...] = ()
     subscriptions: tuple[SubscriptionConfig, ...] = ()
+    obsidian_sync: ObsidianSyncConfig | None = None
     source_path: Path | None = None
     environment: str | None = None
 
@@ -251,12 +289,14 @@ def load_config(path: Path | None = None) -> LoomConfig:
     projects = _parse_projects(raw.get("projects", {}), config_path)
     routes = _parse_routes(raw.get("routes", []), config_path)
     subscriptions = _parse_subscriptions(raw.get("subscriptions", []), config_path)
+    obsidian_sync = _parse_obsidian_sync(raw.get("obsidian_sync"), config_path)
 
     cfg = LoomConfig(
         orchestrator=orchestrator,
         projects=projects,
         routes=routes,
         subscriptions=subscriptions,
+        obsidian_sync=obsidian_sync,
         source_path=config_path,
         environment=environment,
     )
@@ -413,6 +453,91 @@ def _parse_subscriptions(
             )
         )
     return tuple(out)
+
+
+_OBSIDIAN_SYNC_KEYS: frozenset[str] = frozenset(
+    {
+        "vault_path",
+        "tasks_file",
+        "resolved_ttl_days",
+        "include_blocked",
+        "exclude_tags",
+    }
+)
+
+
+def _parse_obsidian_sync(data: Any, config_path: Path) -> ObsidianSyncConfig | None:
+    """Parse the optional ``[obsidian_sync]`` section.
+
+    Absence of the section is the supervisor's spawn gate: returning
+    ``None`` means no obsidian-sync child is spawned on this host.
+    """
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise ConfigError(f"{config_path}: [obsidian_sync] must be a table")
+
+    unknown = set(data.keys()) - _OBSIDIAN_SYNC_KEYS
+    if unknown:
+        raise ConfigError(
+            f"{config_path}: [obsidian_sync] has unknown key(s) "
+            f"{sorted(unknown)}; valid keys: {sorted(_OBSIDIAN_SYNC_KEYS)}"
+        )
+
+    vault_path = _required_path(data, "vault_path", config_path, "obsidian_sync")
+
+    tasks_file_raw = data.get("tasks_file")
+    if tasks_file_raw is None:
+        tasks_file = DEFAULT_OBSIDIAN_TASKS_FILE
+    else:
+        if not isinstance(tasks_file_raw, str) or not tasks_file_raw:
+            raise ConfigError(
+                f"{config_path}: obsidian_sync.tasks_file must be a non-empty "
+                f"path string"
+            )
+        tasks_file = Path(tasks_file_raw)
+        if tasks_file.is_absolute() or any(part == ".." for part in tasks_file.parts):
+            raise ConfigError(
+                f"{config_path}: obsidian_sync.tasks_file must be relative to "
+                f"vault_path and may not contain '..' (got {tasks_file_raw!r})"
+            )
+
+    resolved_ttl_days = _optional_int(
+        data,
+        "resolved_ttl_days",
+        DEFAULT_OBSIDIAN_RESOLVED_TTL_DAYS,
+        config_path,
+        "obsidian_sync",
+    )
+    if resolved_ttl_days < 0:
+        raise ConfigError(
+            f"{config_path}: obsidian_sync.resolved_ttl_days must be >= 0 "
+            f"(got {resolved_ttl_days})"
+        )
+
+    include_blocked = _optional_bool(
+        data, "include_blocked", True, config_path, "obsidian_sync"
+    )
+
+    exclude_tags_raw = data.get("exclude_tags", [])
+    if not isinstance(exclude_tags_raw, list) or not all(
+        isinstance(t, str) for t in exclude_tags_raw
+    ):
+        raise ConfigError(
+            f"{config_path}: obsidian_sync.exclude_tags must be a list of strings"
+        )
+    if any(not t for t in exclude_tags_raw):
+        raise ConfigError(
+            f"{config_path}: obsidian_sync.exclude_tags entries must be non-empty"
+        )
+
+    return ObsidianSyncConfig(
+        vault_path=vault_path,
+        tasks_file=tasks_file,
+        resolved_ttl_days=resolved_ttl_days,
+        include_blocked=include_blocked,
+        exclude_tags=tuple(exclude_tags_raw),
+    )
 
 
 def _parse_retry_policy(data: Any, config_path: Path, scope: str) -> RetryPolicy:

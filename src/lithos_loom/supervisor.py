@@ -231,13 +231,21 @@ class Supervisor:
 def default_categories() -> list[CategorySpec]:
     """Categories the supervisor spawns by default in ``lithos-loom run``.
 
-    Slice 0 registers the route-runner category (US5). Slice 1 will add
-    the obsidian-sync category (samsara only).
+    Slice 0 registers the route-runner category (US5). Slice 1 US7 adds
+    the obsidian-sync category, gated on the presence of
+    ``[obsidian_sync]`` in the loaded config — implicit host gating so
+    operators deploy the section on the vault host and omit it on
+    headless hosts.
     """
     return [
         CategorySpec(
             name="route-runner",
             module="lithos_loom.children.route_runner",
             enabled=lambda cfg: bool(cfg.routes),
+        ),
+        CategorySpec(
+            name="obsidian-sync",
+            module="lithos_loom.children.obsidian_sync",
+            enabled=lambda cfg: cfg.obsidian_sync is not None,
         ),
     ]
