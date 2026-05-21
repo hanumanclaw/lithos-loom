@@ -778,9 +778,9 @@ async def test_multiple_claims_first_human_blocking_wins(tmp_path: Path) -> None
 
 
 async def test_full_marker_set_orders_correctly(tmp_path: Path) -> None:
-    """All markers present in expected order:
+    """All markers present in expected order (after US10):
 
-    - [ ] <title> 🆔 lithos:<id> 📅 <date> #project/<slug> #lithos/<route>
+    - [ ] <title> <priority> 🆔 lithos:<id> 📅 <date> #project/<slug> #lithos/<route>
     """
     routes = (_human_blocking_route(name="review-human"),)
     cfg = _cfg(tmp_path, routes=routes)
@@ -791,13 +791,17 @@ async def test_full_marker_set_orders_correctly(tmp_path: Path) -> None:
             task_id="full",
             title="Review PR for story 03",
             tags=("trigger:review-human",),
-            metadata={"project": "lithos-loom", "scheduled_for": "2026-06-15"},
+            metadata={
+                "project": "lithos-loom",
+                "scheduled_for": "2026-06-15",
+                "priority": "high",
+            },
             claims=({"agent": "loom", "aspect": "review-human"},),
         ),
         _ctx(),
     )
     assert _projected_line(tmp_path) == (
-        "- [ ] Review PR for story 03 🆔 lithos:full "
+        "- [ ] Review PR for story 03 ⏫ 🆔 lithos:full "
         "📅 2026-06-15 #project/lithos-loom #lithos/review-human"
     )
 
@@ -847,3 +851,128 @@ async def test_repeated_event_with_fixed_today_yields_skip_write(
     monkeypatch.setattr(os, "replace", _spy)
     await handler(event, _ctx())
     assert calls == [], "second identical claimed event triggered a write"
+
+
+# ── US10 priority emoji ─────────────────────────────────────────────────
+
+
+_PRIORITY_EMOJI_CHARS = "🔺⏫🔼🔽⏬"
+
+
+async def test_priority_highest_renders_red_triangle(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    handler = make_handler(cfg, today_provider=_fixed_today)
+    await handler(
+        _event("lithos.task.created", task_id="p", metadata={"priority": "highest"}),
+        _ctx(),
+    )
+    assert "🔺" in _projected_line(tmp_path)
+
+
+async def test_priority_high_renders_double_up(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    handler = make_handler(cfg, today_provider=_fixed_today)
+    await handler(
+        _event("lithos.task.created", task_id="p", metadata={"priority": "high"}),
+        _ctx(),
+    )
+    assert "⏫" in _projected_line(tmp_path)
+
+
+async def test_priority_medium_renders_up(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    handler = make_handler(cfg, today_provider=_fixed_today)
+    await handler(
+        _event("lithos.task.created", task_id="p", metadata={"priority": "medium"}),
+        _ctx(),
+    )
+    assert "🔼" in _projected_line(tmp_path)
+
+
+async def test_priority_low_renders_down(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    handler = make_handler(cfg, today_provider=_fixed_today)
+    await handler(
+        _event("lithos.task.created", task_id="p", metadata={"priority": "low"}),
+        _ctx(),
+    )
+    assert "🔽" in _projected_line(tmp_path)
+
+
+async def test_priority_lowest_renders_double_down(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    handler = make_handler(cfg, today_provider=_fixed_today)
+    await handler(
+        _event("lithos.task.created", task_id="p", metadata={"priority": "lowest"}),
+        _ctx(),
+    )
+    assert "⏬" in _projected_line(tmp_path)
+
+
+async def test_missing_priority_omits_emoji(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    handler = make_handler(cfg, today_provider=_fixed_today)
+    await handler(_event("lithos.task.created", task_id="np"), _ctx())
+    line = _projected_line(tmp_path)
+    assert not any(ch in line for ch in _PRIORITY_EMOJI_CHARS)
+
+
+async def test_unknown_priority_warns_and_omits(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Drift-protection: an enum value Lithos doesn't define is logged and
+    dropped, never crashes the subscription loop."""
+    import logging as _logging
+
+    cfg = _cfg(tmp_path)
+    handler = make_handler(cfg, today_provider=_fixed_today)
+    with caplog.at_level(_logging.WARNING):
+        await handler(
+            _event(
+                "lithos.task.created",
+                task_id="u",
+                metadata={"priority": "urgent"},
+            ),
+            _ctx(),
+        )
+    line = _projected_line(tmp_path)
+    assert not any(ch in line for ch in _PRIORITY_EMOJI_CHARS)
+    warns = [r.getMessage() for r in caplog.records if r.levelno == _logging.WARNING]
+    assert any("priority" in m and "urgent" in m for m in warns), warns
+
+
+async def test_non_string_priority_warns_and_omits(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Defensive against schema drift — an int / dict / None for priority
+    is dropped with a warning, never crashes."""
+    import logging as _logging
+
+    cfg = _cfg(tmp_path)
+    handler = make_handler(cfg, today_provider=_fixed_today)
+    with caplog.at_level(_logging.WARNING):
+        await handler(
+            _event("lithos.task.created", task_id="ns", metadata={"priority": 42}),
+            _ctx(),
+        )
+    line = _projected_line(tmp_path)
+    assert not any(ch in line for ch in _PRIORITY_EMOJI_CHARS)
+    warns = [r.getMessage() for r in caplog.records if r.levelno == _logging.WARNING]
+    assert any("priority" in m and "42" in m for m in warns), warns
+
+
+async def test_priority_slots_between_title_and_id(tmp_path: Path) -> None:
+    """Position lock: priority emoji appears after <title> and before
+    🆔 lithos:<id>, matching the PRD's rendered example."""
+    cfg = _cfg(tmp_path)
+    handler = make_handler(cfg, today_provider=_fixed_today)
+    await handler(
+        _event(
+            "lithos.task.created",
+            task_id="slot",
+            title="Slotted task",
+            metadata={"priority": "high"},
+        ),
+        _ctx(),
+    )
+    assert _projected_line(tmp_path) == "- [ ] Slotted task ⏫ 🆔 lithos:slot"
