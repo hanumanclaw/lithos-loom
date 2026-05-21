@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from types import TracebackType
 from typing import Any
 
@@ -44,7 +45,10 @@ class Task:
     """A Lithos task as returned by ``lithos_task_list``.
 
     Field set covers what the poller diffs over plus what the route-runner
-    needs to make claim/match decisions. The Lithos spec also returns
+    needs to make claim/match decisions. ``completed_at`` is the canonical
+    Lithos timestamp for terminal-state transitions (US13: the obsidian-
+    projection handler uses it as the resolution-date anchor for
+    ``✅``/``❌`` markers and TTL eviction). The Lithos spec also returns
     ``description``, ``created_by``, and ``created_at``; those are ignored
     for slice 0 and can be added without breaking call sites.
     """
@@ -55,6 +59,7 @@ class Task:
     tags: tuple[str, ...]
     metadata: Mapping[str, Any]
     claims: tuple[Mapping[str, Any], ...]
+    completed_at: datetime | None = None
 
 
 class LithosClient:
@@ -376,11 +381,28 @@ def _parse_task(raw: Any) -> Task:
             tags=tuple(tags_raw),
             metadata=dict(raw.get("metadata") or {}),
             claims=tuple(dict(c) for c in claims_raw),
+            completed_at=_parse_iso_datetime(raw.get("completed_at")),
         )
     except KeyError as exc:
         raise LithosClientError(
             "invalid_response", f"task entry missing required field: {exc.args[0]}"
         ) from exc
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    """Best-effort ISO-8601 datetime parse. Returns ``None`` for absent
+    or unparseable values so a Lithos schema drift on optional fields
+    doesn't crash the client (US13 only needs ``completed_at`` for
+    terminal-state rendering; missing values fall back to the bus event
+    timestamp at the projection layer)."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _payload_from_result(result: CallToolResult) -> Any:

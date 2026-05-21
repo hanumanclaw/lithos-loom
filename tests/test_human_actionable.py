@@ -19,6 +19,7 @@ from lithos_loom.lithos_client import Task
 from lithos_loom.subscriptions._human_actionable import (
     human_blocking_route_name,
     is_human_actionable,
+    would_be_actionable,
 )
 
 
@@ -242,3 +243,67 @@ def test_human_blocking_route_name_picks_first_matching_claim() -> None:
     ]
     task = _task(claims=(_claim("review-human"), _claim("signoff")))
     assert human_blocking_route_name(task, routes) == "review-human"
+
+
+# ── would_be_actionable (PR #21 review extraction) ─────────────────────
+
+
+def test_would_be_actionable_open_orphan_true() -> None:
+    """The status-agnostic predicate matches is_human_actionable for
+    the open-orphan case (D6 first disjunct)."""
+    task = _task(status="open", tags=("anything",))
+    assert would_be_actionable(task, routes=[], cfg=_cfg()) is True
+
+
+def test_would_be_actionable_ignores_status_for_completed_orphan() -> None:
+    """Distinguishing feature: a completed orphan returns True from
+    would_be_actionable but False from is_human_actionable. Used by the
+    obsidian-projection terminal-event branch to decide whether a
+    just-resolved task should join the TTL lingering window."""
+    task = _task(status="completed", tags=("anything",))
+    assert would_be_actionable(task, routes=[], cfg=_cfg()) is True
+    assert is_human_actionable(task, routes=[], cfg=_cfg()) is False
+
+
+def test_would_be_actionable_cancelled_orphan_true() -> None:
+    """Same as completed — terminal status doesn't disqualify."""
+    task = _task(status="cancelled", tags=("anything",))
+    assert would_be_actionable(task, routes=[], cfg=_cfg()) is True
+
+
+def test_would_be_actionable_autonomous_route_match_false() -> None:
+    """Autonomous-route work — never on the operator's view, whether
+    open or completed. PR #21 review issue 2: this is the predicate the
+    handler's terminal-event branch uses to skip ghost promotions."""
+    routes = [_route("auto", tags=("trigger:auto",), human_blocking=False)]
+    task = _task(status="completed", tags=("trigger:auto",))
+    assert would_be_actionable(task, routes, _cfg()) is False
+
+
+def test_would_be_actionable_human_blocking_claim_true() -> None:
+    routes = [_route("review", tags=("trigger:review",), human_blocking=True)]
+    task = _task(
+        status="completed",
+        tags=("trigger:review",),
+        claims=(_claim("review"),),
+    )
+    assert would_be_actionable(task, routes, _cfg()) is True
+
+
+def test_would_be_actionable_excluded_tag_false() -> None:
+    """Operator opt-out wins over the default-true orphan path, same
+    as is_human_actionable."""
+    task = _task(status="completed", tags=("noisy",))
+    assert (
+        would_be_actionable(task, routes=[], cfg=_cfg(exclude_tags=("noisy",))) is False
+    )
+
+
+def test_would_be_actionable_blocked_with_include_blocked_false() -> None:
+    """include_blocked=False + non-empty depends_on → hide, same as
+    is_human_actionable."""
+    task = _task(
+        status="completed", tags=("anything",), metadata={"depends_on": ["dep-1"]}
+    )
+    cfg = _cfg(include_blocked=False)
+    assert would_be_actionable(task, routes=[], cfg=cfg) is False

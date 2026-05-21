@@ -28,6 +28,7 @@ import logging
 import signal
 import sys
 from collections.abc import Sequence
+from datetime import timedelta
 from pathlib import Path
 
 from lithos_loom.bus import EventBus
@@ -143,8 +144,16 @@ async def _amain(cfg: LoomConfig) -> int:
             cfg.orchestrator.lithos_url, agent_id=cfg.orchestrator.agent_id
         ) as lithos:
             events_url = cfg.orchestrator.lithos_url.rstrip("/") + "/events"
+            # Pull resolved-task history into the bootstrap so the
+            # US13 TTL-lingering window survives daemon restart (PR #21
+            # review issue 1). The source over-fetches completed +
+            # cancelled tasks at bootstrap and filters by completed_at
+            # >= now - window before publishing them as terminal events.
             source = LithosEventStream(
-                client=lithos, bus=EventBus(), events_url=events_url
+                client=lithos,
+                bus=EventBus(),
+                events_url=events_url,
+                bootstrap_resolved_window=timedelta(days=obs.resolved_ttl_days),
             )
             # Re-bind the source's bus locally so the runners share it.
             bus = source.bus

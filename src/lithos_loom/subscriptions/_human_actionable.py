@@ -46,7 +46,11 @@ from typing import Any
 from lithos_loom.config import ObsidianSyncConfig, RouteConfig
 from lithos_loom.lithos_client import Task
 
-__all__ = ["human_blocking_route_name", "is_human_actionable"]
+__all__ = [
+    "human_blocking_route_name",
+    "is_human_actionable",
+    "would_be_actionable",
+]
 
 
 def is_human_actionable(
@@ -54,18 +58,43 @@ def is_human_actionable(
     routes: Sequence[RouteConfig],
     cfg: ObsidianSyncConfig,
 ) -> bool:
-    """Return ``True`` iff this task should appear in the operator's view.
+    """Return ``True`` iff an open task should appear in the operator's view.
 
-    See module docstring for the decision order and D6 quote.
+    See module docstring for the decision order and D6 quote. Terminal
+    tasks always return ``False`` — the obsidian-projection handler
+    routes resolved tasks through :func:`would_be_actionable` instead,
+    which answers "would this have been actionable while it was open?"
+    so the US13 TTL-lingering window correctly skips never-actionable
+    autonomous work (PR #21 review feedback).
     """
-    # Terminal tasks are never actionable here. The handler removes
-    # them on completed/cancelled events; if this helper is ever
-    # called for a terminal task (e.g. a stale claim from a cancelled
-    # workflow), don't surface it. US13 will overlay TTL lingering
-    # with a separate signal.
     if task.status != "open":
         return False
+    return would_be_actionable(task, routes, cfg)
 
+
+def would_be_actionable(
+    task: Task,
+    routes: Sequence[RouteConfig],
+    cfg: ObsidianSyncConfig,
+) -> bool:
+    """Return ``True`` iff the task's tags/metadata would make it
+    actionable to the operator, *ignoring* its current status.
+
+    Same decision tree as :func:`is_human_actionable` minus the
+    status gate. Used by:
+
+    - :func:`is_human_actionable` to compose the live-event decision
+      (open + would-be-actionable = actionable).
+    - The obsidian-projection handler's terminal-event branch to decide
+      whether a completed/cancelled task should join the US13 TTL
+      lingering window — a task that was never projected while open
+      (autonomous-route work) should not suddenly appear in
+      "done this week" queries on completion (PR #21 review).
+    - ``LithosEventStream`` bootstrap-resolved over-fetch to filter
+      Lithos-discovered resolved tasks before publishing them as bus
+      events, so restart-recovery (US13) only rehydrates tasks that
+      would have been on the operator's view.
+    """
     depends_on = task.metadata.get("depends_on") or []
     if not cfg.include_blocked and depends_on:
         return False
@@ -76,7 +105,7 @@ def is_human_actionable(
 
     claimable_routes = [r for r in routes if set(r.match.tags) & task_tag_set]
 
-    # D6 first disjunct: open AND not claimable by any route.
+    # D6 first disjunct: not claimable by any route → would project as orphan.
     if not claimable_routes:
         return True
 
