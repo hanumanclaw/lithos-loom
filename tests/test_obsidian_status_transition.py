@@ -19,6 +19,7 @@ from lithos_loom.bus import Event
 from lithos_loom.subscriptions import SubscriptionContext
 from lithos_loom.subscriptions._obsidian_status_transition import (
     _CANCEL_REASON,
+    _REOPEN_REQUEST_SUMMARY,
     handle,
 )
 
@@ -116,14 +117,57 @@ async def test_open_to_cancelled_logs_at_info(
     )
 
 
+# ── US19: [x] → [ ] → [ReopenRequested] finding ────────────────────────
+
+
+async def test_untick_posts_reopen_request_finding() -> None:
+    """``[x]`` → ``[ ]`` for a known task → ``lithos.finding_post``
+    awaited once with the constant ``[ReopenRequested]`` summary and
+    the context's agent id. ``task_complete`` and ``task_cancel`` must
+    NOT be called — untick is a reopen-request, not a state
+    transition."""
+    lithos = AsyncMock()
+    ctx = _ctx(lithos=lithos, agent_id="lithos-orchestrator-samsara")
+
+    await handle(_event(task_id="done1", prior="[x]", new="[ ]"), ctx)
+
+    lithos.finding_post.assert_awaited_once_with(
+        task_id="done1",
+        summary=_REOPEN_REQUEST_SUMMARY,
+        agent="lithos-orchestrator-samsara",
+    )
+    lithos.task_complete.assert_not_awaited()
+    lithos.task_cancel.assert_not_awaited()
+
+
+async def test_untick_logs_at_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The reopen-request path emits an INFO log naming the task id
+    and the ``[ReopenRequested]`` marker so operators can grep for it."""
+    ctx = _ctx()
+    with caplog.at_level(logging.INFO, logger="test.obsidian_status_transition"):
+        await handle(_event(task_id="done7", prior="[x]", new="[ ]"), ctx)
+
+    info_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("[ReopenRequested]" in m and "done7" in m for m in info_msgs), info_msgs
+
+
+def test_reopen_request_summary_uses_reopen_prefix() -> None:
+    """The summary starts with the exact ``[ReopenRequested]`` prefix
+    the AGENTS.md stable-prefix table specifies (PascalCase, bracketed,
+    no hyphens / underscores). Pins the wire-format that lithos-lens
+    will scan for."""
+    assert _REOPEN_REQUEST_SUMMARY.startswith("[ReopenRequested] ")
+
+
 # ── US20 side-effect: other transitions are silent no-ops ──────────────
 
 
 @pytest.mark.parametrize(
     ("prior", "new"),
     [
-        ("[x]", "[ ]"),  # untick → reopen — US19 future
-        ("[-]", "[ ]"),  # un-cancel — US19 family
+        ("[-]", "[ ]"),  # un-cancel — not in scope; PRD only covers [x]→[ ]
         ("[ ]", "[/]"),  # in-progress — US20 no-op
         ("[ ]", "[>]"),  # rescheduled — US20 no-op
         ("[/]", "[>]"),  # arbitrary user marker transition

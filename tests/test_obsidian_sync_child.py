@@ -145,14 +145,16 @@ class _StubLithosClient:
     The real client does an MCP/SSE handshake on __aenter__; tests
     can't reach a real Lithos, so we substitute this no-op.
 
-    Records ``task_complete`` and ``task_cancel`` invocations on
-    class-level lists so the obsidian-status-transition end-to-end
-    tests can assert on the round-trip. The ``_reset_stub_lithos_state``
-    autouse fixture clears them between tests.
+    Records ``task_complete``, ``task_cancel``, and ``finding_post``
+    invocations on class-level lists so the
+    obsidian-status-transition end-to-end tests can assert on the
+    round-trip. The ``_reset_stub_lithos_state`` autouse fixture
+    clears them between tests.
     """
 
     task_complete_calls: ClassVar[list[dict[str, Any]]] = []
     task_cancel_calls: ClassVar[list[dict[str, Any]]] = []
+    finding_post_calls: ClassVar[list[dict[str, Any]]] = []
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         pass
@@ -163,9 +165,22 @@ class _StubLithosClient:
     async def __aexit__(self, *exc: Any) -> None:
         return None
 
-    async def finding_post(self, **kwargs: Any) -> None:
-        # In case persistent-failure handling triggers in a test, no-op.
-        return None
+    async def finding_post(
+        self,
+        *,
+        task_id: str,
+        summary: str,
+        agent: str | None = None,
+        knowledge_id: str | None = None,
+    ) -> None:
+        type(self).finding_post_calls.append(
+            {
+                "task_id": task_id,
+                "summary": summary,
+                "agent": agent,
+                "knowledge_id": knowledge_id,
+            }
+        )
 
     async def task_complete(self, *, task_id: str, agent: str | None = None) -> None:
         type(self).task_complete_calls.append({"task_id": task_id, "agent": agent})
@@ -188,6 +203,7 @@ def _reset_stub_lithos_state() -> None:
     so cross-test leakage can't make an assertion accidentally pass."""
     _StubLithosClient.task_complete_calls.clear()
     _StubLithosClient.task_cancel_calls.clear()
+    _StubLithosClient.finding_post_calls.clear()
 
 
 class _StubSource:
@@ -632,6 +648,90 @@ async def test_obsidian_sync_child_status_transition_pushes_cancel_to_lithos(
     assert _StubLithosClient.task_complete_calls == [], (
         "task_complete must not be called for [ ]→[-] transitions; "
         f"got {_StubLithosClient.task_complete_calls}"
+    )
+
+
+async def test_obsidian_sync_child_status_transition_posts_reopen_finding(
+    tmp_path: Path, stub_io: list[EventBus]
+) -> None:
+    """Slice 2 US19 end-to-end: configure both projection AND
+    status-transition. Publish a task.created, simulate a user tick
+    `[ ]` → `[x]` (verifies the task_complete path still works), then
+    a user untick `[x]` → `[ ]`. Assert the handler posts a
+    `[ReopenRequested]` finding for the untick — the D17 workaround
+    until upstream `agent-lore/lithos#243` ships `task_reopen`."""
+    from lithos_loom.subscriptions._obsidian_status_transition import (
+        _REOPEN_REQUEST_SUMMARY,
+    )
+
+    cfg = _cfg_with_obsidian(
+        tmp_path,
+        subscriptions=(
+            _projection_subscription(),
+            _status_transition_subscription(),
+        ),
+    )
+    tasks_file = cfg.obsidian_sync.vault_path / cfg.obsidian_sync.tasks_file  # type: ignore[union-attr]
+
+    async def _drive() -> None:
+        await asyncio.sleep(0.1)
+        bus = stub_io[-1]
+        await bus.publish(
+            _event("lithos.task.created", task_id="rop", title="Reopen me")
+        )
+        await asyncio.sleep(0.2)
+        assert tasks_file.exists()
+        assert "- [ ] Reopen me 🆔 lithos:rop" in tasks_file.read_text(encoding="utf-8")
+
+        # 1. User tick [ ] → [x] (causes a task_complete call).
+        tasks_file.write_text(
+            tasks_file.read_text(encoding="utf-8").replace(
+                "- [ ] Reopen me 🆔 lithos:rop",
+                "- [x] Reopen me 🆔 lithos:rop",
+            ),
+            encoding="utf-8",
+        )
+        # Give the watcher + handler time to fire.
+        await asyncio.sleep(0.5)
+
+        # 2. User untick [x] → [ ] (must post [ReopenRequested]).
+        tasks_file.write_text(
+            tasks_file.read_text(encoding="utf-8").replace(
+                "- [x] Reopen me 🆔 lithos:rop",
+                "- [ ] Reopen me 🆔 lithos:rop",
+            ),
+            encoding="utf-8",
+        )
+        await asyncio.sleep(0.5)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    driver = asyncio.create_task(_drive())
+    try:
+        rc = await asyncio.wait_for(_amain(cfg), timeout=5.0)
+    finally:
+        await _cancel_and_drain(driver)
+    assert rc == 0
+
+    # Untick must have posted exactly one [ReopenRequested] finding
+    # for rop with the expected summary + agent.
+    assert _StubLithosClient.finding_post_calls == [
+        {
+            "task_id": "rop",
+            "summary": _REOPEN_REQUEST_SUMMARY,
+            "agent": "lithos-orchestrator-test",
+            "knowledge_id": None,
+        }
+    ], (
+        f"expected one [ReopenRequested] finding for rop; got "
+        f"{_StubLithosClient.finding_post_calls}"
+    )
+    # And the prior tick is still in the complete-call log (sanity:
+    # the handler is correctly dispatching on both transitions).
+    assert _StubLithosClient.task_complete_calls == [
+        {"task_id": "rop", "agent": "lithos-orchestrator-test"}
+    ], (
+        f"expected one task_complete for rop from the prior tick; got "
+        f"{_StubLithosClient.task_complete_calls}"
     )
 
 

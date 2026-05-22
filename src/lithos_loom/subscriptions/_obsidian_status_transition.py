@@ -6,7 +6,9 @@ and pushes the matching action to Lithos:
 
 * ``("[ ]", "[x]")`` → :meth:`LithosClient.task_complete` (US17)
 * ``("[ ]", "[-]")`` → :meth:`LithosClient.task_cancel`   (US18)
-* ``("[x]", "[ ]")`` → ``[ReopenRequested]`` finding      (US19 — follow-up)
+* ``("[x]", "[ ]")`` → :meth:`LithosClient.finding_post` with the
+  ``[ReopenRequested]`` prefix — D17 workaround until upstream
+  ``agent-lore/lithos#243`` adds a real ``task_reopen`` (US19)
 * ``("[ ]", "[/]")`` / ``("[ ]", "[>]")`` — silent no-op  (US20)
 * anything else — silent no-op with a debug log
 
@@ -25,7 +27,8 @@ Idempotency is **not** enforced here. US22 will add a pre-check via
 ``lithos_task_status``; until then, calling ``task_complete`` /
 ``task_cancel`` on an already-resolved task raises a
 :class:`LithosClientError` which the :class:`SubscriptionRunner`
-retry-then-friction path absorbs.
+retry-then-friction path absorbs, and posting ``[ReopenRequested]``
+on an already-open task is harmless but redundant.
 """
 
 from __future__ import annotations
@@ -71,13 +74,52 @@ async def _cancel(task_id: str, ctx: SubscriptionContext) -> None:
     )
 
 
+# Constant summary for the [ReopenRequested] finding. Lithos doesn't
+# yet have ``task_reopen`` (upstream ``agent-lore/lithos#243``), so an
+# untick can't actually reopen the task — instead we post a finding
+# that lithos-lens and the operator can pick up as a signal to revisit.
+# The ``[ReopenRequested]`` prefix follows the project's stable-prefix
+# convention (mirrors ``[Friction]`` / ``[BlockerFailed]`` shapes
+# elsewhere in the codebase).
+_REOPEN_REQUEST_SUMMARY = "[ReopenRequested] task untoggled in Obsidian"
+
+
+async def _reopen_request(task_id: str, ctx: SubscriptionContext) -> None:
+    """US19: ``[x] → [ ]`` — Obsidian untick on completed task →
+    ``[ReopenRequested]`` finding.
+
+    Workaround for D17 — Lithos doesn't yet have ``task_reopen``
+    (upstream ``agent-lore/lithos#243``). The finding gives lithos-lens
+    (and the operator) a signal that the completed task should be
+    revisited. The Lithos task itself stays in ``status=completed`` —
+    no automatic reopen. When #243 ships, this row can be replaced
+    with a real reopen call.
+
+    No pre-check that the task is actually in ``status=completed`` —
+    if the projection lagged and the task is still ``open`` in Lithos,
+    the finding still posts (harmless but redundant). US22 adds the
+    broader idempotency pre-check via ``lithos_task_status``.
+    """
+    await ctx.lithos.finding_post(
+        task_id=task_id,
+        summary=_REOPEN_REQUEST_SUMMARY,
+        agent=ctx.agent_id,
+    )
+    ctx.logger.info(
+        "obsidian-status-transition: posted [ReopenRequested] for "
+        "task %s (untick from [x])",
+        task_id,
+    )
+
+
 # Dispatch table. Each entry maps a ``(prior, new)`` checkbox-marker
 # pair to the coroutine that pushes the corresponding action to Lithos.
-# US19 adds one more row; US20's silent no-op for ``[/]`` and ``[>]``
-# falls out of the missing-entry path below — no explicit row needed.
+# US20's silent no-op for ``[/]`` and ``[>]`` falls out of the missing-
+# entry path below — no explicit row needed.
 _TRANSITIONS: dict[tuple[str, str], TransitionFn] = {
     ("[ ]", "[x]"): _complete,
     ("[ ]", "[-]"): _cancel,
+    ("[x]", "[ ]"): _reopen_request,
 }
 
 
