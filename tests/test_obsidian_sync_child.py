@@ -21,7 +21,7 @@ import signal
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -102,6 +102,18 @@ def _projection_subscription(
     )
 
 
+def _status_transition_subscription(
+    name: str = "obsidian-tasks-transition",
+) -> SubscriptionConfig:
+    return SubscriptionConfig(
+        name=name,
+        event_types=("obsidian.task.status_changed",),
+        action="obsidian-status-transition",
+        retry=RetryPolicy(attempts=1, initial_delay_seconds=0.0, max_delay_seconds=0.0),
+        on_persistent_failure="ignore",
+    )
+
+
 def _event(
     event_type: str,
     *,
@@ -132,7 +144,15 @@ class _StubLithosClient:
 
     The real client does an MCP/SSE handshake on __aenter__; tests
     can't reach a real Lithos, so we substitute this no-op.
+
+    Records ``task_complete`` and ``task_cancel`` invocations on
+    class-level lists so the obsidian-status-transition end-to-end
+    tests can assert on the round-trip. The ``_reset_stub_lithos_state``
+    autouse fixture clears them between tests.
     """
+
+    task_complete_calls: ClassVar[list[dict[str, Any]]] = []
+    task_cancel_calls: ClassVar[list[dict[str, Any]]] = []
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         pass
@@ -146,6 +166,28 @@ class _StubLithosClient:
     async def finding_post(self, **kwargs: Any) -> None:
         # In case persistent-failure handling triggers in a test, no-op.
         return None
+
+    async def task_complete(self, *, task_id: str, agent: str | None = None) -> None:
+        type(self).task_complete_calls.append({"task_id": task_id, "agent": agent})
+
+    async def task_cancel(
+        self,
+        *,
+        task_id: str,
+        agent: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        type(self).task_cancel_calls.append(
+            {"task_id": task_id, "agent": agent, "reason": reason}
+        )
+
+
+@pytest.fixture(autouse=True)
+def _reset_stub_lithos_state() -> None:
+    """Clear ``_StubLithosClient`` class-level call records between tests
+    so cross-test leakage can't make an assertion accidentally pass."""
+    _StubLithosClient.task_complete_calls.clear()
+    _StubLithosClient.task_cancel_calls.clear()
 
 
 class _StubSource:
@@ -300,7 +342,7 @@ async def test_obsidian_sync_child_idles_when_no_obsidian_subscription(
 
     warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any(
-        "no obsidian-projection subscription configured" in m
+        "no obsidian-projection or obsidian-status-transition subscription" in m
         and "fs watcher runs but emits nothing" in m
         for m in warn_msgs
     ), warn_msgs
@@ -463,3 +505,145 @@ async def test_obsidian_sync_child_refuses_duplicate_obsidian_projection_specs(
     error_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert any("refusing to wire" in m for m in error_msgs), error_msgs
     assert stub_io == [], "source should not be constructed when refusing"
+
+
+# ── US17: status-transition handler wiring ─────────────────────────────
+
+
+async def test_obsidian_sync_child_wires_status_transition_handler(
+    tmp_path: Path, stub_io: list[EventBus]
+) -> None:
+    """Slice 2 US17 end-to-end: configure both projection AND
+    status-transition subscriptions. Publish a task.created → projection
+    writes the file. User edits the file to ``[x]`` → fs watcher emits
+    ``obsidian.task.status_changed`` → status-transition handler calls
+    ``lithos.task_complete`` with the right task_id and agent.
+    """
+    cfg = _cfg_with_obsidian(
+        tmp_path,
+        subscriptions=(
+            _projection_subscription(),
+            _status_transition_subscription(),
+        ),
+    )
+    tasks_file = cfg.obsidian_sync.vault_path / cfg.obsidian_sync.tasks_file  # type: ignore[union-attr]
+
+    async def _drive() -> None:
+        # Wait for _amain to wire everything up.
+        await asyncio.sleep(0.1)
+        bus = stub_io[-1]
+        # 1. Publish a task.created → projection writes file.
+        await bus.publish(
+            _event("lithos.task.created", task_id="abc", title="Review PR")
+        )
+        # Wait for the projection's debounced flush to commit.
+        await asyncio.sleep(0.2)
+        assert tasks_file.exists()
+        assert "- [ ] Review PR 🆔 lithos:abc" in tasks_file.read_text(encoding="utf-8")
+
+        # 2. User edits the file: flip [ ] to [x].
+        tasks_file.write_text(
+            tasks_file.read_text(encoding="utf-8").replace(
+                "- [ ] Review PR 🆔 lithos:abc",
+                "- [x] Review PR 🆔 lithos:abc",
+            ),
+            encoding="utf-8",
+        )
+        # Allow time for: fs watcher poll cycle + bus delivery +
+        # status-transition handler awaiting task_complete.
+        await asyncio.sleep(0.6)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    driver = asyncio.create_task(_drive())
+    try:
+        rc = await asyncio.wait_for(_amain(cfg), timeout=5.0)
+    finally:
+        await _cancel_and_drain(driver)
+    assert rc == 0
+
+    # The status-transition handler must have pushed exactly one
+    # task_complete for the ticked task, with the configured agent_id.
+    assert _StubLithosClient.task_complete_calls == [
+        {"task_id": "abc", "agent": "lithos-orchestrator-test"}
+    ], (
+        f"expected one task_complete call for abc; got "
+        f"{_StubLithosClient.task_complete_calls}"
+    )
+
+
+async def test_obsidian_sync_child_rejects_duplicate_status_transition_specs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, stub_io: list[EventBus]
+) -> None:
+    """Two ``[[subscriptions]]`` both with
+    action='obsidian-status-transition' would mean duplicate Lithos
+    calls per event. Refuse at startup with the per-action error
+    message."""
+    cfg = _cfg_with_obsidian(
+        tmp_path,
+        subscriptions=(
+            _status_transition_subscription("first"),
+            _status_transition_subscription("second"),
+        ),
+    )
+    source_logger = "lithos_loom.children.obsidian_sync"
+    with caplog.at_level(logging.ERROR, logger=source_logger):
+        rc = await asyncio.wait_for(_amain(cfg), timeout=2.0)
+    assert rc == 1
+    error_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any(
+        "refusing to wire" in m and "obsidian-status-transition" in m
+        for m in error_msgs
+    ), error_msgs
+    assert stub_io == [], "Lithos source should not be constructed when refusing"
+
+
+async def test_obsidian_sync_child_warns_when_status_transition_without_projection(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, stub_io: list[EventBus]
+) -> None:
+    """status-transition without projection is permitted but inert
+    (the fs watcher silently skips tasks whose marker is unknown to
+    the projection). The child must warn at startup so the operator
+    isn't left wondering why their ticks aren't pushing."""
+    cfg = _cfg_with_obsidian(
+        tmp_path,
+        subscriptions=(_status_transition_subscription("only-transition"),),
+    )
+    source_logger = "lithos_loom.children.obsidian_sync"
+    sender = asyncio.create_task(_sigterm_soon())
+    try:
+        with caplog.at_level(logging.WARNING, logger=source_logger):
+            rc = await asyncio.wait_for(_amain(cfg), timeout=3.0)
+    finally:
+        await _cancel_and_drain(sender)
+    assert rc == 0
+
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "'only-transition' is configured but no obsidian-projection" in m
+        for m in warn_msgs
+    ), warn_msgs
+
+
+async def test_obsidian_sync_child_skips_event_stream_for_status_transition_only(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, stub_io: list[EventBus]
+) -> None:
+    """status-transition alone needs ``LithosClient`` (to call
+    ``task_complete``) but NOT ``LithosEventStream`` (it consumes
+    obsidian-side events only). Verify the SSE source isn't started
+    when projection is absent."""
+    cfg = _cfg_with_obsidian(
+        tmp_path,
+        subscriptions=(_status_transition_subscription(),),
+    )
+    sender = asyncio.create_task(_sigterm_soon())
+    try:
+        rc = await asyncio.wait_for(_amain(cfg), timeout=3.0)
+    finally:
+        await _cancel_and_drain(sender)
+    assert rc == 0
+    # The LithosEventStream stub captures every construction into
+    # stub_io. With no projection, it must NOT have been instantiated.
+    assert stub_io == [], (
+        "LithosEventStream should not be constructed when only "
+        "status-transition is wired"
+    )
