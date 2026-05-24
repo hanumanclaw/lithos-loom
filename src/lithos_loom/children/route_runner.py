@@ -62,6 +62,16 @@ def _configure_logging(level: LogLevel) -> None:
     else:
         for name in _NOISY_LIBRARY_LOGGERS:
             logging.getLogger(name).setLevel(logging.WARNING)
+    # The MCP SDK's SSE reader (``mcp.client.sse.sse_reader``) logs a
+    # full ERROR-level traceback whenever its persistent session is
+    # torn down — e.g. when Lithos restarts. The route-runner holds
+    # its own long-lived LithosClient (line ~87 below), so the same
+    # SDK traceback noise would fire here too without this pin. Our
+    # reconnect loops and subscription retry policy own actual
+    # recovery; the SDK trace is just noise. CRITICAL so real
+    # auth/protocol failures still surface. Mirrors the matching
+    # pin in :mod:`lithos_loom.children.obsidian_sync`.
+    logging.getLogger("mcp.client.sse").setLevel(logging.CRITICAL)
 
 
 logger = logging.getLogger(__name__)

@@ -98,3 +98,32 @@ def test_configure_logging_does_not_silence_httpx_at_debug_level() -> None:
 
     assert logging.getLogger("httpx").level == logging.NOTSET
     assert logging.getLogger("httpx_sse").level == logging.NOTSET
+
+
+def test_configure_logging_pins_mcp_sse_logger_to_critical() -> None:
+    """The MCP SDK's ``mcp.client.sse.sse_reader`` dumps a multi-page
+    ERROR traceback whenever its session is torn down — fires on every
+    Lithos restart. The route-runner holds its own long-lived
+    LithosClient session (parallel to obsidian-sync), so the same
+    pin is needed here. Without this, the SDK traceback noise is
+    only suppressed in one of the two long-lived clients and the
+    daemon's logs still get dominated whenever Lithos cycles.
+
+    Mirrors test_configure_logging_pins_mcp_sse_logger_to_critical in
+    test_obsidian_sync_child.py.
+    """
+    import logging
+
+    from lithos_loom.children.route_runner import _configure_logging
+
+    # Reset so order-of-test doesn't mask the assertion.
+    logging.getLogger("mcp.client.sse").setLevel(logging.NOTSET)
+
+    _configure_logging("info")
+
+    mcp_logger = logging.getLogger("mcp.client.sse")
+    actual = logging.getLevelName(mcp_logger.level)
+    assert mcp_logger.level == logging.CRITICAL, (
+        f"route-runner _configure_logging must pin mcp.client.sse to "
+        f"CRITICAL; got {actual}"
+    )
