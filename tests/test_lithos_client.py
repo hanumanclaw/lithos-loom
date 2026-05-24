@@ -18,8 +18,15 @@ from mcp.types import CallToolResult, TextContent
 from lithos_loom.errors import LithosClientError
 from lithos_loom.lithos_client import (
     LithosClient,
+    Note,
+    NoteSummary,
     Task,
+    WriteResult,
+    _parse_note_list_response,
+    _parse_note_read_response,
     _parse_task_list_response,
+    _parse_write_result,
+    _slug_from_path,
 )
 
 # ── _parse_task_list_response (pure helper) ────────────────────────────
@@ -766,3 +773,529 @@ async def test_task_create_propagates_lithos_error_envelope() -> None:
     with pytest.raises(LithosClientError) as exc:
         await client.task_create(title="")
     assert exc.value.code == "invalid_input"
+
+
+# ── KB-doc surface (Slice 4 + 5) ──────────────────────────────────────
+
+
+# Pure helper: slug extraction.
+
+
+def test_slug_from_path_extracts_first_segment_under_projects() -> None:
+    assert _slug_from_path("projects/lithos-loom/context.md") == "lithos-loom"
+    assert _slug_from_path("projects/influx/context.md") == "influx"
+
+
+def test_slug_from_path_handles_deep_paths() -> None:
+    """Slug is the FIRST path segment after ``projects/``; nested
+    docs under the same slug still resolve to the same slug."""
+    assert (
+        _slug_from_path("projects/lithos-loom/architecture/design.md") == "lithos-loom"
+    )
+
+
+def test_slug_from_path_falls_back_to_first_segment_for_non_projects() -> None:
+    """Docs outside ``projects/`` still get a slug (best-effort) so
+    the field is always populated. Projection's subscription filter
+    rejects them by path-prefix before this matters in practice."""
+    assert _slug_from_path("observations/inbox/foo.md") == "observations"
+
+
+def test_slug_from_path_empty_string() -> None:
+    assert _slug_from_path("") == ""
+
+
+# Pure helper: note read response parsing.
+
+
+def test_parse_note_read_returns_typed_note() -> None:
+    result = _content(
+        {
+            "id": "doc-1",
+            "title": "Lithos Loom",
+            "content": "# Lithos Loom\n\nBody here.",
+            "path": "projects/lithos-loom/context.md",
+            "metadata": {
+                "version": 12,
+                "updated_at": "2026-05-24T14:30:00Z",
+                "tags": ["project-context", "track-1"],
+                "status": "active",
+                "note_type": "concept",
+            },
+        }
+    )
+    note = _parse_note_read_response(result)
+    assert isinstance(note, Note)
+    assert note.id == "doc-1"
+    assert note.title == "Lithos Loom"
+    assert note.body == "# Lithos Loom\n\nBody here."
+    assert note.version == 12
+    assert note.tags == ("project-context", "track-1")
+    assert note.status == "active"
+    assert note.note_type == "concept"
+    assert note.path == "projects/lithos-loom/context.md"
+    assert note.slug == "lithos-loom"
+
+
+def test_parse_note_read_raises_when_content_missing() -> None:
+    """``note_read`` is the body-required path — missing ``content``
+    is a server-side bug that should surface, not pass silently."""
+    result = _content(
+        {
+            "id": "doc-1",
+            "title": "x",
+            "path": "projects/foo/context.md",
+            "metadata": {"version": 1},
+        }
+    )
+    with pytest.raises(LithosClientError, match="missing 'content'"):
+        _parse_note_read_response(result)
+
+
+def test_parse_note_read_tolerates_missing_optional_metadata_fields() -> None:
+    """Tags / status / note_type / updated_at may all be absent on a
+    freshly-created doc — the parser fills them with safe defaults."""
+    result = _content(
+        {
+            "id": "doc-1",
+            "title": "x",
+            "content": "body",
+            "path": "projects/foo/context.md",
+            "metadata": {"version": 1},
+        }
+    )
+    note = _parse_note_read_response(result)
+    assert note.tags == ()
+    assert note.status is None
+    assert note.note_type is None
+    assert note.updated_at is None
+
+
+def test_parse_note_read_raises_on_error_envelope() -> None:
+    result = _content(
+        {"status": "error", "code": "doc_not_found", "message": "no such doc"}
+    )
+    with pytest.raises(LithosClientError) as exc:
+        _parse_note_read_response(result)
+    assert exc.value.code == "doc_not_found"
+
+
+def test_parse_note_read_wraps_malformed_version_as_invalid_response() -> None:
+    """A non-numeric ``metadata.version`` (e.g. server returned a
+    string by mistake) must surface as
+    ``LithosClientError("invalid_response", ...)``, not as a bare
+    ``ValueError`` from ``int(...)``. The parser is the boundary
+    between Lithos's loose JSON shape and the client's typed
+    surface — coercion failures must wear the client's envelope so
+    callers can ``except LithosClientError`` uniformly."""
+    result = _content(
+        {
+            "id": "doc-1",
+            "title": "x",
+            "content": "body",
+            "path": "projects/foo/context.md",
+            "metadata": {"version": "abc"},  # bad type
+        }
+    )
+    with pytest.raises(LithosClientError) as exc:
+        _parse_note_read_response(result)
+    assert exc.value.code == "invalid_response"
+
+
+def test_parse_note_read_wraps_malformed_version_list_as_invalid_response() -> None:
+    """Same as above but with ``version`` as a non-empty list —
+    exercises the ``TypeError`` branch of the catch (lists don't
+    coerce to int). Empty list falls back to 0 via the ``or`` chain,
+    which is the degenerate-but-harmless case; non-empty list is
+    the genuinely malformed shape that must surface clean."""
+    result = _content(
+        {
+            "id": "doc-1",
+            "title": "x",
+            "content": "body",
+            "path": "projects/foo/context.md",
+            "metadata": {"version": [1, 2]},
+        }
+    )
+    with pytest.raises(LithosClientError) as exc:
+        _parse_note_read_response(result)
+    assert exc.value.code == "invalid_response"
+
+
+# Pure helper: note list response parsing.
+
+
+def test_parse_note_list_returns_typed_summaries() -> None:
+    result = _content(
+        {
+            "items": [
+                {
+                    "id": "doc-1",
+                    "title": "Lithos Loom",
+                    "path": "projects/lithos-loom/context.md",
+                    "metadata": {
+                        "version": 12,
+                        "tags": ["project-context"],
+                        "status": "active",
+                        "note_type": "concept",
+                    },
+                },
+                {
+                    "id": "doc-2",
+                    "title": "Influx",
+                    "path": "projects/influx/context.md",
+                    "metadata": {
+                        "version": 3,
+                        "tags": ["project-context"],
+                        "status": "active",
+                        "note_type": "concept",
+                    },
+                },
+            ]
+        }
+    )
+    summaries = _parse_note_list_response(result)
+    assert len(summaries) == 2
+    assert all(isinstance(s, NoteSummary) for s in summaries)
+    assert summaries[0].slug == "lithos-loom"
+    assert summaries[1].slug == "influx"
+
+
+def test_parse_note_list_accepts_results_alias() -> None:
+    """Some Lithos versions wrap the list as ``results`` instead of
+    ``items``. Both shapes are tolerated."""
+    result = _content(
+        {
+            "results": [
+                {
+                    "id": "doc-1",
+                    "title": "x",
+                    "path": "projects/foo/context.md",
+                    "metadata": {"version": 1},
+                }
+            ]
+        }
+    )
+    summaries = _parse_note_list_response(result)
+    assert len(summaries) == 1
+
+
+def test_parse_note_list_returns_empty_list_when_no_items() -> None:
+    result = _content({"items": []})
+    assert _parse_note_list_response(result) == []
+
+
+def test_parse_note_list_raises_on_missing_items_key() -> None:
+    result = _content({"unexpected": "shape"})
+    with pytest.raises(LithosClientError, match="missing 'items'"):
+        _parse_note_list_response(result)
+
+
+def test_parse_note_list_raises_on_error_envelope() -> None:
+    result = _content(
+        {"status": "error", "code": "invalid_input", "message": "bad prefix"}
+    )
+    with pytest.raises(LithosClientError) as exc:
+        _parse_note_list_response(result)
+    assert exc.value.code == "invalid_input"
+
+
+# Pure helper: write result parsing.
+
+
+def test_parse_write_result_created() -> None:
+    payload = {
+        "status": "created",
+        "document": {
+            "id": "doc-new",
+            "title": "x",
+            "path": "projects/x/context.md",
+            "metadata": {"version": 1},
+        },
+    }
+    wr = _parse_write_result(payload)
+    assert wr.status == "created"
+    assert wr.note is not None
+    assert wr.note.id == "doc-new"
+
+
+def test_parse_write_result_version_conflict_carries_current_version() -> None:
+    """The conflict envelope must carry ``current_version`` so the
+    bidirectional-sync caller can pull + diff against it."""
+    payload = {
+        "status": "version_conflict",
+        "message": "expected 11, got 12",
+        "current_version": 12,
+    }
+    wr = _parse_write_result(payload)
+    assert wr.status == "version_conflict"
+    assert wr.current_version == 12
+    assert wr.note is None
+    assert "expected 11" in (wr.message or "")
+
+
+def test_parse_write_result_slug_collision_carries_existing_id() -> None:
+    payload = {
+        "status": "slug_collision",
+        "message": "slug 'foo' already used by doc-42",
+        "slug_collision_existing_id": "doc-42",
+    }
+    wr = _parse_write_result(payload)
+    assert wr.status == "slug_collision"
+    assert wr.slug_collision_existing_id == "doc-42"
+
+
+def test_parse_write_result_rejects_unknown_status() -> None:
+    """A status value Lithos doesn't define is a server-side bug
+    that should surface, not pass silently."""
+    payload = {"status": "future_outcome_we_dont_know_about"}
+    with pytest.raises(LithosClientError, match="unexpected status"):
+        _parse_write_result(payload)
+
+
+# Async method tests.
+
+
+async def test_note_read_returns_note_when_found() -> None:
+    client, session = _client_with_session(
+        _content(
+            {
+                "id": "doc-1",
+                "title": "Loom",
+                "content": "body",
+                "path": "projects/loom/context.md",
+                "metadata": {"version": 1, "tags": ["project-context"]},
+            }
+        )
+    )
+    note = await client.note_read(id="doc-1")
+    assert note is not None
+    assert note.id == "doc-1"
+    assert note.slug == "loom"
+    session.call_tool.assert_awaited_once_with("lithos_read", arguments={"id": "doc-1"})
+
+
+async def test_note_read_returns_none_on_doc_not_found() -> None:
+    """``doc_not_found`` is folded into ``None`` so handlers can
+    treat deleted docs as a no-op rather than try/except."""
+    client, _ = _client_with_session(
+        _content({"status": "error", "code": "doc_not_found", "message": "no"})
+    )
+    assert await client.note_read(id="ghost") is None
+
+
+async def test_note_read_requires_id_or_path() -> None:
+    client, _ = _client_with_session(_content({}))
+    with pytest.raises(LithosClientError, match="one of id"):
+        await client.note_read()
+
+
+async def test_note_read_propagates_other_errors() -> None:
+    client, _ = _client_with_session(
+        _content({"status": "error", "code": "transport_failure", "message": "down"})
+    )
+    with pytest.raises(LithosClientError) as exc:
+        await client.note_read(id="doc-1")
+    assert exc.value.code == "transport_failure"
+
+
+async def test_note_write_create_passes_arguments() -> None:
+    client, session = _client_with_session(
+        _content(
+            {
+                "status": "created",
+                "document": {
+                    "id": "doc-new",
+                    "title": "Loom",
+                    "path": "projects/loom/context.md",
+                    "metadata": {"version": 1},
+                },
+            }
+        )
+    )
+    wr = await client.note_write(
+        title="Loom",
+        content="body",
+        tags=["project-context"],
+        path="projects/loom/context.md",
+    )
+    assert wr.status == "created"
+    assert wr.note is not None
+    session.call_tool.assert_awaited_once_with(
+        "lithos_write",
+        arguments={
+            "title": "Loom",
+            "content": "body",
+            "agent": "lithos-orchestrator-test",
+            "note_type": "concept",
+            "tags": ["project-context"],
+            "path": "projects/loom/context.md",
+        },
+    )
+
+
+async def test_note_write_update_passes_expected_version() -> None:
+    """The update path includes ``expected_version`` for optimistic
+    locking — the Lithos surface compares this against the canonical
+    version and returns ``version_conflict`` on mismatch."""
+    client, session = _client_with_session(
+        _content(
+            {
+                "status": "updated",
+                "document": {
+                    "id": "doc-1",
+                    "title": "Loom",
+                    "path": "projects/loom/context.md",
+                    "metadata": {"version": 13},
+                },
+            }
+        )
+    )
+    wr = await client.note_write(
+        id="doc-1",
+        title="Loom",
+        content="new body",
+        expected_version=12,
+    )
+    assert wr.status == "updated"
+    args = session.call_tool.await_args.kwargs["arguments"]
+    assert args["id"] == "doc-1"
+    assert args["expected_version"] == 12
+
+
+async def test_note_write_version_conflict_does_not_raise() -> None:
+    """Version conflicts come back as data, not exceptions —
+    bidirectional sync needs this branch to be expected, not a
+    try/except site."""
+    client, _ = _client_with_session(
+        _content(
+            {
+                "status": "version_conflict",
+                "message": "expected 11, got 12",
+                "current_version": 12,
+            }
+        )
+    )
+    wr = await client.note_write(
+        id="doc-1", title="x", content="y", expected_version=11
+    )
+    assert wr.status == "version_conflict"
+    assert wr.current_version == 12
+
+
+async def test_note_write_slug_collision_does_not_raise() -> None:
+    """Same shape as version_conflict — slug collisions are operator-
+    actionable data, not exceptional control flow."""
+    client, _ = _client_with_session(
+        _content(
+            {
+                "status": "slug_collision",
+                "message": "taken",
+                "slug_collision_existing_id": "doc-42",
+            }
+        )
+    )
+    wr = await client.note_write(title="x", content="y", path="projects/foo/context.md")
+    assert wr.status == "slug_collision"
+    assert wr.slug_collision_existing_id == "doc-42"
+
+
+async def test_note_write_error_envelope_still_raises() -> None:
+    """``status: "error"`` (the truly exceptional envelope) DOES
+    raise — distinct from domain failures like version_conflict."""
+    client, _ = _client_with_session(
+        _content({"status": "error", "code": "transport_failure", "message": "down"})
+    )
+    with pytest.raises(LithosClientError) as exc:
+        await client.note_write(title="x", content="y", path="projects/foo/context.md")
+    assert exc.value.code == "transport_failure"
+
+
+async def test_note_write_requires_agent_id() -> None:
+    client = LithosClient(base_url="http://example.test:8765")  # no agent_id
+    fake_session = AsyncMock()
+    client._session = fake_session  # type: ignore[assignment]
+    with pytest.raises(LithosClientError, match="agent"):
+        await client.note_write(title="x", content="y", path="projects/foo/context.md")
+
+
+async def test_note_write_omits_optional_args_when_none() -> None:
+    """``id``, ``path``, ``expected_version``, ``status``, ``tags``
+    are all omitted when None — strict Lithos servers don't reject
+    unexpected keys, and absent keys are cleaner on the wire."""
+    client, session = _client_with_session(
+        _content(
+            {
+                "status": "created",
+                "document": {
+                    "id": "doc-new",
+                    "title": "x",
+                    "path": "",
+                    "metadata": {"version": 1},
+                },
+            }
+        )
+    )
+    await client.note_write(title="x", content="y")
+    args = session.call_tool.await_args.kwargs["arguments"]
+    assert "id" not in args
+    assert "path" not in args
+    assert "expected_version" not in args
+    assert "status" not in args
+    assert "tags" not in args
+
+
+async def test_note_list_passes_filters_and_returns_summaries() -> None:
+    client, session = _client_with_session(
+        _content(
+            {
+                "items": [
+                    {
+                        "id": "doc-1",
+                        "title": "Loom",
+                        "path": "projects/loom/context.md",
+                        "metadata": {"version": 1, "tags": ["project-context"]},
+                    }
+                ]
+            }
+        )
+    )
+    summaries = await client.note_list(
+        path_prefix="projects/", tags=["project-context"]
+    )
+    assert len(summaries) == 1
+    assert summaries[0].slug == "loom"
+    session.call_tool.assert_awaited_once_with(
+        "lithos_list",
+        arguments={
+            "limit": 100,
+            "path_prefix": "projects/",
+            "tags": ["project-context"],
+        },
+    )
+
+
+async def test_note_list_default_limit_is_100() -> None:
+    """Documented in the docstring; pin so a future change to a
+    smaller default doesn't silently break the obsidian-sync child's
+    bootstrap (~20 projects in current use)."""
+    client, session = _client_with_session(_content({"items": []}))
+    await client.note_list()
+    args = session.call_tool.await_args.kwargs["arguments"]
+    assert args["limit"] == 100
+
+
+async def test_note_list_omits_filters_when_none() -> None:
+    client, session = _client_with_session(_content({"items": []}))
+    await client.note_list()
+    args = session.call_tool.await_args.kwargs["arguments"]
+    assert "path_prefix" not in args
+    assert "tags" not in args
+
+
+def test_write_result_default_warnings_is_empty_tuple() -> None:
+    """Regression: ``warnings`` default must be the canonical empty
+    tuple (not None, not a fresh list each construction) so handler
+    code can ``if not wr.warnings:`` test cleanly."""
+    wr = WriteResult(status="created")
+    assert wr.warnings == ()

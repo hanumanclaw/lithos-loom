@@ -26,10 +26,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from types import TracebackType
-from typing import Any
+from typing import Any, Literal
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -37,7 +37,27 @@ from mcp.types import CallToolResult
 
 from lithos_loom.errors import LithosClientError
 
-__all__ = ["LithosClient", "Task"]
+__all__ = ["LithosClient", "Note", "NoteSummary", "Task", "WriteResult"]
+
+
+WriteStatus = Literal[
+    "created",
+    "updated",
+    "duplicate",
+    "version_conflict",
+    "slug_collision",
+    "invalid_input",
+    "content_too_large",
+    "error",
+]
+"""All terminal status values ``lithos_write`` can return.
+
+Mirrors the Lithos-side ``WriteOutcome`` enum (``lithos/src/lithos/intake.py``).
+``created`` / ``updated`` are success paths; everything else means the
+caller has to decide what to do. ``version_conflict`` and
+``slug_collision`` are the two cases the bidirectional-sync path
+(Slice 5) reacts to programmatically.
+"""
 
 
 @dataclass(frozen=True)
@@ -72,6 +92,90 @@ class Task:
     created_by: str = ""
     created_at: datetime | None = None
     outcome: str | None = None
+
+
+@dataclass(frozen=True)
+class Note:
+    """A full Lithos KB document as returned by ``lithos_read``
+    (Slice 4 + 5).
+
+    Field set carries everything the projection layer needs to render
+    a vault file with frontmatter: identity (``id``, ``path``,
+    ``slug``), versioning (``version``, ``updated_at``), body, and
+    the metadata fields the operator's queries rely on (``status``,
+    ``tags``, ``note_type``). ``slug`` is derived server-side from
+    the path's first segment under ``projects/`` and exposed here as
+    a convenience so callers don't have to re-parse it.
+
+    Frozen + Mapping-typed ``metadata.extra`` so subscription handlers
+    can read additional persisted fields without a client plumbing PR
+    (mirrors the :class:`Task` design).
+    """
+
+    id: str
+    title: str
+    body: str
+    version: int
+    updated_at: datetime | None
+    tags: tuple[str, ...]
+    status: str | None  # active | archived | quarantined | None
+    note_type: str | None
+    path: str  # e.g. "projects/lithos-loom/context.md"
+    slug: str  # derived: first path segment after "projects/"
+
+
+@dataclass(frozen=True)
+class NoteSummary:
+    """Lightweight ``Note`` projection returned by ``lithos_list``.
+
+    Same identity + version + metadata fields as :class:`Note` but
+    without the body — `lithos_list` doesn't return content by
+    default and pulling it for an enumeration view would be wasteful.
+    Use :meth:`LithosClient.note_read` to fetch the full body for a
+    specific id once the caller has decided which docs to project.
+    """
+
+    id: str
+    title: str
+    version: int
+    updated_at: datetime | None
+    tags: tuple[str, ...]
+    status: str | None
+    note_type: str | None
+    path: str
+    slug: str
+
+
+@dataclass(frozen=True)
+class WriteResult:
+    """Result envelope from :meth:`LithosClient.note_write`.
+
+    Mirrors Lithos's ``WriteResult`` / ``WriteOutcome`` (see
+    ``lithos/src/lithos/knowledge.py`` and ``intake.py``). The handler
+    inspects ``.status`` to branch: ``"created"`` / ``"updated"`` are
+    success paths; ``"version_conflict"`` carries ``current_version``
+    so the caller can re-fetch and resolve; ``"slug_collision"``
+    carries ``slug_collision_existing_id`` so the caller can surface
+    the conflicting doc to the operator.
+
+    Critically: a version_conflict response does NOT raise — the
+    caller MUST check ``.status``. Raising would force every push-back
+    site to try/except, masking the intent that a conflict is an
+    expected branch of bidirectional sync.
+    """
+
+    status: WriteStatus
+    note: Note | None = None
+    """Set on ``"created"`` / ``"updated"`` (the persisted doc)."""
+    current_version: int | None = None
+    """Set on ``"version_conflict"`` — the version Lithos actually has,
+    which the caller pulls + diffs against to resolve."""
+    slug_collision_existing_id: str | None = None
+    """Set on ``"slug_collision"`` — the id of the doc that already
+    owns this slug, for operator surfacing."""
+    message: str | None = None
+    """Operator-readable message on non-success outcomes."""
+    warnings: tuple[str, ...] = field(default_factory=tuple)
 
 
 class LithosClient:
@@ -481,6 +585,171 @@ class LithosClient:
                 return None
             raise
 
+    # ── KB-doc surface (Slice 4 + 5) ─────────────────────────────────
+
+    async def note_read(
+        self,
+        *,
+        id: str | None = None,
+        path: str | None = None,
+    ) -> Note | None:
+        """Fetch a full Lithos KB document by ``id`` or ``path``.
+
+        Returns ``None`` if Lithos reports the doc as missing
+        (``code="doc_not_found"`` envelope), so callers can treat
+        deleted docs as a no-op rather than try/except.
+
+        Exactly one of ``id`` / ``path`` should be passed — Lithos
+        accepts either but the convention here is "use id when you
+        have one, path otherwise" (the projection layer always has
+        the id; the doctor may have only the path).
+        """
+        if self._session is None:
+            raise LithosClientError(
+                "client_not_initialised",
+                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
+            )
+        if id is None and path is None:
+            raise LithosClientError(
+                "invalid_input", "note_read requires one of id= or path="
+            )
+        arguments: dict[str, Any] = {}
+        if id is not None:
+            arguments["id"] = id
+        if path is not None:
+            arguments["path"] = path
+        result = await self._session.call_tool("lithos_read", arguments=arguments)
+        try:
+            return _parse_note_read_response(result)
+        except LithosClientError as exc:
+            if exc.code == "doc_not_found":
+                return None
+            raise
+
+    async def note_write(
+        self,
+        *,
+        agent: str | None = None,
+        title: str,
+        content: str,
+        tags: list[str] | None = None,
+        note_type: str = "concept",
+        path: str | None = None,
+        id: str | None = None,
+        expected_version: int | None = None,
+        status: str | None = None,
+    ) -> WriteResult:
+        """Create or update a Lithos KB doc; returns a :class:`WriteResult`.
+
+        **Does not raise on ``version_conflict`` or ``slug_collision``** —
+        the caller MUST inspect ``WriteResult.status`` and branch.
+        This is deliberate: bidirectional sync needs both outcomes to
+        be expected branches, not exceptions. Other domain errors
+        (``invalid_input``, ``content_too_large``) also come back as
+        ``WriteResult`` envelopes with the corresponding status;
+        unexpected transport errors propagate as raised
+        :class:`LithosClientError`.
+
+        ``id`` triggers update semantics; ``path`` + no ``id`` creates.
+        ``expected_version`` is only meaningful on update — Lithos
+        compares against the canonical version and returns
+        ``status="version_conflict"`` with ``current_version`` populated
+        if the operator's view is stale.
+
+        Defaults ``note_type`` to ``"concept"`` to match the D14
+        convention for project context docs (which use the ``concept``
+        enum value + a ``project-context`` tag, since the enum doesn't
+        have a dedicated value).
+        """
+        agent_id = agent or self.agent_id
+        if not agent_id:
+            raise LithosClientError("missing_agent", "note_write needs an agent id")
+        arguments: dict[str, Any] = {
+            "title": title,
+            "content": content,
+            "agent": agent_id,
+            "note_type": note_type,
+        }
+        if tags is not None:
+            arguments["tags"] = tags
+        if path is not None:
+            arguments["path"] = path
+        if id is not None:
+            arguments["id"] = id
+        if expected_version is not None:
+            arguments["expected_version"] = expected_version
+        if status is not None:
+            arguments["status"] = status
+        payload = await self._call_for_write_result("lithos_write", arguments)
+        return _parse_write_result(payload)
+
+    async def note_list(
+        self,
+        *,
+        path_prefix: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 100,
+    ) -> list[NoteSummary]:
+        """Enumerate KB docs matching the filters. Returns a list of
+        lightweight :class:`NoteSummary` (no body).
+
+        ``path_prefix`` is the cheapest server-side filter for
+        directory-scoped enumeration (``"projects/"`` for Slice 4).
+        ``tags`` narrows further (e.g. ``["project-context"]``).
+
+        ``limit`` is forwarded as-is; the projection bootstrap caps it
+        at 100 by default, which comfortably exceeds the user's 20-ish
+        project count. If your call site might exceed the limit,
+        implement pagination at the call site — this method
+        intentionally does NOT auto-page because the projection layer
+        works in single-batch semantics today and adding hidden
+        pagination would change observability without changing
+        contract.
+        """
+        if self._session is None:
+            raise LithosClientError(
+                "client_not_initialised",
+                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
+            )
+        arguments: dict[str, Any] = {"limit": limit}
+        if path_prefix is not None:
+            arguments["path_prefix"] = path_prefix
+        if tags is not None:
+            arguments["tags"] = tags
+        result = await self._session.call_tool("lithos_list", arguments=arguments)
+        return _parse_note_list_response(result)
+
+    async def _call_for_write_result(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Like :meth:`_call` but does NOT raise on
+        ``version_conflict`` / ``slug_collision`` envelopes — the
+        caller (:meth:`note_write`) needs to see them as data. Other
+        error envelopes still raise."""
+        if self._session is None:
+            raise LithosClientError(
+                "client_not_initialised",
+                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
+            )
+        result = await self._session.call_tool(tool, arguments=arguments)
+        payload = _payload_from_result(result)
+        if not isinstance(payload, dict):
+            raise LithosClientError(
+                "invalid_response",
+                f"expected dict response from {tool}, got {type(payload).__name__}",
+            )
+        # Lithos's write surface returns "status" on every response —
+        # success ("created", "updated") AND domain failures
+        # ("version_conflict", "slug_collision", "invalid_input",
+        # etc.). Re-raise only the truly exceptional envelope
+        # (``status == "error"``); the rest are returned for the
+        # caller to inspect.
+        if payload.get("status") == "error":
+            _raise_if_error_envelope(payload)
+        return payload
+
 
 # ── Pure parse helpers (heavily unit-tested) ───────────────────────────
 
@@ -608,3 +877,190 @@ def _raise_if_error_envelope(payload: Mapping[str, Any]) -> None:
         code=str(payload.get("code") or "error"),
         message=str(payload.get("message") or ""),
     )
+
+
+# ── Note parse helpers (Slice 4 + 5) ───────────────────────────────────
+
+
+def _slug_from_path(path: str) -> str:
+    """Extract the project slug from a Lithos doc path.
+
+    For ``projects/<slug>/<filename>.md`` returns ``<slug>``. For
+    paths that don't sit under ``projects/`` (e.g. ``observations/...``)
+    returns the first segment as a best-effort fallback so the
+    field is always populated.
+
+    Empty path → empty slug. The caller is responsible for filtering
+    docs that shouldn't be projected (the projection subscription's
+    ``path_prefix`` filter does this).
+    """
+    if not path:
+        return ""
+    parts = path.split("/")
+    if len(parts) >= 2 and parts[0] == "projects":
+        return parts[1]
+    return parts[0]
+
+
+def _parse_note(raw: Any, *, body_required: bool) -> Note:
+    """Parse a Lithos KB-doc envelope into a :class:`Note`.
+
+    ``body_required=True`` (for ``note_read`` responses) raises if
+    ``content`` is missing; ``False`` is used by callers that wrap
+    list-shaped responses where bodies are absent by design.
+    """
+    if not isinstance(raw, dict):
+        raise LithosClientError(
+            "invalid_response", f"note entry must be a dict, got {type(raw).__name__}"
+        )
+    try:
+        doc_id = str(raw["id"])
+        title = str(raw["title"])
+        path = str(raw.get("path") or "")
+        metadata = raw.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        tags_raw = metadata.get("tags") or raw.get("tags") or []
+        version_raw = metadata.get("version") or raw.get("version") or 0
+        body_raw = raw.get("content")
+        if body_required and body_raw is None:
+            raise LithosClientError(
+                "invalid_response", "note response missing 'content'"
+            )
+        return Note(
+            id=doc_id,
+            title=title,
+            body=str(body_raw or ""),
+            version=int(version_raw),
+            updated_at=_parse_iso_datetime(
+                metadata.get("updated_at") or raw.get("updated_at")
+            ),
+            tags=tuple(str(t) for t in tags_raw),
+            status=_optional_str(metadata.get("status") or raw.get("status")),
+            note_type=_optional_str(metadata.get("note_type") or raw.get("note_type")),
+            path=path,
+            slug=_slug_from_path(path),
+        )
+    except KeyError as exc:
+        raise LithosClientError(
+            "invalid_response", f"note entry missing required field: {exc.args[0]}"
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        # Catches coercion failures from ``int(version_raw)`` /
+        # ``str(...)`` / ``tuple(str(t) for t in tags_raw)`` when the
+        # server returns malformed field types (``version="abc"``,
+        # ``tags={...}`` instead of a list, etc.). Without this the
+        # raw conversion exception would escape, breaking the
+        # otherwise-consistent "bad server shape → typed
+        # LithosClientError" contract the rest of the client uses.
+        raise LithosClientError(
+            "invalid_response", f"malformed note entry: {exc}"
+        ) from exc
+
+
+def _parse_note_summary(raw: Any) -> NoteSummary:
+    """Parse a list-view note entry. Same shape as :func:`_parse_note`
+    but without the body and with no ``body_required`` check."""
+    note = _parse_note(raw, body_required=False)
+    return NoteSummary(
+        id=note.id,
+        title=note.title,
+        version=note.version,
+        updated_at=note.updated_at,
+        tags=note.tags,
+        status=note.status,
+        note_type=note.note_type,
+        path=note.path,
+        slug=note.slug,
+    )
+
+
+def _parse_note_read_response(result: CallToolResult) -> Note:
+    payload = _payload_from_result(result)
+    if not isinstance(payload, dict):
+        raise LithosClientError(
+            "invalid_response",
+            f"expected dict response, got {type(payload).__name__}",
+        )
+    _raise_if_error_envelope(payload)
+    # ``lithos_read`` returns the doc fields at the top level (not
+    # wrapped in a ``"document"`` key) — see lithos/server.py:1337.
+    return _parse_note(payload, body_required=True)
+
+
+def _parse_note_list_response(result: CallToolResult) -> list[NoteSummary]:
+    payload = _payload_from_result(result)
+    if not isinstance(payload, dict):
+        raise LithosClientError(
+            "invalid_response",
+            f"expected dict response, got {type(payload).__name__}",
+        )
+    _raise_if_error_envelope(payload)
+    items = payload.get("items")
+    if items is None:
+        # Some Lithos versions return ``results`` instead — accept both.
+        items = payload.get("results")
+    if items is None:
+        raise LithosClientError(
+            "invalid_response",
+            "missing 'items' (or 'results') key in lithos_list response",
+        )
+    if not isinstance(items, list):
+        raise LithosClientError(
+            "invalid_response", "'items' must be a list in lithos_list response"
+        )
+    return [_parse_note_summary(item) for item in items]
+
+
+def _parse_write_result(payload: dict[str, Any]) -> WriteResult:
+    """Parse a ``lithos_write`` envelope into a :class:`WriteResult`.
+
+    Trusts the caller (:meth:`LithosClient._call_for_write_result`)
+    to have already raised on the truly exceptional ``status=="error"``
+    envelope; all other statuses come through here as data.
+    """
+    status = str(payload.get("status") or "")
+    if status not in (
+        "created",
+        "updated",
+        "duplicate",
+        "version_conflict",
+        "slug_collision",
+        "invalid_input",
+        "content_too_large",
+    ):
+        raise LithosClientError(
+            "invalid_response",
+            f"unexpected status in lithos_write response: {status!r}",
+        )
+    document = payload.get("document")
+    note = (
+        _parse_note(document, body_required=False)
+        if isinstance(document, dict) and document
+        else None
+    )
+    warnings_raw = payload.get("warnings") or []
+    return WriteResult(
+        status=status,  # type: ignore[arg-type]
+        note=note,
+        current_version=(
+            int(payload["current_version"])
+            if isinstance(payload.get("current_version"), int)
+            else None
+        ),
+        slug_collision_existing_id=_optional_str(
+            payload.get("slug_collision_existing_id")
+        ),
+        message=_optional_str(payload.get("message")),
+        warnings=tuple(str(w) for w in warnings_raw),
+    )
+
+
+def _optional_str(value: Any) -> str | None:
+    """Coerce a value to ``str`` only when truthy; ``None`` / empty
+    string collapse to ``None`` so consumers don't have to disambiguate
+    'absent' from 'empty string'."""
+    if value is None:
+        return None
+    s = str(value)
+    return s if s else None
