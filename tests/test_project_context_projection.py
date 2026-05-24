@@ -990,3 +990,184 @@ def test_round_trip_render_then_extract(tmp_path: Path) -> None:
     assert fm["lithos_version"] == note.version
     assert fm["slug"] == note.slug
     assert fm["tags"] == list(note.tags)
+
+
+# ── Cold-start divergence (reviewer finding on PR #45) ─────────────────
+
+
+async def test_cold_start_divergence_routes_to_conflict_resolver(
+    tmp_path: Path,
+) -> None:
+    """Operator edited a projected file while the daemon was down.
+    On restart, the bootstrap event for that doc finds an on-disk
+    body that differs from canonical. The handler must route through
+    the conflict resolver — moving the local body to the conflicts
+    archive — rather than silently overwriting it."""
+    cfg = _cfg(tmp_path)
+    lithos = AsyncMock()
+    lithos.note_read.return_value = _note(body="Server body")
+    sync_state = ProjectionSyncState()  # empty — cold start
+    handler = make_handler(cfg, sync_state=sync_state)
+
+    # Pre-existing file from a prior session, edited by the operator
+    # while we were down. Frontmatter looks legit (some prior version),
+    # body differs from what Lithos now has.
+    target = _vault_path(tmp_path, "lithos-loom/context.md")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "---\nlithos_id: doc-1\nlithos_version: 11\n---\n"
+        "# Lithos Loom\n\nOperator's offline edit\n",
+        encoding="utf-8",
+    )
+
+    await handler(_event("lithos.note.created"), _ctx(lithos))
+
+    # Conflict file holds the operator's local body.
+    conflicts_dir = tmp_path / "vault" / "_lithos" / "conflicts"
+    conflict_files = list(conflicts_dir.glob("lithos-loom.context.*.md"))
+    assert len(conflict_files) == 1, (
+        "operator's edit must be preserved in the conflicts archive — "
+        "otherwise restart with locally diverged files silently loses data"
+    )
+    assert "Operator's offline edit" in conflict_files[0].read_text()
+
+    # Canonical now at the original path.
+    rendered = target.read_text()
+    fm, body = extract_frontmatter(rendered)
+    assert fm["lithos_version"] == 12  # canonical's version
+    assert "Server body" in body
+
+    # sync_state populated by the resolver so subsequent events for
+    # the same doc take the normal path.
+    assert "doc-1" in sync_state.note_body_hashes
+
+
+async def test_cold_start_matching_body_takes_normal_write_path(
+    tmp_path: Path,
+) -> None:
+    """File on disk has the SAME body as canonical (daemon restarted
+    but operator didn't edit, OR Lithos hasn't changed since last
+    projection). The divergence check must NOT trigger a conflict;
+    the normal write path runs and refreshes frontmatter (which
+    may have advanced even if body didn't)."""
+    cfg = _cfg(tmp_path)
+    canonical = _note(body="Same body on both sides")
+    lithos = AsyncMock()
+    lithos.note_read.return_value = canonical
+    sync_state = ProjectionSyncState()  # empty — cold start
+    handler = make_handler(cfg, sync_state=sync_state)
+
+    # Pre-render canonical to get the exact body that's about to be
+    # on disk too. Stripping a leading-H1 line and trailing whitespace
+    # is what the renderer does; mirroring that here without depending
+    # on the renderer's internals is fragile — easier to render the
+    # canonical first, dump it, then check the divergence path stays
+    # silent on a byte-identical disk file with stale frontmatter.
+    import dataclasses
+
+    rendered = render_doc(
+        dataclasses.replace(canonical, path="projects/lithos-loom/context.md")
+    )
+    target = _vault_path(tmp_path, "lithos-loom/context.md")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Write the canonical body but with STALE frontmatter (older
+    # version). This is exactly the "daemon restarted, Lithos
+    # unchanged" case — body matches, frontmatter may be stale.
+    _, canonical_body = extract_frontmatter(rendered)
+    target.write_text(
+        f"---\nlithos_id: doc-1\nlithos_version: 1\n---\n{canonical_body}",
+        encoding="utf-8",
+    )
+
+    await handler(_event("lithos.note.created"), _ctx(lithos))
+
+    # NO conflict file should have been created.
+    conflicts_dir = tmp_path / "vault" / "_lithos" / "conflicts"
+    if conflicts_dir.exists():
+        assert list(conflicts_dir.iterdir()) == []
+
+    # Local frontmatter refreshed (version bumped to canonical).
+    fm, _ = extract_frontmatter(target.read_text())
+    assert fm["lithos_version"] == canonical.version
+
+
+async def test_cold_start_check_does_not_fire_after_first_event(
+    tmp_path: Path,
+) -> None:
+    """After the first event populates ``sync_state.note_body_hashes``
+    for a doc, subsequent events MUST take the normal path even if
+    the on-disk file diverges from canonical. (Runtime divergence is
+    handled by the dir-watcher → note-push → version_conflict path,
+    NOT by the projection.)"""
+    cfg = _cfg(tmp_path)
+    lithos = AsyncMock()
+    lithos.note_read.return_value = _note(body="Server")
+    sync_state = ProjectionSyncState()
+    handler = make_handler(cfg, sync_state=sync_state)
+
+    # First event populates sync_state.
+    await handler(_event("lithos.note.created"), _ctx(lithos))
+    target = _vault_path(tmp_path, "lithos-loom/context.md")
+    assert target.exists()
+    baseline_body_hash = sync_state.note_body_hashes["doc-1"]
+
+    # Operator races in with an edit BEFORE we see the next Lithos
+    # event (real-runtime case; the dir-watcher would emit and the
+    # push handler would handle it, but here we simulate the
+    # projection re-fetching first).
+    target.write_text(
+        "---\nlithos_id: doc-1\nlithos_version: 12\n---\n"
+        "# Lithos Loom\n\nOperator-just-edited\n",
+        encoding="utf-8",
+    )
+
+    # Second projection event arrives. Cold-start check MUST NOT
+    # fire — sync_state has a baseline for this doc. Normal write
+    # path runs and overwrites the operator's edit. That's the
+    # intended behavior: runtime divergence is the dir-watcher's
+    # job; if the operator edited and we got a Lithos update at
+    # the same time, push-via-watcher and project-via-Lithos race
+    # and the watcher path is what preserves the operator edit.
+    lithos.note_read.return_value = _note(body="Server v2", version=13)
+    await handler(_event("lithos.note.updated"), _ctx(lithos))
+
+    # NO conflict file created — the cold-start path didn't fire.
+    conflicts_dir = tmp_path / "vault" / "_lithos" / "conflicts"
+    if conflicts_dir.exists():
+        assert list(conflicts_dir.iterdir()) == []
+
+    # sync_state body hash advanced to the new canonical (not the
+    # operator's body), confirming the normal path ran.
+    assert sync_state.note_body_hashes["doc-1"] != baseline_body_hash
+
+
+async def test_cold_start_unreadable_file_falls_through(
+    tmp_path: Path,
+) -> None:
+    """File exists but unreadable (chmod 000, permission flip) → skip
+    the divergence check and let the normal write path try its luck.
+    Don't crash."""
+    cfg = _cfg(tmp_path)
+    lithos = AsyncMock()
+    lithos.note_read.return_value = _note(body="Server")
+    sync_state = ProjectionSyncState()
+    handler = make_handler(cfg, sync_state=sync_state)
+
+    target = _vault_path(tmp_path, "lithos-loom/context.md")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("anything", encoding="utf-8")
+    target.chmod(0o000)  # unreadable
+
+    try:
+        # Normal write path runs — it can still write because parent
+        # dir is writable; the atomic rename overwrites the
+        # unreadable file. No crash, no conflict.
+        await handler(_event("lithos.note.created"), _ctx(lithos))
+    finally:
+        # Restore permissions if the test was interrupted before the
+        # rewrite (rewrite would also reset them).
+        if target.exists():
+            target.chmod(0o644)
+
+    # The doc was projected.
+    assert "doc-1" in sync_state.note_body_hashes

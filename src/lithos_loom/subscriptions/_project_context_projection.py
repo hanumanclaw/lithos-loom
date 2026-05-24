@@ -62,9 +62,10 @@ from typing import Any
 from lithos_loom.bus import Event
 from lithos_loom.config import LoomConfig
 from lithos_loom.lithos_client import Note
-from lithos_loom.render_project_context import render_doc
+from lithos_loom.render_project_context import compute_body_hash, render_doc
 from lithos_loom.subscriptions import Handler, SubscriptionContext
 from lithos_loom.subscriptions._atomic_write import write_file_atomic
+from lithos_loom.subscriptions._note_conflict import resolve_conflict
 from lithos_loom.sync_state import ProjectionSyncState
 
 __all__ = ["make_handler"]
@@ -74,6 +75,14 @@ logger = logging.getLogger(__name__)
 
 _PROJECTS_PATH_PREFIX = "projects/"
 _PROJECT_CONTEXT_TAG = "project-context"
+# Relative-to-vault location of the conflicts archive — mirror of the
+# value the note-push handler uses. Centralised here rather than
+# importing across modules to keep each module's deps shallow; the
+# anti-drift contract is "if the operator surfaces conflicts somewhere
+# else, both this constant AND _note_push._CONFLICTS_RELPATH must
+# move together." Today there's nothing to drift against because
+# there's no operator-facing config knob for it.
+_CONFLICTS_RELPATH = Path("_lithos/conflicts")
 
 _REEVALUATE_EVENTS: frozenset[str] = frozenset(
     {"lithos.note.created", "lithos.note.updated"}
@@ -106,6 +115,7 @@ def make_handler(
             "supervisor's spawn gate should have prevented this"
         )
     projects_root = obs.vault_path / obs.projects_dir
+    conflicts_dir = obs.vault_path / _CONFLICTS_RELPATH
     sync_state = sync_state if sync_state is not None else ProjectionSyncState()
 
     async def handle(event: Event, ctx: SubscriptionContext) -> None:
@@ -215,7 +225,9 @@ def make_handler(
             )
             return
 
-        await _project_note(note, sse_path, projects_root, sync_state, ctx)
+        await _project_note(
+            note, sse_path, projects_root, conflicts_dir, sync_state, ctx
+        )
 
     return handle
 
@@ -265,6 +277,7 @@ async def _project_note(
     note: Note,
     lithos_path: str,
     projects_root: Path,
+    conflicts_dir: Path,
     sync_state: ProjectionSyncState,
     ctx: Any,
 ) -> None:
@@ -317,6 +330,12 @@ async def _project_note(
     note_for_render = dataclasses.replace(note, path=lithos_path, slug=slug)
     rendered = render_doc(note_for_render)
     rendered_file_hash = hashlib.sha256(rendered.encode("utf-8")).digest()
+    # Body-only hash is what Slice 5's dir-watcher reads as the
+    # baseline for its body-only diff. Recording it here means the
+    # watcher can suppress its own self-write detection on either
+    # body change AND see that frontmatter-only operator edits are
+    # the only thing that should be silently absorbed.
+    rendered_body_hash = compute_body_hash(rendered)
 
     # Lithos path is ``projects/<slug>/<filename>.md``; strip the
     # ``projects/`` prefix so the vault path is
@@ -330,6 +349,7 @@ async def _project_note(
     # prior_path memory is what lets a retried migration still
     # know about the orphan old file).
     prior_hash = sync_state.note_file_hashes.get(note.id)
+    prior_body_hash = sync_state.note_body_hashes.get(note.id)
     prior_version = sync_state.note_versions.get(note.id)
     prior_path = sync_state.note_projected_paths.get(note.id)
 
@@ -343,11 +363,52 @@ async def _project_note(
         )
         return
 
+    # Cold-start divergence check (reviewer finding on PR #45). The
+    # projection bootstrap fires a ``lithos.note.created`` event for
+    # every project-context doc when the daemon starts. If the daemon
+    # was previously running and the operator edited a projected file
+    # while it was down, the local body differs from the canonical body
+    # Lithos has — and sync_state is empty across restart so the
+    # in-memory baseline doesn't tell us "this is an operator edit."
+    # Without this check, the projection would silently overwrite the
+    # operator's edit with the canonical body (data loss).
+    #
+    # Detection: file exists on disk + no ``note_body_hashes`` baseline
+    # for this doc THIS session (=> first event for this doc since
+    # daemon start). If the on-disk body differs from canonical, route
+    # through the same conflict resolver runtime version_conflict uses
+    # — operator's local body is moved to ``<vault>/_lithos/conflicts``
+    # for recovery, canonical body is pulled to the original path, and
+    # the ``[Friction]`` breadcrumb fires for operator visibility.
+    #
+    # The check is conservative on two axes: it ONLY fires when no
+    # baseline exists (won't re-trigger during runtime), and ONLY when
+    # the existing file's body actually differs from canonical (no-op
+    # for the common "daemon restart with no operator edits" case).
+    if (
+        target.exists()
+        and note.id not in sync_state.note_body_hashes
+        and await _resolve_cold_start_divergence(
+            note=note,
+            lithos_path=lithos_path,
+            target=target,
+            rendered_body_hash=rendered_body_hash,
+            conflicts_dir=conflicts_dir,
+            sync_state=sync_state,
+            ctx=ctx,
+        )
+    ):
+        # Resolver moved local + pulled canonical + populated
+        # sync_state. Nothing else to do — the normal write path
+        # would re-write what the resolver already wrote.
+        return
+
     # Coordination state BEFORE the write — any concurrent dir-watcher
     # poll that sees the new file's bytes must also see matching state.
     sync_state.record_project_context_write(
         doc_id=note.id,
         file_hash=rendered_file_hash,
+        body_hash=rendered_body_hash,
         version=note.version,
         projected_path=target,
     )
@@ -362,8 +423,13 @@ async def _project_note(
             sync_state.forget_project_context(doc_id=note.id)
         else:
             sync_state.note_file_hashes[note.id] = prior_hash
-            # prior_version is paired with prior_hash — both populated or
-            # both absent — so the int cast is safe here.
+            # prior_body_hash + prior_version + prior_path are populated
+            # together with prior_hash — all four are written by
+            # ``record_project_context_write`` in one shot — so the
+            # paired asserts express the invariant rather than guarding
+            # against drift in this method.
+            assert prior_body_hash is not None
+            sync_state.note_body_hashes[note.id] = prior_body_hash
             assert prior_version is not None
             sync_state.note_versions[note.id] = prior_version
             assert prior_path is not None
@@ -391,6 +457,89 @@ async def _project_note(
         slug,
         note.version,
     )
+
+
+async def _resolve_cold_start_divergence(
+    *,
+    note: Note,
+    lithos_path: str,
+    target: Path,
+    rendered_body_hash: bytes,
+    conflicts_dir: Path,
+    sync_state: ProjectionSyncState,
+    ctx: Any,
+) -> bool:
+    """If the on-disk file's body differs from canonical, route through
+    the conflict resolver and return True; otherwise return False.
+
+    Called by :func:`_project_note` when a file exists on disk but no
+    sync_state baseline exists for this doc this session (= cold
+    start). A matching body means the operator didn't edit while we
+    were down; the caller falls through to the normal write path
+    (which then writes canonical bytes — needed because frontmatter
+    may have advanced even when body didn't).
+
+    The resolver itself updates sync_state with the canonical hashes,
+    so subsequent events for this doc go through the normal write
+    path (the ``note.id in sync_state.note_body_hashes`` gate flips
+    True).
+    """
+    try:
+        existing_text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        # File became unreadable between the exists() check and the
+        # read. Skip the divergence check; the normal write path will
+        # overwrite (no operator edit to preserve if we can't read).
+        ctx.logger.debug(
+            "project-context-projection: cold-start check skipped for "
+            "note %s — file at %s unreadable: %s",
+            note.id,
+            target,
+            exc,
+        )
+        return False
+    existing_body_hash = compute_body_hash(existing_text)
+    if existing_body_hash == rendered_body_hash:
+        # No body divergence — operator didn't edit while we were
+        # down (or edited the body identically). Fall through to the
+        # normal write path so frontmatter still refreshes.
+        return False
+
+    # Operator edit detected. Route through the same resolver
+    # runtime version_conflict uses.
+    rel_path = lithos_path[len(_PROJECTS_PATH_PREFIX) :]
+    slug, _, filename = rel_path.partition("/")
+    if not filename:
+        # Path was exactly "projects/<slug>" with no filename — not a
+        # shape the projection writes. Skip the cold-start check;
+        # the normal path will surface this as a validation issue.
+        ctx.logger.debug(
+            "project-context-projection: cold-start check skipped for "
+            "note %s — path %r has no filename component",
+            note.id,
+            lithos_path,
+        )
+        return False
+
+    ctx.logger.warning(
+        "project-context-projection: cold-start divergence for doc=%s "
+        "(local body at %s differs from canonical); routing through "
+        "conflict resolver to preserve operator edit",
+        note.id,
+        target,
+    )
+    await resolve_conflict(
+        local_path=target,
+        canonical_note=note,
+        canonical_lithos_path=lithos_path,
+        conflicts_dir=conflicts_dir,
+        slug=slug,
+        filename=filename,
+        sync_state=sync_state,
+        doc_id=note.id,
+        logger_=ctx.logger,
+    )
+    return True
 
 
 async def _handle_deleted(

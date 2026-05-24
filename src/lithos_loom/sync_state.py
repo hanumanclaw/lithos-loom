@@ -138,6 +138,28 @@ class ProjectionSyncState:
     note-push handler reads this to provide ``expected_version`` to
     ``lithos_write`` for optimistic locking. Keyed by Lithos doc id."""
 
+    note_body_hashes: dict[str, bytes] = field(default_factory=dict)
+    """Per-project-context-doc **body-only** hash (SHA-256 of the
+    Markdown body, frontmatter excluded), keyed by Lithos doc id
+    (Slice 5).
+
+    Drives the dir-watcher's body-only diff (D28 invariant: frontmatter
+    edits never push). The watcher computes the on-disk body hash
+    every poll and compares against this baseline:
+
+    * Match → projection wrote this body (or operator edited only the
+      frontmatter); suppress, no push.
+    * Mismatch combined with a whole-file hash that does NOT match
+      :attr:`note_file_hashes` → real operator body edit; emit
+      ``obsidian.note.modified``.
+
+    Distinct from :attr:`note_file_hashes` because Slice 5's
+    note-push round-trip rewrites frontmatter (version bump) without
+    changing body, and the projection itself rewrites frontmatter
+    fields like ``lithos_updated_at`` on docs the operator didn't
+    touch. Whole-file hash alone would mis-classify both as user
+    body edits and trigger feedback-loop pushes."""
+
     note_projected_paths: dict[str, Path] = field(default_factory=dict)
     """Per-project-context-doc **absolute vault path** the projection
     most recently wrote to, keyed by Lithos doc id (Slice 4).
@@ -197,20 +219,23 @@ class ProjectionSyncState:
         *,
         doc_id: str,
         file_hash: bytes,
+        body_hash: bytes,
         version: int,
         projected_path: Path,
     ) -> None:
         """Capture the post-render state for a single project-context
-        doc the projection is about to commit (Slice 4).
+        doc the projection is about to commit (Slice 4 + Slice 5).
 
-        Per-doc state lives in three parallel maps keyed by doc id:
-        ``note_file_hashes`` (whole-file hash — used both by the
-        projection for self-dedup and by Slice 5's dir-watcher for
-        self-write suppression), ``note_versions`` (the version
-        Slice 5's note-push provides to ``expected_version`` for
-        optimistic locking), and ``note_projected_paths`` (the absolute
-        vault path of the current projection — used for stale-file
-        cleanup on path migration / tag-removal / out-of-projects-move).
+        Per-doc state lives in four parallel maps keyed by doc id:
+        ``note_file_hashes`` (whole-file hash — used by the projection
+        for self-dedup), ``note_body_hashes`` (body-only hash — used
+        by Slice 5's dir-watcher to suppress self-writes without
+        false-positive matches against frontmatter-only changes),
+        ``note_versions`` (the version Slice 5's note-push provides
+        to ``expected_version`` for optimistic locking), and
+        ``note_projected_paths`` (the absolute vault path of the
+        current projection — used for stale-file cleanup on path
+        migration / tag-removal / out-of-projects-move).
 
         Called by the project-context projection per doc, before the
         atomic rename — same ordering invariant as
@@ -226,6 +251,7 @@ class ProjectionSyncState:
         per-file hash against the per-doc entry directly.
         """
         self.note_file_hashes[doc_id] = file_hash
+        self.note_body_hashes[doc_id] = body_hash
         self.note_versions[doc_id] = version
         self.note_projected_paths[doc_id] = projected_path
 
@@ -239,8 +265,9 @@ class ProjectionSyncState:
         suppress a subsequent re-creation of the same doc (e.g. if
         the operator restores it from KB, or re-adds the
         ``project-context`` tag) as a self-write. Idempotent — silent
-        no-op when the id isn't tracked. Clears all three parallel
+        no-op when the id isn't tracked. Clears all four parallel
         maps in one shot."""
         self.note_file_hashes.pop(doc_id, None)
+        self.note_body_hashes.pop(doc_id, None)
         self.note_versions.pop(doc_id, None)
         self.note_projected_paths.pop(doc_id, None)
