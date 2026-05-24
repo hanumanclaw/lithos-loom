@@ -180,13 +180,13 @@ async def test_updated_event_with_identical_content_skips_write(
     from lithos_loom.subscriptions import _obsidian_projection as proj
 
     write_calls: list[Path] = []
-    real_write = proj._write_tasks_file_atomic
+    real_write = proj.write_file_atomic
 
     async def _spy_write(path: Path, content: str) -> None:
         write_calls.append(path)
         await real_write(path, content)
 
-    monkeypatch.setattr(proj, "_write_tasks_file_atomic", _spy_write)
+    monkeypatch.setattr(proj, "write_file_atomic", _spy_write)
 
     # Updated event with the SAME title → render produces an identical
     # line → content-hash matches last_written_hash → no write.
@@ -1695,7 +1695,7 @@ def _read_handler_closure(handler: Any, name: str) -> Any:
     Reaches into Python-private state (``__code__.co_freevars`` /
     ``__closure__``) — only suitable for verifying internal invariants
     that can't be observed via the public event API. Specifically,
-    ``last_written_hash`` is updated AFTER ``_write_tasks_file_atomic``
+    ``last_written_hash`` is updated AFTER ``write_file_atomic``
     returns, so a failed write must leave it untouched; the same-
     content retry path that would otherwise prove this hits the
     in-memory ``current == prior`` short-circuit and never reaches

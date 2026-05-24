@@ -47,6 +47,7 @@ __all__ = [
     "DEFAULT_CONFIG_FILENAME",
     "DEFAULT_LOG_LEVEL",
     "DEFAULT_MAX_CONCURRENCY",
+    "DEFAULT_OBSIDIAN_PROJECTS_DIR",
     "DEFAULT_OBSIDIAN_RESOLVED_TTL_DAYS",
     "DEFAULT_OBSIDIAN_TASKS_FILE",
     "DEFAULT_WORK_DIR",
@@ -85,6 +86,7 @@ DEFAULT_MAX_CONCURRENCY = 4
 DEFAULT_LOG_LEVEL: LogLevel = "info"
 DEFAULT_OBSIDIAN_TASKS_FILE = Path("_lithos/tasks.md")
 DEFAULT_OBSIDIAN_RESOLVED_TTL_DAYS = 7
+DEFAULT_OBSIDIAN_PROJECTS_DIR = Path("_lithos/projects")
 
 
 def parse_log_level(value: str) -> LogLevel:
@@ -194,6 +196,13 @@ class ObsidianSyncConfig:
     exclude_tags: tuple[str, ...] = ()
     """Tags whose presence on a task suppresses projection. Generic
     operator-level denylist; matched against ``task.tags`` membership."""
+    projects_dir: Path = field(default=DEFAULT_OBSIDIAN_PROJECTS_DIR)
+    """Where Slice 4's project-context projection writes per-project
+    docs under the vault. Default ``_lithos/projects`` mirrors the
+    Lithos-side ``knowledge/projects/<slug>/<filename>.md`` layout
+    one-to-one so the slug + filename map straight across. Stored as
+    a relative path; joined with ``vault_path`` only at use time
+    (same shape as ``tasks_file``)."""
 
 
 @dataclass(frozen=True)
@@ -474,6 +483,7 @@ _OBSIDIAN_SYNC_KEYS: frozenset[str] = frozenset(
         "resolved_ttl_days",
         "include_blocked",
         "exclude_tags",
+        "projects_dir",
     }
 )
 
@@ -543,12 +553,31 @@ def _parse_obsidian_sync(data: Any, config_path: Path) -> ObsidianSyncConfig | N
             f"{config_path}: obsidian_sync.exclude_tags entries must be non-empty"
         )
 
+    projects_dir_raw = data.get("projects_dir")
+    if projects_dir_raw is None:
+        projects_dir = DEFAULT_OBSIDIAN_PROJECTS_DIR
+    else:
+        if not isinstance(projects_dir_raw, str) or not projects_dir_raw:
+            raise ConfigError(
+                f"{config_path}: obsidian_sync.projects_dir must be a non-empty "
+                f"path string"
+            )
+        projects_dir = Path(projects_dir_raw)
+        if projects_dir.is_absolute() or any(
+            part == ".." for part in projects_dir.parts
+        ):
+            raise ConfigError(
+                f"{config_path}: obsidian_sync.projects_dir must be relative to "
+                f"vault_path and may not contain '..' (got {projects_dir_raw!r})"
+            )
+
     return ObsidianSyncConfig(
         vault_path=vault_path,
         tasks_file=tasks_file,
         resolved_ttl_days=resolved_ttl_days,
         include_blocked=include_blocked,
         exclude_tags=tuple(exclude_tags_raw),
+        projects_dir=projects_dir,
     )
 
 

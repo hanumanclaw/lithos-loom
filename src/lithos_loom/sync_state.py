@@ -42,6 +42,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 __all__ = ["ProjectionSyncState"]
 
@@ -107,6 +108,58 @@ class ProjectionSyncState:
     transition that must NOT be suppressed). Without this counter the
     flip-then-flip-back case was silently dropped."""
 
+    note_file_hashes: dict[str, bytes] = field(default_factory=dict)
+    """Per-project-context-doc **full-file** hash the projection most
+    recently emitted (SHA-256 of the entire rendered output —
+    frontmatter + body), keyed by Lithos doc id (Slice 4).
+
+    Two purposes:
+
+    * Projection self-dedup: skip the write if the freshly-rendered
+      file would be byte-identical to what we last wrote. Must be
+      whole-file (not body-only) because US30 requires frontmatter
+      fields (``lithos_version``, ``status``, ``tags``,
+      ``lithos_updated_at``) to mirror Lithos — a version bump with
+      unchanged body MUST still rewrite the frontmatter, otherwise
+      Slice 5's optimistic-lock contract breaks.
+    * Slice 5 dir-watcher self-write suppression: the watcher
+      computes the on-disk hash and compares against this; a match
+      means "the projection wrote these exact bytes, suppress as
+      self-write."
+
+    Body-only hash (``compute_body_hash``) is a separate concept
+    used by Slice 5's body-only diff for the D28 invariant (operator
+    frontmatter edits never push). It is NOT stored here — the
+    dir-watcher computes it on the fly when needed."""
+
+    note_versions: dict[str, int] = field(default_factory=dict)
+    """Per-project-context-doc ``lithos_version`` the projection most
+    recently wrote into vault frontmatter (Slice 4). The Slice 5
+    note-push handler reads this to provide ``expected_version`` to
+    ``lithos_write`` for optimistic locking. Keyed by Lithos doc id."""
+
+    note_projected_paths: dict[str, Path] = field(default_factory=dict)
+    """Per-project-context-doc **absolute vault path** the projection
+    most recently wrote to, keyed by Lithos doc id (Slice 4).
+
+    Required for stale-file cleanup when a note's address changes
+    while the projection's view of "where to write next" diverges
+    from "where the previous file lives". Three scenarios this
+    enables cleanup for, all surfaced by reviewer feedback on PR #37:
+
+    * Path migration within ``projects/``: doc moves from
+      ``projects/foo/context.md`` to ``projects/bar/context.md`` —
+      unlink the old file before writing the new.
+    * Tag removal: doc loses ``project-context`` tag — unlink the
+      stale projection (was actionable, now isn't).
+    * Path moved out of ``projects/``: doc moves to e.g.
+      ``observations/...`` — unlink the stale projection.
+
+    Without the prior path stored here we'd have no way to find the
+    old file from the current event payload (Lithos sends the NEW
+    path, not the OLD one). Cleared by ``forget_project_context``
+    on delete + on cleanup-driven-by-filter-rejection."""
+
     def record_projection_write(
         self,
         *,
@@ -138,3 +191,56 @@ class ProjectionSyncState:
         self.task_priority_markers = dict(task_priority_markers)
         self.task_due_date_markers = dict(task_due_date_markers)
         self.write_version += 1
+
+    def record_project_context_write(
+        self,
+        *,
+        doc_id: str,
+        file_hash: bytes,
+        version: int,
+        projected_path: Path,
+    ) -> None:
+        """Capture the post-render state for a single project-context
+        doc the projection is about to commit (Slice 4).
+
+        Per-doc state lives in three parallel maps keyed by doc id:
+        ``note_file_hashes`` (whole-file hash — used both by the
+        projection for self-dedup and by Slice 5's dir-watcher for
+        self-write suppression), ``note_versions`` (the version
+        Slice 5's note-push provides to ``expected_version`` for
+        optimistic locking), and ``note_projected_paths`` (the absolute
+        vault path of the current projection — used for stale-file
+        cleanup on path migration / tag-removal / out-of-projects-move).
+
+        Called by the project-context projection per doc, before the
+        atomic rename — same ordering invariant as
+        :meth:`record_projection_write` so any concurrent dir-watcher
+        poll that sees the new file also sees the matching
+        coordination state.
+
+        Unlike the task projection's ``write_version`` (one counter
+        shared across all tasks in a single file), per-doc projection
+        is naturally file-scoped — re-rendering one doc doesn't
+        invalidate the dir-watcher's view of any other doc — so no
+        global counter is needed here. The dir-watcher compares
+        per-file hash against the per-doc entry directly.
+        """
+        self.note_file_hashes[doc_id] = file_hash
+        self.note_versions[doc_id] = version
+        self.note_projected_paths[doc_id] = projected_path
+
+    def forget_project_context(self, *, doc_id: str) -> None:
+        """Drop a doc's projection state (called on
+        ``lithos.note.deleted`` after the local file is removed, and
+        on filter-rejection-driven cleanup after the stale file is
+        unlinked).
+
+        Keeping a stale hash here would cause the dir-watcher to
+        suppress a subsequent re-creation of the same doc (e.g. if
+        the operator restores it from KB, or re-adds the
+        ``project-context`` tag) as a self-write. Idempotent — silent
+        no-op when the id isn't tracked. Clears all three parallel
+        maps in one shot."""
+        self.note_file_hashes.pop(doc_id, None)
+        self.note_versions.pop(doc_id, None)
+        self.note_projected_paths.pop(doc_id, None)

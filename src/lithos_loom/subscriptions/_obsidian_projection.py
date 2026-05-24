@@ -116,7 +116,6 @@ import asyncio
 import contextlib
 import hashlib
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -138,6 +137,7 @@ from lithos_loom.render import (
 from lithos_loom.render import (
     validated_priority as _validated_priority,
 )
+from lithos_loom.subscriptions._atomic_write import write_file_atomic
 from lithos_loom.subscriptions._human_actionable import (
     is_human_actionable,
     would_be_actionable,
@@ -432,7 +432,7 @@ def make_handler(
         the watcher's self-write suppression keeps seeing consistent
         state.
 
-        This ordering only works because :func:`_write_tasks_file_atomic`
+        This ordering only works because :func:`write_file_atomic`
         has no internal ``await`` points (enforced; see its docstring).
         ``await coro()`` on a yield-less coroutine runs the coroutine
         to completion synchronously, so there is no observable
@@ -473,7 +473,7 @@ def make_handler(
             for tid, entry in state.items()
         }
         # Disk first. Raises → sync_state untouched → next event retries.
-        await _write_tasks_file_atomic(tasks_path, content)
+        await write_file_atomic(tasks_path, content)
         # Synchronously update sync_state. No yield between the
         # rename returning and this call, so the fs watcher never
         # observes the new file content without the matching
@@ -655,56 +655,7 @@ def _hash_existing_file(path: Path) -> bytes | None:
     return hashlib.sha256(raw).digest()
 
 
-async def _write_tasks_file_atomic(path: Path, content: str) -> None:
-    """Atomically rewrite ``path`` with ``content``.
-
-    Strategy: write to ``<path>.tmp``, fsync, then ``os.replace`` onto
-    the final path. ``os.replace`` is atomic on POSIX. Creates
-    ``path.parent`` if absent. If anything between the temp-write and
-    the replace raises, the temp file is best-effort cleaned up so a
-    failed write doesn't litter the vault with ``tasks.md.tmp``
-    (Copilot review on #17, mirroring ``write_result_atomically`` in
-    plugin_runner.py).
-
-    **No internal** ``await`` **points** — load-bearing invariant for
-    Slice 2 US23. Two properties depend on it:
-
-    1. The fs watcher's self-write suppression. The caller updates
-       ``sync_state`` *before* awaiting this function; if there were
-       a yield between that update and ``os.replace``, the watcher
-       could poll with ``sync_state.last_written_hash`` pointing at
-       the new content while the file still showed the old, mis-firing
-       per-task suppression.
-    2. The caller's failure-rollback contract. The caller catches
-       ``Exception`` to roll back ``sync_state`` when the rename
-       didn't apply, and lets ``CancelledError`` propagate without
-       rolling back on the grounds that cancellation cannot fire
-       mid-rename. That reasoning requires this function to have no
-       suspension points where cancellation could fire after the
-       rename but before this function returns.
-
-    Don't add ``await`` here without re-deriving both invariants. If
-    write latency becomes an issue, ``asyncio.to_thread`` wraps this
-    whole synchronous body in one yield-after-completion shot rather
-    than introducing yields inside it.
-
-    Synchronous I/O inside an async function — fine for the
-    vault-sized files this serves (<10kB typical).
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        tmp.write_text(content, encoding="utf-8")
-        fd = os.open(tmp, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-    except Exception:
-        # Best-effort cleanup. If unlink itself fails (already gone,
-        # permission flip), swallow — the original exception is more
-        # informative for the operator.
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
+# write_file_atomic moved to ``._atomic_write`` so Slice 4's
+# project-context projection can share the same temp + fsync + rename
+# contract — see :mod:`lithos_loom.subscriptions._atomic_write` for
+# the load-bearing invariants this projection's _flush relies on.

@@ -56,6 +56,7 @@ from lithos_loom.bus import EventBus
 from lithos_loom.config import LogLevel, LoomConfig, SubscriptionConfig, load_config
 from lithos_loom.lithos_client import LithosClient
 from lithos_loom.sources.lithos_event_stream import LithosEventStream
+from lithos_loom.sources.lithos_note_stream import LithosNoteStream
 from lithos_loom.sources.obsidian_fs_watcher import ObsidianFsWatcher
 from lithos_loom.subscriptions import (
     Handler,
@@ -74,6 +75,9 @@ from lithos_loom.subscriptions._obsidian_projection import (
 from lithos_loom.subscriptions._obsidian_status_transition import (
     handle as handle_obsidian_status_transition,
 )
+from lithos_loom.subscriptions._project_context_projection import (
+    make_handler as make_project_context_projection_handler,
+)
 from lithos_loom.sync_state import ProjectionSyncState
 
 # Actions this child is willing to host. Subscriptions whose ``action``
@@ -86,6 +90,7 @@ _CHILD_ACTIONS: frozenset[str] = frozenset(
         "obsidian-status-transition",
         "obsidian-priority-changed",
         "obsidian-due-date-changed",
+        "project-context-projection",
     }
 )
 
@@ -126,9 +131,11 @@ async def _amain(cfg: LoomConfig) -> int:
     obs = cfg.obsidian_sync
     logger.info(
         "obsidian-sync child started; vault=%s tasks_file=%s "
-        "resolved_ttl_days=%d include_blocked=%s exclude_tags=%s",
+        "projects_dir=%s resolved_ttl_days=%d include_blocked=%s "
+        "exclude_tags=%s",
         obs.vault_path,
         obs.tasks_file,
+        obs.projects_dir,
         obs.resolved_ttl_days,
         obs.include_blocked,
         list(obs.exclude_tags) or "[]",
@@ -164,6 +171,7 @@ async def _amain(cfg: LoomConfig) -> int:
     status_transition_specs = by_action.get("obsidian-status-transition", [])
     priority_changed_specs = by_action.get("obsidian-priority-changed", [])
     due_date_changed_specs = by_action.get("obsidian-due-date-changed", [])
+    project_context_projection_specs = by_action.get("project-context-projection", [])
     projection_spec = projection_specs[0] if projection_specs else None
     status_transition_spec = (
         status_transition_specs[0] if status_transition_specs else None
@@ -173,6 +181,11 @@ async def _amain(cfg: LoomConfig) -> int:
     )
     due_date_changed_spec = (
         due_date_changed_specs[0] if due_date_changed_specs else None
+    )
+    project_context_projection_spec = (
+        project_context_projection_specs[0]
+        if project_context_projection_specs
+        else None
     )
 
     # status-transition / priority-changed / due-date-changed all need
@@ -231,7 +244,8 @@ async def _amain(cfg: LoomConfig) -> int:
             logger.warning(
                 "obsidian-sync: no obsidian-projection, "
                 "obsidian-status-transition, obsidian-priority-changed, "
-                "or obsidian-due-date-changed subscription configured; "
+                "obsidian-due-date-changed, or "
+                "project-context-projection subscription configured; "
                 "fs watcher runs but emits nothing without projection "
                 "state. Add a [[subscriptions]] block with "
                 "action='obsidian-projection' to populate it."
@@ -276,13 +290,25 @@ async def _amain(cfg: LoomConfig) -> int:
                 due_date_changed_spec.name,
             )
             my_handlers["obsidian-due-date-changed"] = handle_obsidian_due_date_changed
+        if project_context_projection_spec is not None:
+            logger.info(
+                "obsidian-sync: wiring subscription %r",
+                project_context_projection_spec.name,
+            )
+            my_handlers["project-context-projection"] = (
+                make_project_context_projection_handler(cfg, sync_state=sync_state)
+            )
 
         # LithosClient is needed for both: the projection wires through
         # to LithosEventStream for upstream events; the status-transition
         # handler calls task_complete / task_cancel / finding_post.
         # LithosEventStream only spawns when projection is configured —
-        # status-transition consumes obsidian-side events only.
+        # status-transition consumes obsidian-side events only. The
+        # LithosNoteStream (Slice 4) only spawns when the
+        # project-context-projection subscription is configured —
+        # otherwise nothing would consume its events.
         need_event_stream = projection_spec is not None
+        need_note_stream = project_context_projection_spec is not None
         async with LithosClient(
             cfg.orchestrator.lithos_url, agent_id=cfg.orchestrator.agent_id
         ) as lithos:
@@ -314,6 +340,22 @@ async def _amain(cfg: LoomConfig) -> int:
                 )
                 tasks.append(
                     asyncio.create_task(source.run(), name="lithos-event-stream")
+                )
+            if need_note_stream:
+                events_url = cfg.orchestrator.lithos_url.rstrip("/") + "/events"
+                # Second SSE source for note lifecycle events (Slice 4
+                # US28). Bootstraps via lithos_list(path_prefix=,
+                # tags=) so cold restart re-projects every existing
+                # project-context doc — the projection subscription's
+                # per-doc hash dedup short-circuits the writes when
+                # nothing changed.
+                note_source = LithosNoteStream(
+                    client=lithos,
+                    bus=bus,
+                    events_url=events_url,
+                )
+                tasks.append(
+                    asyncio.create_task(note_source.run(), name="lithos-note-stream")
                 )
             tasks.extend(
                 asyncio.create_task(r.run(), name=f"sub-{r.spec.name}") for r in runners

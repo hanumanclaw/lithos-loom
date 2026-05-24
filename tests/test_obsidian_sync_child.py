@@ -343,9 +343,14 @@ class _StubSource:
 
 @pytest.fixture
 def stub_io(monkeypatch: pytest.MonkeyPatch) -> list[EventBus]:
-    """Replace LithosClient + LithosEventStream in the obsidian_sync
-    module and return a list that captures the bus each _StubSource was
-    constructed with — tests publish to ``captured_buses[-1]``."""
+    """Replace LithosClient + LithosEventStream + LithosNoteStream in
+    the obsidian_sync module and return a list that captures the bus
+    each _StubSource was constructed with — tests publish to
+    ``captured_buses[-1]``.
+
+    Slice 4 added the second source; both are stubbed so the wiring
+    test can assert which subscriptions cause which sources to spawn
+    without touching a real Lithos."""
     captured: list[EventBus] = []
 
     class _CapturingSource(_StubSource):
@@ -355,6 +360,7 @@ def stub_io(monkeypatch: pytest.MonkeyPatch) -> list[EventBus]:
 
     monkeypatch.setattr(obs_sync_mod, "LithosClient", _StubLithosClient)
     monkeypatch.setattr(obs_sync_mod, "LithosEventStream", _CapturingSource)
+    monkeypatch.setattr(obs_sync_mod, "LithosNoteStream", _CapturingSource)
     return captured
 
 
@@ -481,8 +487,8 @@ async def test_obsidian_sync_child_idles_when_no_obsidian_subscription(
     warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any(
         "no obsidian-projection, obsidian-status-transition, "
-        "obsidian-priority-changed, or obsidian-due-date-changed "
-        "subscription configured"
+        "obsidian-priority-changed, obsidian-due-date-changed, or "
+        "project-context-projection subscription configured"
         in m
         and "fs watcher runs but emits nothing" in m
         for m in warn_msgs
@@ -1483,4 +1489,88 @@ async def test_obsidian_sync_child_skips_priority_when_lithos_already_matches(
     assert _StubLithosClient.task_update_calls == [], (
         "task_update must NOT be called when Lithos already has the "
         f"target priority; got {_StubLithosClient.task_update_calls}"
+    )
+
+
+# ── Slice 4: project-context-projection wiring ─────────────────────────
+
+
+def _project_context_projection_subscription(
+    name: str = "project-context",
+) -> SubscriptionConfig:
+    return SubscriptionConfig(
+        name=name,
+        event_types=(
+            "lithos.note.created",
+            "lithos.note.updated",
+            "lithos.note.deleted",
+        ),
+        action="project-context-projection",
+        retry=RetryPolicy(attempts=1, initial_delay_seconds=0.0, max_delay_seconds=0.0),
+        on_persistent_failure="ignore",
+    )
+
+
+async def test_obsidian_sync_spawns_note_stream_when_project_context_configured(
+    tmp_path: Path,
+    stub_io: list[EventBus],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``project-context-projection`` subscription triggers a
+    LithosNoteStream spawn alongside the task stream. The Slice 4
+    wiring contract: each source's lifecycle is gated on a consumer
+    existing for its events.
+
+    ``stub_io`` captures one entry per source-constructor call (both
+    LithosEventStream and LithosNoteStream are stubbed by the same
+    ``_CapturingSource``), so two captures means both sources spawned."""
+    cfg = _cfg_with_obsidian(
+        tmp_path,
+        subscriptions=(
+            _projection_subscription(),
+            _project_context_projection_subscription(),
+        ),
+    )
+
+    sender = asyncio.create_task(_sigterm_soon())
+    try:
+        with caplog.at_level(logging.INFO, logger="lithos_loom.children.obsidian_sync"):
+            rc = await asyncio.wait_for(_amain(cfg), timeout=2.0)
+    finally:
+        await _cancel_and_drain(sender)
+
+    assert rc == 0
+    assert len(stub_io) == 2, (
+        f"expected 2 source spawns (event + note); got {len(stub_io)}"
+    )
+    info_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("wiring subscription 'project-context'" in m for m in info_msgs), (
+        info_msgs
+    )
+
+
+async def test_no_note_stream_without_project_context_subscription(
+    tmp_path: Path,
+    stub_io: list[EventBus],
+) -> None:
+    """LithosNoteStream's lifecycle is gated on the
+    project-context-projection subscription — without it, the source
+    would publish events nobody consumes, wasting an SSE connection.
+
+    With only the task projection subscription, exactly one source
+    spawns (the event stream)."""
+    cfg = _cfg_with_obsidian(
+        tmp_path,
+        subscriptions=(_projection_subscription(),),  # task only
+    )
+
+    sender = asyncio.create_task(_sigterm_soon())
+    try:
+        rc = await asyncio.wait_for(_amain(cfg), timeout=2.0)
+    finally:
+        await _cancel_and_drain(sender)
+
+    assert rc == 0
+    assert len(stub_io) == 1, (
+        f"expected exactly 1 source spawn (event stream only); got {len(stub_io)}"
     )

@@ -9,6 +9,7 @@ import pytest
 
 from lithos_loom.config import (
     DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_OBSIDIAN_PROJECTS_DIR,
     DEFAULT_OBSIDIAN_RESOLVED_TTL_DAYS,
     DEFAULT_OBSIDIAN_TASKS_FILE,
     LoomConfig,
@@ -195,6 +196,7 @@ def test_obsidian_sync_minimal_parses(
     # D6 revised default: blocked tasks project.
     assert cfg.obsidian_sync.include_blocked is True
     assert cfg.obsidian_sync.exclude_tags == ()
+    assert cfg.obsidian_sync.projects_dir == DEFAULT_OBSIDIAN_PROJECTS_DIR
 
 
 def test_obsidian_sync_full_parses(
@@ -213,6 +215,7 @@ def test_obsidian_sync_full_parses(
             resolved_ttl_days = 14
             include_blocked = false
             exclude_tags = ["debug:trace", "internal"]
+            projects_dir = "loom/projects"
             """
         ),
     )
@@ -223,6 +226,7 @@ def test_obsidian_sync_full_parses(
     assert cfg.obsidian_sync.resolved_ttl_days == 14
     assert cfg.obsidian_sync.include_blocked is False
     assert cfg.obsidian_sync.exclude_tags == ("debug:trace", "internal")
+    assert cfg.obsidian_sync.projects_dir == Path("loom/projects")
 
 
 def test_obsidian_sync_vault_path_required(
@@ -296,6 +300,66 @@ def test_obsidian_sync_tasks_file_must_be_relative(
         ),
     )
     with pytest.raises(ConfigError, match="tasks_file must be relative"):
+        load_config()
+
+
+def test_obsidian_sync_projects_dir_must_be_relative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``projects_dir`` is joined with vault_path at use time —
+    same constraints as ``tasks_file``: must be relative, no ``..``
+    escapes. Pins the equivalent guards for the Slice 4 knob."""
+    vault = tmp_path / "vault"
+
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        dedent(
+            f"""
+            [obsidian_sync]
+            vault_path = "{vault}"
+            projects_dir = "/etc/projects"
+            """
+        ),
+    )
+    with pytest.raises(ConfigError, match="projects_dir must be relative"):
+        load_config()
+
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        dedent(
+            f"""
+            [obsidian_sync]
+            vault_path = "{vault}"
+            projects_dir = "../escape"
+            """
+        ),
+    )
+    with pytest.raises(ConfigError, match="projects_dir must be relative"):
+        load_config()
+
+
+def test_obsidian_sync_projects_dir_must_be_non_empty_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty string / wrong type → config error rather than silently
+    falling back to the default. Operators who explicitly set the
+    field expect it to apply or fail loudly."""
+    vault = tmp_path / "vault"
+
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        dedent(
+            f"""
+            [obsidian_sync]
+            vault_path = "{vault}"
+            projects_dir = ""
+            """
+        ),
+    )
+    with pytest.raises(ConfigError, match="projects_dir must be a non-empty"):
         load_config()
 
 
