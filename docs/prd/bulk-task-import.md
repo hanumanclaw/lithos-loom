@@ -130,6 +130,7 @@ operator: uv run lithos-loom project import /tmp/big-import.md \
 | D72 | `--dry-run` preview | Prints the full plan (project doc body after stripping + extracted tasks with parsed metadata + dependency edges + sibling parallelism flags) and exits without Lithos writes. Only Lithos call is the slug-collision pre-flight (read-only). Output is framed with `NO CHANGES MADE — re-run without --dry-run to apply` at both start AND end so it can't be mistaken for a success log |
 | D73 | Typo hint on "project not found" | On tasks-only "no project at slug=X" error, query existing Lithos projects (one extra `note_list` call on the error path; negligible cost) and suggest matches within edit distance 2. Standard CLI ergonomic; significantly reduces the wrong-slug footgun |
 | D74 | Cross-mode hints in refusal | Every refusal message suggests the OTHER mode as the recovery path. Greenfield + slug-exists → "did you mean `--tasks-only --slug X`?". Tasks-only + slug-not-found → "use without `--tasks-only` to create a new project, or check the slug (suggestions: ...)". Operator's intent is recoverable in one re-run without consulting docs |
+| D75 | Default slug strips leading `project-` from file stem | When deriving the default slug from the source file stem (greenfield mode, no `--slug`, no frontmatter `title`), strip a leading `project-` prefix (case-insensitive) before slugifying. The `project-` prefix is a common filesystem-organization convention (e.g. `~/.../projects/project-organising-myself.md`) which becomes redundant once docs live under `projects/<slug>/...`. **NOT** stripped from frontmatter `title` — that's explicit operator intent; respected as-is. When the strip fires, `--dry-run` output and the success output flag it explicitly: `slug=organising-myself (stripped leading "project-" from stem "project-organising-myself"; override with --slug)`. Override with `--slug <slug>` on the rare legitimate case (e.g. a project literally named "project-management" where the operator wants the prefix preserved) |
 
 ## Relationship to Existing Track 1 Architecture
 
@@ -161,6 +162,8 @@ One vertical slice. The CLI changes land in `src/lithos_loom/cli/project.py` (ex
 79. As an operator, I want `--tasks-only` to require the `--slug` flag explicitly (and ignore frontmatter for routing), so that I never silently file tasks against the wrong project due to ambiguous frontmatter.
 
 80. As an operator, I want greenfield slug to be optional (defaulting to slugified frontmatter `title` → file stem, with `--slug` available as an override), so that I can clean up inconsistent naming as I migrate existing project docs.
+
+100. As an operator with existing project files at `~/Dropbox/obsidian/dave/projects/project-organising-myself.md` (using the `project-` filename prefix as a folder-organization convention), I want default slug derivation to strip a leading `project-` prefix from the file stem (case-insensitive) — but NOT from frontmatter `title` — so that the resulting Lithos path doesn't carry triple-redundancy (`projects/project-organising-myself/project-organising-myself-project-context.md` becomes `projects/organising-myself/organising-myself-project-context.md`), with `--slug <slug>` available as an override for the rare legitimate "project-management" case and `--dry-run` showing the resolved slug before any writes.
 
 #### Refusal semantics
 
@@ -358,6 +361,7 @@ After implementation, hand-test against staging Lithos (`localhost:8766`) with a
 | 14 | `--force-tasks --yes` bypass | Tasks-only `--force-tasks --yes` | No prompt; deletes + re-imports silently |
 | 15 | Validation aggregates errors | Source with cross-project tag AND empty parent AND `#123` (looks like task ref) in one doc | Single error report listing both real errors; `#123` (all-digit) is NOT flagged as a tag (per D61 / D40) |
 | 16 | Mid-batch failure recovery | Inject network failure on task 5 of 10 (kill staging Lithos mid-call) | `[Friction]` finding posted to project doc with state ("doc created; 4 of 10 tasks created"); error message shows exact recovery command `--tasks-only --slug X --force-tasks` |
+| 17 | Default slug strips `project-` from stem (D75) | Source file `project-foo.md` with no frontmatter `title`; greenfield mode, no `--slug` | Resolved slug = `foo`; stderr / dry-run output flags the strip with the override hint; explicit `--slug project-foo` overrides the strip; frontmatter `title: Project Foo` is NOT stripped (slug stays `project-foo`) |
 
 ## Risks
 
