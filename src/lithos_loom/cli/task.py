@@ -24,6 +24,24 @@ from lithos_loom.errors import LithosLoomError
 from lithos_loom.lithos_client import LithosClient, Task
 from lithos_loom.render import PRIORITY_EMOJI, render_line, validated_priority
 
+# Canonical project-context query (mirrors the `project list` default and
+# the capture macro's dropdown source). Kept in sync with the same
+# constants in cli/project.py.
+_PROJECTS_PATH_PREFIX = "projects/"
+_PROJECT_CONTEXT_TAG = "project-context"
+
+
+class UnknownProjectError(LithosLoomError):
+    """`--project` matched neither a Lithos project-context doc nor a
+    local `[projects]` entry. Carries the offending slug + the sorted
+    set of known slugs so the CLI can render a helpful exit-2 message."""
+
+    def __init__(self, slug: str, known: list[str]) -> None:
+        super().__init__(f"unknown project {slug!r}")
+        self.slug = slug
+        self.known = known
+
+
 task_app = typer.Typer(
     name="task",
     help="Task-creation CLI helpers (Slice 3+).",
@@ -37,7 +55,8 @@ def task_create(
         ...,
         "--project",
         "-p",
-        help="Project slug (must match a [projects.<name>] entry in TOML).",
+        help="Project slug (must be a known Lithos project, or a local "
+        "[projects.<name>] entry).",
     ),
     title: str = typer.Option(
         ...,
@@ -100,8 +119,11 @@ def task_create(
 ) -> None:
     """Create a Lithos task and emit its projected line.
 
-    Validates ``--project`` against the configured ``[projects]``
-    table, validates ``--priority`` against the D18 enum, then calls
+    Validates ``--project`` against the canonical Lithos project list
+    (``projects/`` KB docs tagged ``project-context``) unioned with the
+    local TOML ``[projects]`` table — so a project created via the
+    create-project macro (Lithos-only, no TOML entry) is accepted.
+    Validates ``--priority`` against the D18 enum, then calls
     ``lithos_task_create`` with the assembled metadata in a single
     RPC (lithos#295). On success, renders the projected line via
     the shared :func:`lithos_loom.render.render_line` so a macro-
@@ -133,15 +155,6 @@ def task_create(
         )
         sys.exit(2)
 
-    if project not in cfg.projects:
-        configured = ", ".join(sorted(cfg.projects)) or "(none)"
-        typer.echo(
-            f"lithos-loom: unknown project {project!r}; "
-            f"configured projects: {configured}",
-            err=True,
-        )
-        sys.exit(2)
-
     if priority is not None and priority not in PRIORITY_EMOJI:
         typer.echo(
             f"lithos-loom: unknown priority {priority!r} "
@@ -157,12 +170,20 @@ def task_create(
         task_id = asyncio.run(
             _create_task_async(
                 cfg=cfg,
+                project=project,
                 title=title,
                 description=brief,
                 tags=tag_list,
                 metadata=metadata,
             )
         )
+    except UnknownProjectError as exc:
+        known = ", ".join(exc.known) or "(none)"
+        typer.echo(
+            f"lithos-loom: unknown project {exc.slug!r}; known projects: {known}",
+            err=True,
+        )
+        sys.exit(2)
     except LithosLoomError as exc:
         typer.echo(f"lithos-loom: task_create failed: {exc}", err=True)
         sys.exit(1)
@@ -212,16 +233,34 @@ def task_create(
 async def _create_task_async(
     *,
     cfg: LoomConfig,
+    project: str,
     title: str,
     description: str | None,
     tags: list[str],
     metadata: dict[str, Any],
 ) -> str:
-    """One-shot ``async with LithosClient(...)`` wrapper around
-    ``task_create``. Returns the new task's id."""
+    """One-shot ``async with LithosClient(...)`` wrapper that validates
+    ``project`` against the canonical Lithos project list (∪ TOML
+    ``[projects]``) and then creates the task. Returns the new task's id.
+
+    Validation shares the create's client session (one connection): a
+    ``note_list`` of the ``projects/`` KB gives the canonical slugs, and
+    a project absent from both that and the local ``[projects]`` table
+    raises :class:`UnknownProjectError`. Lithos itself doesn't validate
+    ``metadata.project``, so this is the typo backstop the capture flow
+    relies on. ``note_list`` failures (Lithos unreachable / RPC error)
+    propagate as ``OSError`` / ``LithosClientError`` — the create needs
+    Lithos anyway, so there's no offline path to preserve here."""
     async with LithosClient(
         cfg.orchestrator.lithos_url, agent_id=cfg.orchestrator.agent_id
     ) as client:
+        summaries = await client.note_list(
+            path_prefix=_PROJECTS_PATH_PREFIX,
+            tags=[_PROJECT_CONTEXT_TAG],
+        )
+        known = {s.slug for s in summaries if s.slug} | set(cfg.projects)
+        if project not in known:
+            raise UnknownProjectError(project, sorted(known))
         return await client.task_create(
             title=title,
             description=description,

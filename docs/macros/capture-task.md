@@ -43,7 +43,7 @@ try {
 }
 if (!projects.length) {
   new Notice(
-    "No projects configured. Add a [projects.<slug>] table to your lithos-loom.toml.",
+    "No projects found in Lithos. Create one first (create-project macro or `lithos-loom project create`).",
     10000
   );
   return;

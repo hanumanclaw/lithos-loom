@@ -22,6 +22,7 @@ import pytest
 from typer.testing import CliRunner
 
 from lithos_loom.cli import task as cli_task_mod
+from lithos_loom.lithos_client import NoteSummary
 from lithos_loom.main import app
 
 runner = CliRunner()
@@ -40,6 +41,11 @@ class _StubLithosClient:
     task_create_calls: ClassVar[list[dict[str, Any]]] = []
     task_create_returns: ClassVar[str] = "new-1"
     task_create_side_effect: ClassVar[Exception | None] = None
+    # Canonical Lithos project-context summaries returned by note_list
+    # (the project-validation source). Default empty → only TOML
+    # [projects] slugs validate, unless a test seeds Lithos-side slugs.
+    note_list_returns: ClassVar[list[Any]] = []
+    note_list_side_effect: ClassVar[Exception | None] = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.init_args = args
@@ -81,6 +87,18 @@ class _StubLithosClient:
             raise cls.task_create_side_effect
         return cls.task_create_returns
 
+    async def note_list(
+        self,
+        *,
+        path_prefix: str | None = None,
+        tags: list[str] | None = None,
+        **_: Any,
+    ) -> list[Any]:
+        cls = type(self)
+        if cls.note_list_side_effect is not None:
+            raise cls.note_list_side_effect
+        return list(cls.note_list_returns)
+
 
 @pytest.fixture(autouse=True)
 def _reset_stub() -> None:
@@ -89,6 +107,8 @@ def _reset_stub() -> None:
     _StubLithosClient.task_create_calls.clear()
     _StubLithosClient.task_create_returns = "new-1"
     _StubLithosClient.task_create_side_effect = None
+    _StubLithosClient.note_list_returns = []
+    _StubLithosClient.note_list_side_effect = None
 
 
 @pytest.fixture
@@ -120,6 +140,21 @@ def _write_config(
         )
     )
     return config_path
+
+
+def _project_summary(slug: str) -> NoteSummary:
+    """A Lithos project-context doc summary as note_list would return."""
+    return NoteSummary(
+        id=f"doc-{slug}",
+        title=slug,
+        version=1,
+        updated_at=None,
+        tags=("project-context",),
+        status="active",
+        note_type="project_context",
+        path=f"projects/{slug}/{slug}-project-context.md",
+        slug=slug,
+    )
 
 
 # ── Happy path ─────────────────────────────────────────────────────────
@@ -396,9 +431,10 @@ def test_task_create_all_priority_values_pass_through(
 def test_task_create_unknown_project_exits_two(
     tmp_path: Path, patched_lithos: type[_StubLithosClient]
 ) -> None:
-    """Unknown project → exit 2, error names what IS configured, no
-    Lithos call."""
+    """Slug in neither Lithos (note_list) nor TOML → exit 2, error names
+    the known projects, no task created."""
     config_path = _write_config(tmp_path, projects=("lithos-loom",))
+    # No Lithos project-context docs; only the TOML slug is known.
 
     result = runner.invoke(
         app,
@@ -417,6 +453,58 @@ def test_task_create_unknown_project_exits_two(
     assert "unknown project 'nonexistent'" in result.stderr
     assert "lithos-loom" in result.stderr
     assert patched_lithos.task_create_calls == []
+
+
+def test_task_create_accepts_lithos_only_project(
+    tmp_path: Path, patched_lithos: type[_StubLithosClient]
+) -> None:
+    """The bug regression guard: a project created via the macro exists
+    in Lithos but NOT in TOML [projects] — task create must accept it."""
+    # TOML has a different project; the macro-created one is Lithos-only.
+    config_path = _write_config(tmp_path, projects=("other-project",))
+    patched_lithos.note_list_returns = [_project_summary("macro-made")]
+
+    result = runner.invoke(
+        app,
+        [
+            "task",
+            "create",
+            "--project",
+            "macro-made",
+            "--title",
+            "Do the thing",
+            "--config",
+            str(config_path),
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    assert len(patched_lithos.task_create_calls) == 1
+    assert patched_lithos.task_create_calls[0]["metadata"] == {"project": "macro-made"}
+
+
+def test_task_create_accepts_toml_only_project(
+    tmp_path: Path, patched_lithos: type[_StubLithosClient]
+) -> None:
+    """Union leniency: a slug configured in TOML but with no Lithos
+    project-context doc still validates (offline / local overlay)."""
+    config_path = _write_config(tmp_path, projects=("local-only",))
+    patched_lithos.note_list_returns = []  # nothing in Lithos
+
+    result = runner.invoke(
+        app,
+        [
+            "task",
+            "create",
+            "--project",
+            "local-only",
+            "--title",
+            "x",
+            "--config",
+            str(config_path),
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    assert len(patched_lithos.task_create_calls) == 1
 
 
 def test_task_create_unknown_priority_exits_two(
