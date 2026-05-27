@@ -53,10 +53,16 @@ from lithos_loom.cli._project_import_bulk import (
     resolve_default_slug_from_stem,
     validate_import_flags,
 )
+from lithos_loom.cli._regenerate_done import (
+    build_done_content,
+    collect_resolved_lines,
+    render_dry_run,
+)
 from lithos_loom.config import LoomConfig, load_config
 from lithos_loom.errors import LithosClientError, LithosLoomError
 from lithos_loom.lithos_client import LithosClient, NoteSummary, WriteResult
 from lithos_loom.render_project_context import extract_frontmatter
+from lithos_loom.subscriptions._atomic_write import write_file_atomic
 from lithos_loom.task_graph import build_plan
 from lithos_loom.task_line_parser import parse_doc
 
@@ -1170,3 +1176,166 @@ def _print_text_rows(rows: list[_ProjectRow]) -> None:
             f"✓ ({row.repo})" if row.local and row.repo else "✓" if row.local else "✗"
         )
         typer.echo(f"{row.slug:<{slug_width}}  {status:<{status_width}}  {local_mark}")
+
+
+@project_app.command("regenerate-done")
+def project_regenerate_done(
+    slug: str = typer.Option(
+        ...,
+        "--slug",
+        "-s",
+        help="Project slug whose <slug>-done.md archive to rebuild.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview the rebuilt file (line count + lines); write nothing.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the overwrite confirmation prompt.",
+    ),
+    output_format: str = typer.Option(
+        _FORMAT_TEXT,
+        "--format",
+        "-f",
+        help=f"Output format ({_FORMAT_TEXT} | {_FORMAT_JSON}).",
+    ),
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Explicit TOML config path.",
+    ),
+) -> None:
+    """Rebuild a project's task-archive done file from Lithos.
+
+    Queries every resolved (completed + cancelled) Lithos task carrying
+    ``metadata.project == <slug>`` and overwrites
+    ``<vault>/_lithos/projects/<slug>/<slug>-done.md`` with one
+    Tasks-plugin line per task, sorted oldest-first by resolution date.
+
+    Unlike the live ``task-archive`` subscription, this writes ALL
+    resolved tasks for the slug — the "was this surfaced to the operator"
+    signal is ephemeral and can't be reconstructed, so a rebuild is a
+    complete-history snapshot rather than the surfaced-only set. Use it
+    to backfill history that predates the archiver, or to rebuild a
+    deleted/damaged file. It OVERWRITES the existing file (discarding any
+    manual edits) — that's the point of a regenerate.
+    """
+    if output_format not in (_FORMAT_TEXT, _FORMAT_JSON):
+        typer.echo(
+            f"lithos-loom: unknown --format {output_format!r} "
+            f"(expected one of: {_FORMAT_TEXT}, {_FORMAT_JSON})",
+            err=True,
+        )
+        sys.exit(2)
+
+    try:
+        cfg = load_config(config)
+    except LithosLoomError as exc:
+        typer.echo(f"lithos-loom: {exc}", err=True)
+        sys.exit(1)
+
+    obs = cfg.obsidian_sync
+    if obs is None:
+        typer.echo(
+            "lithos-loom: regenerate-done needs an [obsidian_sync] section "
+            "(it writes a per-project file under the vault); none configured",
+            err=True,
+        )
+        sys.exit(1)
+
+    if not _SLUG_RE.match(slug):
+        typer.echo(
+            f"lithos-loom: invalid slug {slug!r}; must match "
+            f"{_SLUG_RE.pattern} (lowercase alphanumerics + hyphens, must "
+            f"start+end alphanumeric)",
+            err=True,
+        )
+        sys.exit(2)
+
+    # Done-file path convention mirrors the task-archive subscription's
+    # ``_done_file`` (``<projects_root>/<slug>/<slug>-done.md``); inlined
+    # here so the CLI doesn't reach into a daemon-layer private. The slug
+    # is already ``_SLUG_RE``-validated above, so the path is safe.
+    done_path = obs.vault_path / obs.projects_dir / slug / f"{slug}-done.md"
+
+    is_json = output_format == _FORMAT_JSON
+
+    def _emit_json(action: str, *, count: int, written: bool) -> None:
+        # Single-line JSON envelope shared by every 0-exit path so
+        # scripted callers get a parseable result on the no-write paths
+        # (dry-run / no-op / aborted) too, not just on a real write.
+        typer.echo(
+            json.dumps(
+                {
+                    "slug": slug,
+                    "path": str(done_path),
+                    "action": action,
+                    "count": count,
+                    "written": written,
+                }
+            )
+        )
+
+    try:
+        lines = asyncio.run(collect_resolved_lines(cfg=cfg, slug=slug))
+    except OSError as exc:
+        typer.echo(
+            f"lithos-loom: could not reach Lithos at "
+            f"{cfg.orchestrator.lithos_url} ({exc})",
+            err=True,
+        )
+        sys.exit(1)
+    except LithosClientError as exc:
+        typer.echo(f"lithos-loom: regenerate-done failed: {exc}", err=True)
+        sys.exit(1)
+
+    if dry_run:
+        if is_json:
+            _emit_json("dry-run", count=len(lines), written=False)
+        else:
+            typer.echo(render_dry_run(slug, done_path, lines))
+        return
+
+    file_exists = done_path.exists()
+    if not lines and not file_exists:
+        if is_json:
+            _emit_json("noop", count=0, written=False)
+        else:
+            typer.echo(
+                f"lithos-loom: no resolved tasks for {slug!r}; nothing to write",
+                err=True,
+            )
+        return
+
+    if file_exists and not yes:
+        try:
+            existing = done_path.read_text(encoding="utf-8")
+            n = sum(1 for ln in existing.splitlines() if ln)
+        except OSError:
+            n = 0  # count is cosmetic; still prompt before clobbering
+        action = "clear" if not lines else f"overwrite ({len(lines)} line(s))"
+        if not typer.confirm(
+            f"{action} {done_path.name} (currently {n} line(s))?",
+            default=False,
+        ):
+            if is_json:
+                _emit_json("aborted", count=len(lines), written=False)
+            else:
+                typer.echo("aborted; no changes made", err=True)
+            return
+
+    try:
+        asyncio.run(write_file_atomic(done_path, build_done_content(lines)))
+    except OSError as exc:
+        typer.echo(f"lithos-loom: could not write {done_path} ({exc})", err=True)
+        sys.exit(1)
+
+    if is_json:
+        _emit_json("written", count=len(lines), written=True)
+        return
+    typer.echo(str(done_path))

@@ -28,6 +28,7 @@ It is the orchestration layer that connects Lithos to coding agents — replacin
 | [`docs/prd/full.md`](docs/prd/full.md) | Full system PRD — 75 user stories spanning A1–A10 |
 | [`docs/macros/README.md`](docs/macros/README.md) | Slice 3 Obsidian capture macro — install instructions + behaviour notes. The macro source itself lives at [`docs/macros/capture-task.md`](docs/macros/capture-task.md) (copy-it-verbatim into your vault's Templater Template Folder). |
 | [`docs/cli/project-import.md`](docs/cli/project-import.md) | **`lithos-loom project import` reference** — every flag, decision, exit code, and worked example for adopting existing Obsidian project docs into Lithos (greenfield doc + tasks, `--tasks-only`, `--force-tasks`, `--dry-run`). |
+| [`docs/cli/project-regenerate-done.md`](docs/cli/project-regenerate-done.md) | **`lithos-loom project regenerate-done` reference** — rebuild a project's `<slug>-done.md` task archive from Lithos (all resolved tasks), the all-resolved-vs-surfaced semantic, flags, exit codes, and the live-daemon caveat. |
 | [`docs/result-schema.json`](docs/result-schema.json) | Versioned JSON Schema for the plugin `result.json` contract |
 
 ## Requirements
@@ -152,6 +153,7 @@ Individual `story-implement` runs *can* be sandboxed in docker (deferred A10 enh
 | `lithos-loom project list [--format text\|json] [--source lithos\|toml]` | List projects with Lithos-canonical status + TOML-local overlay (Slice 4 US31 / D30). |
 | `lithos-loom project create --title T [--slug S] [--tags A,B] [--body \| --body-file PATH] [--format text\|json]` | Create a new Lithos project-context doc (Slice 5 US36). Used by the `create-project` Templater macro. |
 | `lithos-loom project import <source> [--slug S] [--tags A,B] [--tasks-only] [--no-tasks] [--force-tasks] [--yes] [--dry-run] [--format text\|json]` | Import an existing local Markdown file as a Lithos project, extracting `- [ ]` lines as real Lithos tasks. **Full reference:** [`docs/cli/project-import.md`](docs/cli/project-import.md). |
+| `lithos-loom project regenerate-done --slug S [--dry-run] [--yes] [--format text\|json]` | Rebuild a project's `<slug>-done.md` task archive from Lithos (all resolved tasks, sorted by date). **Full reference:** [`docs/cli/project-regenerate-done.md`](docs/cli/project-regenerate-done.md). |
 | `lithos-loom obsidian-sync show [--format text\|json]` | Print the resolved `[obsidian_sync]` block — vault_path, tasks_file, filter knobs. Used by the capture macro to discover the configured `tasks_file` path at runtime. |
 
 ## Project layout

@@ -25,7 +25,7 @@ A separate per-project completed-tasks file fixes both: persistence becomes oper
 
 A new `task-archive` subscription that appends a Tasks-plugin-compatible line to `<vault>/_lithos/projects/<slug>/<slug>-done.md` whenever a human-surfaced Lithos task transitions to `completed` or `cancelled`. Companion change to the existing `obsidian-projection` subscription: immediately evict resolved tasks from the global file (rather than TTL-lingering) once they've been archived.
 
-Per-project done files are **vault-only, append-only, never regenerated**. They are not Lithos-canonical and have no upstream representation; the dir-watcher excludes them by suffix so operator edits are inert. The archive is a one-way operator-visible artifact derived from Lithos events.
+Per-project done files are **vault-only and append-only** — the live event path never rewrites them. They are not Lithos-canonical and have no upstream representation; the dir-watcher excludes them by suffix so operator edits are inert. The archive is a one-way operator-visible artifact derived from Lithos events. (An operator can rebuild one on demand — writing *all* resolved tasks, not the surfaced-only set — with `lithos-loom project regenerate-done`; see [`docs/cli/project-regenerate-done.md`](../cli/project-regenerate-done.md).)
 
 ### Flow per event
 
@@ -142,7 +142,7 @@ The archiver calls this verbatim. No new render path.
 
 1. **Sort order in done files.** Append-only = chronological by daemon-processing order, not by Lithos `resolved_at`. Bootstrap-replay tasks land first (in `resolved_since` order), then live events arrive in real-time order. Probably fine — operators query via Dataview / grep, not by reading top-to-bottom. Revisit if soak surfaces a real friction.
 
-2. **Operator-deleted done file.** Append-only + no regeneration means deleting the file loses archived history for that project. New completions re-create the file with just the new line. Document as a one-line note in `docs/macros/README.md` so the operator knows the failure mode.
+2. **Operator-deleted done file.** ~~Append-only + no regeneration means deleting the file loses archived history for that project.~~ **Resolved:** `lithos-loom project regenerate-done --slug <slug>` rebuilds the file from Lithos (all resolved tasks for the slug). New completions also re-append going forward. See [`docs/cli/project-regenerate-done.md`](../cli/project-regenerate-done.md).
 
 3. **Long-running `surfaced` map memory pressure.** Cleared on archive but a long-uptime daemon accumulates entries for tasks that never reach a terminal state (still-open tasks indefinitely). Cap is the open-task count, which is bounded; not a real concern. Revisit if soak shows growth.
 

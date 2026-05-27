@@ -217,10 +217,11 @@ tags = ["trigger:story-review-human"]
 # evict the line from the global tasks.md immediately. Tasks with no /
 # unknown metadata.project land in <projects_dir>/_unassigned/.
 #
-# Done files are vault-only, append-only, never regenerated — the dir
-# watcher excludes the -done.md suffix so operator edits to them are
-# inert. Deleting a done file loses that project's archived history
-# (re-created with just new lines on the next completion).
+# Done files are vault-only and append-only — the dir watcher excludes
+# the -done.md suffix so operator edits to them are inert. Deleting a
+# done file loses that project's surfaced history, but you can rebuild
+# the full resolved-task history any time with
+# `lithos-loom project regenerate-done --slug <slug>`.
 #
 # Requires the obsidian-projection subscription above — the projection
 # is what marks tasks "surfaced" (the archiver only archives tasks the
