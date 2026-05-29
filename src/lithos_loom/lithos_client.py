@@ -24,19 +24,77 @@ continues on transient failures.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import contextvars
 import dataclasses
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import TracebackType
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.types import CallToolResult
 
 from lithos_loom.errors import LithosClientError
+
+logger = logging.getLogger(__name__)
+
+# Dead-session recovery (#43). When Lithos restarts, the long-lived
+# MCP-over-SSE session held by the daemon's shared client goes dead and
+# every subsequent call_tool fails. ``_invoke`` re-establishes the
+# session and retries, bounded, so the daemon recovers without a restart.
+_MAX_TRANSPORT_ATTEMPTS = 3
+_RECONNECT_BACKOFF_SECONDS = 0.5
+
+
+class _ShutdownSentinel:
+    """Type-safe sentinel queued by :meth:`LithosClient.__aexit__` to tell
+    the keeper to stop. Using a class (vs ``None``) keeps the queue's type
+    annotation precise: ``Queue[_ReconnectRequest | _ShutdownSentinel]``.
+    """
+
+
+_SHUTDOWN: Final = _ShutdownSentinel()
+
+
+_invoke_retried: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "lithos_client_invoke_retried", default=False
+)
+"""Per-task flag set True by :meth:`LithosClient._invoke` if the call needed
+a transport retry (#43). Callers that need to disambiguate
+"server-committed-but-response-lost" from "first-attempt failure" check
+this immediately after ``_invoke`` returns or raises — currently only
+:meth:`LithosClient.task_claim`, whose ``claim_failed`` ownership
+re-check is gated on retry-occurred to avoid falsely treating an
+unrelated same-agent collision as our own committed claim (PR #60
+review, 2026-05-29).
+
+Reset at the start of every ``_invoke`` call, so the flag only reflects
+the most recent call's retry state. Read into a local *before* any
+follow-up ``_invoke`` (e.g. ``task_status``), which would clobber it.
+"""
+
+
+@dataclass
+class _ReconnectRequest:
+    """One reconnect ask from a caller to the keeper.
+
+    ``expected_gen`` is the session generation the caller observed before
+    its ``call_tool`` failed. The keeper compares against the current
+    generation under serial processing — if a peer already reconnected,
+    this request is a no-op and just signals ``done`` so the caller can
+    retry against the already-fresh session.
+    """
+
+    expected_gen: int
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    error: BaseException | None = None
+
 
 __all__ = ["LithosClient", "Note", "NoteSummary", "Task", "WriteResult"]
 
@@ -194,16 +252,342 @@ class LithosClient:
         self._sse_ctx: Any = None
         self._session_ctx: Any = None
         self._session: ClientSession | None = None
+        # Dead-session recovery (#43): the keeper task (spawned in
+        # ``__aenter__``) owns session lifecycle (open / close) — the MCP
+        # SDK's anyio cancel scopes are pinned to whichever task entered
+        # them, so all teardown + re-establish MUST run in that task. Other
+        # tasks dispatch reconnect requests via ``_reconnect_queue`` and
+        # await an ``_ReconnectRequest.done`` event. The generation counter
+        # makes concurrent requests single-flight (peer already reconnected
+        # → skip).
+        #
+        # Normal ``call_tool`` calls still go direct from any caller task —
+        # the MCP SDK's ClientSession multiplexes via request IDs, so
+        # concurrent in-flight calls are safe; only the open/close edges
+        # need the keeper.
+        self._reconnect_lock = asyncio.Lock()
+        self._session_generation = 0
+        self._keeper_task: asyncio.Task[None] | None = None
+        self._reconnect_queue: (
+            asyncio.Queue[_ReconnectRequest | _ShutdownSentinel] | None
+        ) = None
+        self._ready_event: asyncio.Event | None = None
+        self._startup_error: BaseException | None = None
+        # True once ``__aenter__`` has been called — distinguishes the
+        # test-bypass path (set ``_session`` directly, no keeper) from a
+        # production client whose keeper has died (then we fail loudly
+        # rather than silently fall back to the unsafe inline reconnect).
+        self._aenter_called: bool = False
 
     async def __aenter__(self) -> LithosClient:
-        sse_url = f"{self.base_url}/sse"
-        self._sse_ctx = sse_client(sse_url)
-        read, write = await self._sse_ctx.__aenter__()
-        self._session_ctx = ClientSession(read, write)
-        session = await self._session_ctx.__aenter__()
-        await session.initialize()
-        self._session = session
+        self._aenter_called = True
+        self._reconnect_queue = asyncio.Queue()
+        self._ready_event = asyncio.Event()
+        self._keeper_task = asyncio.create_task(
+            self._keeper_loop(), name="lithos-client-keeper"
+        )
+        await self._ready_event.wait()
+        if self._startup_error is not None:
+            err = self._startup_error
+            # Keeper has already exited; await it to surface any unraisable
+            # warnings before propagating the original error.
+            with contextlib.suppress(BaseException):
+                await self._keeper_task
+            self._keeper_task = None
+            raise err
         return self
+
+    async def _keeper_loop(self) -> None:
+        """Own the MCP session for the client's lifetime.
+
+        Runs the initial ``_establish`` (so the anyio cancel scopes opened
+        by ``sse_client`` / ``ClientSession`` belong to *this* task), then
+        services reconnect requests from :attr:`_reconnect_queue` one at a
+        time. Each reconnect tears down the old session and opens a fresh
+        one — both safe because we're back in the task that originally
+        opened the scopes (see :meth:`_teardown_in_keeper` for why this
+        matters).
+
+        On shutdown sentinel: drain pending requests so blocked callers
+        don't hang, then tear down the live session.
+        """
+        assert self._reconnect_queue is not None
+        assert self._ready_event is not None
+        try:
+            await self._establish()
+        except BaseException as exc:  # noqa: BLE001 — surface via startup_error
+            self._startup_error = exc
+            self._ready_event.set()
+            return
+        self._ready_event.set()
+        try:
+            while True:
+                request = await self._reconnect_queue.get()
+                if isinstance(request, _ShutdownSentinel):
+                    break
+                if self._session_generation != request.expected_gen:
+                    # Peer already reconnected since this caller's call
+                    # failed — no-op, caller will retry against the
+                    # already-fresh session.
+                    request.done.set()
+                    continue
+                try:
+                    await self._teardown_in_keeper()
+                    await self._establish()
+                    self._session_generation += 1
+                except BaseException as exc:  # noqa: BLE001 — surface via request
+                    request.error = exc
+                finally:
+                    request.done.set()
+        finally:
+            self._drain_pending_reconnects()
+            await self._teardown_in_keeper()
+
+    def _drain_pending_reconnects(self) -> None:
+        """Fail any reconnect requests still in the queue after shutdown so
+        callers blocked on ``request.done.wait()`` don't hang forever."""
+        if self._reconnect_queue is None:
+            return
+        shutdown_err = LithosClientError(
+            "session_unavailable",
+            "LithosClient keeper exited before processing reconnect",
+        )
+        while True:
+            try:
+                request = self._reconnect_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if isinstance(request, _ShutdownSentinel):
+                continue
+            request.error = shutdown_err
+            request.done.set()
+
+    async def _teardown_in_keeper(self) -> None:
+        """Tear down the current session + SSE contexts. Safe because the
+        keeper is the same task that opened them — calling ``__aexit__``
+        from any other task would raise ``RuntimeError: Attempted to exit
+        cancel scope in a different task than it was entered in`` (soak
+        2026-05-29; see also :meth:`_keeper_loop` docstring).
+
+        Errors during teardown are swallowed: the connection is already
+        dead (caller wouldn't have requested a reconnect otherwise), and
+        the fresh ``_establish`` that follows is what matters.
+        """
+        if self._session_ctx is not None:
+            try:  # noqa: SIM105 — contextlib.suppress(Exception) misses BaseExceptionGroup
+                await self._session_ctx.__aexit__(None, None, None)
+            except* Exception:
+                pass
+            self._session_ctx = None
+        self._session = None
+        if self._sse_ctx is not None:
+            try:  # noqa: SIM105 — contextlib.suppress(Exception) misses BaseExceptionGroup
+                await self._sse_ctx.__aexit__(None, None, None)
+            except* Exception:
+                pass
+            self._sse_ctx = None
+
+    async def _establish(self) -> None:
+        """Open a fresh MCP-over-SSE session, replacing any prior one.
+
+        The connect → ``ClientSession`` → ``initialize()`` sequence, factored
+        out of ``__aenter__`` so :meth:`_reconnect` can reuse it after a
+        dead-session failure. Reassigns ``self._session`` in place, so a
+        client shared across the daemon's subscription handlers recovers for
+        all of them without re-wiring.
+
+        On a partial failure (e.g. ``initialize()`` raises after the SSE
+        stream opened) we tear down what we opened before re-raising, so a
+        failed (re)connect never leaks the SSE context — important on the
+        initial ``__aenter__`` path, where there's no retry loop to clean up
+        after us.
+        """
+        try:
+            sse_url = f"{self.base_url}/sse"
+            self._sse_ctx = sse_client(sse_url)
+            read, write = await self._sse_ctx.__aenter__()
+            self._session_ctx = ClientSession(read, write)
+            session = await self._session_ctx.__aenter__()
+            await session.initialize()
+            self._session = session
+        except BaseExceptionGroup:
+            # anyio may surface partial-connect failures inside an
+            # ExceptionGroup. Handled separately from bare Exception so an
+            # ordinary connect/init error keeps its original type —
+            # wrapping it in a group via ``except*`` would degrade
+            # caller-side diagnostics.
+            await self._cleanup_partial_connect()
+            raise
+        except Exception:
+            await self._cleanup_partial_connect()
+            raise
+
+    async def _cleanup_partial_connect(self) -> None:
+        """Tear down a partially-opened session inside ``_establish``'s
+        except branch.
+
+        Unlike :meth:`_teardown_quietly` (which runs from a reconnect
+        triggered by some *other* task's failed call), we're in the same
+        task that opened these contexts, so calling ``__aexit__`` here is
+        safe — the anyio cancel scopes the SDK opened live in our stack
+        and exiting them won't cancel anyone else. Best-effort: errors
+        during cleanup are subordinate to the original exception we're
+        about to re-raise. ``except* Exception`` swallows Exception-derived
+        errors (bare or in an ExceptionGroup) while letting a
+        CancelledError-bearing residual subgroup propagate, so true
+        cancellation still wins over the original re-raise.
+        """
+        if self._session_ctx is not None:
+            try:  # noqa: SIM105 — contextlib.suppress(Exception) misses BaseExceptionGroup
+                await self._session_ctx.__aexit__(None, None, None)
+            except* Exception:
+                pass
+            self._session_ctx = None
+        self._session = None
+        if self._sse_ctx is not None:
+            try:  # noqa: SIM105 — contextlib.suppress(Exception) misses BaseExceptionGroup
+                await self._sse_ctx.__aexit__(None, None, None)
+            except* Exception:
+                pass
+            self._sse_ctx = None
+
+    async def _request_reconnect(self, *, expected_gen: int) -> None:
+        """Request a reconnect.
+
+        Production path (``__aenter__`` has run, keeper alive): queue a
+        request to the keeper and wait — the keeper does the teardown +
+        re-establish in its own task, where the anyio scopes belong.
+
+        Test path (``__aenter__`` never called, ``_session`` injected
+        directly): fall back to inline reconnect. Safe in tests because
+        mock sessions don't have real anyio cancel scopes.
+
+        Production with dead keeper: fail loudly rather than silently
+        falling back to the inline path — the inline path is unsafe in
+        production and would re-introduce the 2026-05-28 RuntimeError.
+        """
+        if self._keeper_task is not None and not self._keeper_task.done():
+            assert self._reconnect_queue is not None
+            request = _ReconnectRequest(expected_gen=expected_gen)
+            await self._reconnect_queue.put(request)
+            await request.done.wait()
+            if request.error is not None:
+                raise request.error
+            return
+        if self._aenter_called:
+            raise LithosClientError(
+                "session_unavailable",
+                "LithosClient keeper has exited; client is no longer usable",
+            )
+        await self._reconnect_inline(expected_gen=expected_gen)
+
+    async def _reconnect_inline(self, *, expected_gen: int) -> None:
+        """Reconnect from the caller's task (TESTS ONLY).
+
+        Used by the test-bypass path where ``__aenter__`` is skipped and
+        ``_session`` is set directly. Drops refs (rather than calling
+        ``__aexit__`` on real SDK contexts, which is the failure mode the
+        keeper exists to avoid) and calls ``_establish``. Single-flight via
+        :attr:`_reconnect_lock` so concurrent callers reconnect once.
+        """
+        async with self._reconnect_lock:
+            if self._session_generation != expected_gen:
+                return
+            self._session_ctx = None
+            self._session = None
+            self._sse_ctx = None
+            await self._establish()
+            self._session_generation += 1
+
+    async def _invoke(self, tool: str, arguments: dict[str, Any]) -> CallToolResult:
+        """Single chokepoint for every MCP tool call.
+
+        Wraps ``session.call_tool`` with dead-session recovery (#43): on a
+        transport-level failure it re-establishes the session and retries,
+        bounded by :data:`_MAX_TRANSPORT_ATTEMPTS` with a small backoff, then
+        re-raises the last error. Callers layer their own response decoding
+        on the returned :class:`CallToolResult` — domain ``{status:"error"}``
+        envelopes live *in* the result and are raised by those decoders
+        *after* this returns, so the only exceptions seen here are transport
+        / protocol failures from the SDK.
+
+        The catch is intentionally broad (any ``Exception`` except
+        ``CancelledError``): the exact exception the MCP/anyio stack raises on
+        a dropped SSE stream is version-dependent, and a too-narrow filter
+        would silently fail to recover. Bounded retries + per-attempt WARNING
+        logs + re-raise-on-exhaustion keep it from masking a persistent fault.
+
+        At-least-once caveat: the dominant failure — the session died while
+        idle and the next ``call_tool`` fails before the request is
+        transmitted — is safe to retry for reads and writes alike. A write
+        that committed server-side but lost its response to a mid-flight crash
+        could double-apply on retry; Lithos writes are largely tolerant
+        (``note_write`` is optimistic-version-locked, ``task_complete`` /
+        ``task_cancel`` are idempotent, a duplicate ``task_create`` is a
+        recoverable dup), so this isn't gated.
+        """
+        if self._session is None and not self._aenter_called:
+            raise LithosClientError(
+                "client_not_initialised",
+                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
+            )
+        # Reset the per-task retry flag so this call's reading of it reflects
+        # only this call's retry state. See :data:`_invoke_retried` for the
+        # rationale (task_claim ownership re-check disambiguation).
+        _invoke_retried.set(False)
+        last_exc: BaseException | None = None  # may be BaseExceptionGroup
+        for attempt in range(_MAX_TRANSPORT_ATTEMPTS):
+            session = self._session
+            if session is None:
+                # Transient: keeper is mid-reconnect (between teardown and
+                # establish, both await points). Request a reconnect — the
+                # keeper's generation guard makes this a near-no-op if the
+                # reconnect is already in flight.
+                await self._request_reconnect(expected_gen=self._session_generation)
+                continue
+            gen = self._session_generation
+            try:
+                return await session.call_tool(tool, arguments=arguments)
+            except asyncio.CancelledError:
+                raise
+            except BaseExceptionGroup as group:
+                # anyio (inside the MCP SDK) commonly wraps SSE-stream-closed
+                # failures in a group. If a CancelledError is anywhere in the
+                # tree, propagate the cancellation subgroup instead of
+                # retrying. Otherwise treat the remainder as a transport
+                # failure (soak 2026-05-28).
+                cancel_subgroup, rest = group.split(asyncio.CancelledError)
+                if cancel_subgroup is not None:
+                    raise cancel_subgroup from group
+                last_exc = rest if rest is not None else group
+            except Exception as exc:  # noqa: BLE001 — see _invoke docstring
+                last_exc = exc
+            # Transport-failure handling (shared between the bare and grouped
+            # paths): retry up to _MAX_TRANSPORT_ATTEMPTS, with reconnect.
+            if attempt == _MAX_TRANSPORT_ATTEMPTS - 1:
+                break
+            logger.warning(
+                "LithosClient: call_tool(%s) failed (%r); re-establishing "
+                "session (attempt %d/%d)",
+                tool,
+                last_exc,
+                attempt + 1,
+                _MAX_TRANSPORT_ATTEMPTS,
+            )
+            await asyncio.sleep(_RECONNECT_BACKOFF_SECONDS)
+            await self._request_reconnect(expected_gen=gen)
+            # Mark retry as having happened before the next call_tool attempt,
+            # so a write that committed-but-response-lost (claim_failed et al.)
+            # can be reconciled by the caller's idempotency check.
+            _invoke_retried.set(True)
+        if last_exc is not None:
+            raise last_exc
+        # Every attempt hit the transient-None path without ever landing a
+        # live session — surface a clean error rather than looping forever.
+        raise LithosClientError(
+            "session_unavailable",
+            "LithosClient could not re-establish a session after reconnect",
+        )
 
     async def __aexit__(
         self,
@@ -211,6 +595,29 @@ class LithosClient:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        """Shut down the client.
+
+        Production path (keeper alive): queue a shutdown sentinel and
+        await the keeper — it tears down the session in its own task,
+        where the anyio scopes belong. Calling ``__aexit__`` on the
+        contexts from this task would raise ``RuntimeError: Attempted to
+        exit cancel scope in a different task than it was entered in``
+        (the keeper task opened them, not us).
+
+        Test path (no keeper): fall back to direct ``__aexit__`` on
+        whatever contexts are pinned — safe because mock contexts don't
+        have real anyio scopes. Preserves backward-compat with tests that
+        bypass ``__aenter__`` and set ``_session_ctx`` / ``_sse_ctx``
+        directly.
+        """
+        if self._keeper_task is not None and not self._keeper_task.done():
+            assert self._reconnect_queue is not None
+            self._reconnect_queue.put_nowait(_SHUTDOWN)
+            with contextlib.suppress(Exception, BaseExceptionGroup):
+                await self._keeper_task  # keeper errors surface via request.error
+            self._keeper_task = None
+            return
+        # Test / pre-init path — close any directly-installed contexts.
         try:
             if self._session_ctx is not None:
                 await self._session_ctx.__aexit__(exc_type, exc, tb)
@@ -229,14 +636,10 @@ class LithosClient:
         Returns the decoded JSON payload (typically a ``dict``). Domain
         errors with a ``{status: "error", code, message}`` envelope raise
         :class:`LithosClientError`; transport-level failures from the
-        ``mcp`` SDK propagate untouched.
+        ``mcp`` SDK are recovered (dead-session reconnect) by
+        :meth:`_invoke`, or propagate if recovery is exhausted.
         """
-        if self._session is None:
-            raise LithosClientError(
-                "client_not_initialised",
-                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
-            )
-        result = await self._session.call_tool(tool, arguments=arguments)
+        result = await self._invoke(tool, arguments)
         payload = _payload_from_result(result)
         if isinstance(payload, dict):
             _raise_if_error_envelope(payload)
@@ -259,17 +662,12 @@ class LithosClient:
         contract so loom can roll out ahead of a staging Lithos that
         doesn't yet recognise the kwarg.
         """
-        if self._session is None:
-            raise LithosClientError(
-                "client_not_initialised",
-                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
-            )
         arguments: dict[str, Any] = {"with_claims": with_claims}
         if status is not None:
             arguments["status"] = status
         if resolved_since is not None:
             arguments["resolved_since"] = resolved_since.isoformat()
-        result = await self._session.call_tool("lithos_task_list", arguments=arguments)
+        result = await self._invoke("lithos_task_list", arguments)
         return _parse_task_list_response(result)
 
     async def finding_post(
@@ -288,11 +686,6 @@ class LithosClient:
         ``[Friction]`` posting and Lithos will surface it cluster-wide via
         finding listings rather than per-task.
         """
-        if self._session is None:
-            raise LithosClientError(
-                "client_not_initialised",
-                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
-            )
         agent_id = agent or self.agent_id
         if not agent_id:
             raise LithosClientError(
@@ -311,9 +704,7 @@ class LithosClient:
         }
         if knowledge_id is not None:
             arguments["knowledge_id"] = knowledge_id
-        result = await self._session.call_tool(
-            "lithos_finding_post", arguments=arguments
-        )
+        result = await self._invoke("lithos_finding_post", arguments)
         payload = _payload_from_result(result)
         if isinstance(payload, dict):
             _raise_if_error_envelope(payload)
@@ -333,27 +724,96 @@ class LithosClient:
         """Claim ``aspect`` of ``task_id``. Returns the claim's ``expires_at``.
 
         Raises :class:`LithosClientError` with ``code="claim_failed"`` when
-        the aspect is already claimed (or the task isn't open). Callers
-        treat that as "skip — another runner won the race".
+        the aspect is already claimed **by another agent** (or the task isn't
+        open). Callers treat that as "skip — another runner won the race".
+
+        Idempotent under the transport-retry layer (#43), but ONLY when
+        ``_invoke`` actually retried this call. ``_invoke`` may re-issue
+        this claim after a transport failure, and a claim that committed
+        server-side before its response was lost would then come back
+        ``claim_failed`` — *because we already hold it*. To avoid turning
+        our own committed claim into a visible ``claim_failed`` (which would
+        make RouteRunner silently skip work it owns until the TTL lapses),
+        a retry-induced ``claim_failed`` is disambiguated against the
+        task's actual claims: if **we** hold this aspect, the claim
+        effectively succeeded and we return its expiry.
+
+        **Critical**: the ownership re-check is gated on
+        :data:`_invoke_retried`. On a *first-attempt* ``claim_failed`` we
+        re-raise immediately, because the only way our ``agent_id`` could
+        be the holder without us having retried is if a *different* Loom
+        process is sharing this ``agent_id`` and already holds the claim
+        — and silently "succeeding" in that case would let both processes
+        run the plugin (PR #60 review, 2026-05-29). Operators are still
+        free to use process-unique ``agent_id`` values to avoid the
+        ambiguity entirely; this gate just removes the regression where
+        the retry-recovery path made the shared-``agent_id`` mistake more
+        dangerous than it was without #43.
         """
         agent_id = agent or self.agent_id
         if not agent_id:
             raise LithosClientError("missing_agent", "task_claim needs an agent id")
-        payload = await self._call(
-            "lithos_task_claim",
-            {
-                "task_id": task_id,
-                "aspect": aspect,
-                "agent": agent_id,
-                "ttl_minutes": ttl_minutes,
-            },
-        )
+        try:
+            payload = await self._call(
+                "lithos_task_claim",
+                {
+                    "task_id": task_id,
+                    "aspect": aspect,
+                    "agent": agent_id,
+                    "ttl_minutes": ttl_minutes,
+                },
+            )
+        except LithosClientError as exc:
+            if exc.code != "claim_failed":
+                raise
+            # Capture the retry flag BEFORE the next ``_invoke`` (via
+            # ``_claim_expiry_if_held`` → ``task_status``) resets it.
+            retried = _invoke_retried.get()
+            if not retried:
+                # First-attempt claim_failed: a same-``agent_id`` holder must
+                # be a *different* process, since we never sent a prior
+                # request that could have committed and lost its response.
+                # Propagate as a real collision.
+                raise
+            held = await self._claim_expiry_if_held(task_id, aspect, agent_id)
+            if held is not None:
+                logger.info(
+                    "task_claim: %s aspect %r reported claim_failed on retry "
+                    "but is already held by %s (treating as success — likely a "
+                    "retried claim whose first response was lost)",
+                    task_id,
+                    aspect,
+                    agent_id,
+                )
+                return held
+            raise
         expires = payload.get("expires_at") if isinstance(payload, dict) else None
         if not isinstance(expires, str):
             raise LithosClientError(
                 "invalid_response", "task_claim response missing expires_at"
             )
         return expires
+
+    async def _claim_expiry_if_held(
+        self, task_id: str, aspect: str, agent_id: str
+    ) -> str | None:
+        """Return our own claim's ``expires_at`` for ``aspect`` if ``agent_id``
+        already holds it on ``task_id``, else ``None``.
+
+        Disambiguates a ``claim_failed`` that is actually our own
+        committed-but-response-lost claim (#43). Returns ``""`` when we hold
+        the claim but Lithos omitted ``expires_at`` (we still own it — the
+        caller only needs to know the claim is ours). A missing task or any
+        non-matching/other-agent claim returns ``None`` → genuine failure.
+        """
+        task = await self.task_status(task_id=task_id)
+        if task is None:
+            return None
+        for claim in task.claims:
+            if claim.get("agent") == agent_id and claim.get("aspect") == aspect:
+                expires = claim.get("expires_at")
+                return expires if isinstance(expires, str) else ""
+        return None
 
     async def task_renew(
         self,
@@ -541,14 +1001,7 @@ class LithosClient:
         claim serialization cost, and uses an explicit
         ``task_not_found`` error envelope instead of an empty list.
         """
-        if self._session is None:
-            raise LithosClientError(
-                "client_not_initialised",
-                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
-            )
-        result = await self._session.call_tool(
-            "lithos_task_status", arguments={"task_id": task_id}
-        )
+        result = await self._invoke("lithos_task_status", {"task_id": task_id})
         try:
             tasks = _parse_task_list_response(result)
         except LithosClientError as exc:
@@ -571,14 +1024,7 @@ class LithosClient:
         ``metadata.priority`` comparisons — and reserve
         :meth:`task_status` for callers that need claims.
         """
-        if self._session is None:
-            raise LithosClientError(
-                "client_not_initialised",
-                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
-            )
-        result = await self._session.call_tool(
-            "lithos_task_get", arguments={"task_id": task_id}
-        )
+        result = await self._invoke("lithos_task_get", {"task_id": task_id})
         try:
             return _parse_task_get_response(result)
         except LithosClientError as exc:
@@ -605,11 +1051,6 @@ class LithosClient:
         have one, path otherwise" (the projection layer always has
         the id; the doctor may have only the path).
         """
-        if self._session is None:
-            raise LithosClientError(
-                "client_not_initialised",
-                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
-            )
         if id is None and path is None:
             raise LithosClientError(
                 "invalid_input", "note_read requires one of id= or path="
@@ -619,7 +1060,7 @@ class LithosClient:
             arguments["id"] = id
         if path is not None:
             arguments["path"] = path
-        result = await self._session.call_tool("lithos_read", arguments=arguments)
+        result = await self._invoke("lithos_read", arguments)
         try:
             return _parse_note_read_response(result)
         except LithosClientError as exc:
@@ -748,17 +1189,12 @@ class LithosClient:
         pagination would change observability without changing
         contract.
         """
-        if self._session is None:
-            raise LithosClientError(
-                "client_not_initialised",
-                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
-            )
         arguments: dict[str, Any] = {"limit": limit}
         if path_prefix is not None:
             arguments["path_prefix"] = path_prefix
         if tags is not None:
             arguments["tags"] = tags
-        result = await self._session.call_tool("lithos_list", arguments=arguments)
+        result = await self._invoke("lithos_list", arguments)
         return _parse_note_list_response(result)
 
     async def note_delete(
@@ -822,12 +1258,7 @@ class LithosClient:
         ``version_conflict`` / ``slug_collision`` envelopes — the
         caller (:meth:`note_write`) needs to see them as data. Other
         error envelopes still raise."""
-        if self._session is None:
-            raise LithosClientError(
-                "client_not_initialised",
-                "LithosClient not initialised; use 'async with LithosClient(...) as c'",
-            )
-        result = await self._session.call_tool(tool, arguments=arguments)
+        result = await self._invoke(tool, arguments)
         payload = _payload_from_result(result)
         if not isinstance(payload, dict):
             raise LithosClientError(
