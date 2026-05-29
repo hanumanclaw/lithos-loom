@@ -1,14 +1,13 @@
 """Check-runner framework + per-domain probes for ``lithos-loom doctor``.
 
-US15 (Slice 1) ships the vault probes — verify ``vault_path`` exists,
-``_lithos/`` is creatable, and a write+read round-trip works.
+Vault probes verify ``vault_path`` exists, ``_lithos/`` is creatable,
+and a write+read round-trip works.
 
-Slice 4 US32 adds project-context probes — verify every TOML
-``[projects.<slug>]`` entry has a matching Lithos project context
-doc at ``projects/<slug>/`` (i.e. the slug is canonical, not just
-host-local invention). Per **D23** Lithos is the project registry;
-a TOML entry referencing a slug Lithos doesn't know about is a
-misconfiguration the operator should fix.
+Project-context probes verify every TOML ``[projects.<slug>]`` entry
+has a matching Lithos project-context doc at ``projects/<slug>/``
+(i.e. the slug is canonical, not just host-local). Lithos is the
+project registry; a TOML entry referencing a slug Lithos doesn't know
+about is a misconfiguration the operator should fix.
 
 Public surface:
 
@@ -63,7 +62,7 @@ class CheckResult:
 
 
 def run_vault_checks(cfg: LoomConfig) -> list[CheckResult]:
-    """Run the three vault probes from US15 against ``cfg``.
+    """Run the three vault probes against ``cfg``.
 
     Returns an empty list when ``[obsidian_sync]`` isn't configured —
     the caller (the ``doctor`` CLI command) prints a skip note in that
@@ -174,7 +173,7 @@ def format_results(results: list[CheckResult]) -> list[str]:
     return lines
 
 
-# ── Project-context probes (Slice 4 US32) ──────────────────────────────
+# ── Project-context probes ──────────────────────────────────────────────
 
 
 class _ProjectsClient(Protocol):
@@ -197,7 +196,7 @@ async def run_project_checks(
     client: _ProjectsClient,
 ) -> list[CheckResult]:
     """Verify every TOML ``[projects.<slug>]`` entry has a matching
-    Lithos project context doc (Slice 4 US32, reframed per D23).
+    Lithos project-context doc.
 
     Returns:
 

@@ -1,5 +1,4 @@
-"""ObsidianFsWatcher — polling source for vault edits to ``_lithos/tasks.md``
-(Slice 2 US16 + US23).
+"""ObsidianFsWatcher — polling source for vault edits to ``_lithos/tasks.md``.
 
 Watches a single projected file, polls its SHA-256 at
 ``poll_interval_seconds``, parses per-task ``[ ]/[x]/[-]`` markers,
@@ -17,11 +16,7 @@ Why polling instead of ``watchdog``:
 * Deterministic tests — ``poll_once()`` is callable directly without
   installing OS-level fs handlers.
 
-When Slice 5 needs to watch the multi-file ``_lithos/projects/<slug>/``
-tree we may revisit; the architecture (source publishes events; sync
-state coordinates self-writes) is the same regardless of mechanism.
-
-US23 self-write suppression has two layers, cheapest-first:
+Self-write suppression has two layers, cheapest-first:
 
 1. **Unchanged hash.** ``current_hash == self._last_seen_hash`` →
    no edits since last poll → return without parsing.
@@ -38,8 +33,7 @@ US23 self-write suppression has two layers, cheapest-first:
    ``obsidian.task.status_changed`` for each task whose parsed marker
    differs from ``sync_state.task_status_markers[task_id]``. Tasks
    the projection has never written (``projection_marker is None``)
-   are ignored — the capture-macro path that introduces those is
-   Slice 3.
+   are ignored — they are new lines inserted by the capture-macro.
 
 Event payload shape::
 
@@ -78,12 +72,12 @@ logger = logging.getLogger(__name__)
 
 
 VALID_STATUS_MARKERS: frozenset[str] = frozenset({"[ ]", "[x]", "[-]", "[/]", "[>]"})
-"""Checkbox markers recognised by the user story (US16 enum).
+"""Checkbox markers the watcher recognises.
 
 ``[ ]`` open · ``[x]`` completed · ``[-]`` cancelled · ``[/]`` in
-progress · ``[>]`` rescheduled. The watcher emits events for any
-flip among these; the status-transition subscription decides which
-ones map to Lithos calls (US17–US20)."""
+progress · ``[>]`` rescheduled. The watcher emits events for any flip
+among these; the status-transition subscription decides which ones map
+to Lithos calls."""
 
 
 EMOJI_TO_PRIORITY: dict[str, str] = {
@@ -93,27 +87,25 @@ EMOJI_TO_PRIORITY: dict[str, str] = {
     "🔽": "low",
     "⏬": "lowest",
 }
-"""D18 priority enum (Slice 2 US21), inverse of the projection's
-``_PRIORITY_EMOJI``. The two tables are pinned to agree by an
-anti-drift test in ``tests/test_obsidian_fs_watcher.py``
+"""Priority emoji → enum string, inverse of the projection's
+``PRIORITY_EMOJI``. The two tables are pinned to agree by an anti-drift
+test in ``tests/test_obsidian_fs_watcher.py``
 (``test_priority_emoji_table_matches_projection_table``); if either
 changes, that test fails loudly. Public (no underscore) so the
-anti-drift test can import it without reaching into private
-internals."""
+anti-drift test can import it without reaching into private internals."""
 
 
-# `- [<m>] ...` where <m> is exactly one character (PRD line shapes
-# use single-char markers; the regex deliberately rejects multi-char
+# `- [<m>] ...` where <m> is exactly one character (single-char markers
+# are the projected line shape; the regex deliberately rejects multi-char
 # weirdness rather than guessing).
 _LINE_RE = re.compile(r"^- \[(?P<marker>.)\] ")
 _TASK_ID_RE = re.compile(r"🆔 lithos:(?P<task_id>[A-Za-z0-9_-]+)")
-# Match any of the five D18 priority emoji. The projection renders
-# the emoji in the trailing-metadata zone *after* the 🆔 marker
-# (see ``render.render_line``). The parser scopes search to the
-# zone after ``id_match.end()`` so titles freely containing one of
-# these emoji can't be misread as the task's priority. Mid-line
-# emoji in titles are by design ignored — only trailing-zone
-# metadata is authoritative.
+# Match any of the five priority emoji. The projection renders the emoji
+# in the trailing-metadata zone *after* the 🆔 marker (see
+# ``render.render_line``). The parser scopes search to the zone after
+# ``id_match.end()`` so titles freely containing one of these emoji
+# can't be misread as the task's priority. Mid-line emoji in titles are
+# by design ignored — only trailing-zone metadata is authoritative.
 _PRIORITY_EMOJI_RE = re.compile(r"(🔺|⏫|🔼|🔽|⏬)")
 # Match the Tasks-plugin due-date marker: `📅 YYYY-MM-DD`. Same
 # trailing-zone-only scoping as the priority regex above — a title
@@ -162,15 +154,15 @@ class ObsidianFsWatcher:
         # projection self-write — the projection's re-rendered file is
         # authoritative over any user edits sitting on top of it.
         self._observed_markers: dict[str, str] = {}
-        # Parallel per-task memory for priority enums (Slice 2 US21).
-        # Same role as ``_observed_markers`` but for the
+        # Parallel per-task memory for priority enums. Same role as
+        # ``_observed_markers`` but for the
         # ``obsidian.task.priority_changed`` event family. ``None``
         # values are meaningful — "user committed a line with no
         # priority emoji" — so this is ``dict[str, str | None]``
         # rather than just ``dict[str, str]``.
         self._observed_priorities: dict[str, str | None] = {}
-        # Parallel per-task memory for due dates (Slice 3 round-trip).
-        # Same role as ``_observed_priorities`` but for
+        # Parallel per-task memory for due dates. Same role as
+        # ``_observed_priorities`` but for
         # ``obsidian.task.due_date_changed``. ``None`` is a meaningful
         # value here — "user committed a line with no 📅 marker" — so
         # the type is ``dict[str, str | None]``. The string values are
@@ -310,22 +302,22 @@ class ObsidianFsWatcher:
         # ``raw is None`` means missing/unreadable; nothing to parse.
         text = raw.decode("utf-8", errors="replace") if raw is not None else ""
         for task_id, marker, priority, due_date in _parse_line_markers(text):
-            # ─── status diff (US17–US19) ──────────────────────────────
+            # ─── status diff ──────────────────────────────────────────
             prior_status = self._observed_markers.get(
                 task_id, self.sync_state.task_status_markers.get(task_id)
             )
             if prior_status is None:
                 # Task not in the projection's last-known render and
                 # we haven't observed it before. Stale line, or a
-                # Slice 3+ capture-macro line. Suppress — Slice 2
-                # only owns projection-known tasks.
+                # capture-macro line. Suppress — we only diff
+                # projection-known tasks.
                 continue
             if marker != prior_status:
                 await self._publish_status_change(task_id, prior_status, marker)
                 self._observed_markers[task_id] = marker
                 published += 1
 
-            # ─── priority diff (US21) ─────────────────────────────────
+            # ─── priority diff ────────────────────────────────────────
             # Only diff priority for projection-known tasks (same
             # ``prior_status is None`` gate above). ``None`` is a
             # meaningful value here — "no priority emoji on the
@@ -342,7 +334,7 @@ class ObsidianFsWatcher:
                 self._observed_priorities[task_id] = priority
                 published += 1
 
-            # ─── due-date diff (Slice 3 round-trip) ───────────────────
+            # ─── due-date diff ────────────────────────────────────────
             # Same shape as the priority diff above. ``None`` is
             # meaningful ("no 📅 marker on the line"), so we use
             # explicit membership for the observed-map lookup. The
@@ -377,9 +369,9 @@ class ObsidianFsWatcher:
     async def _publish_priority_change(
         self, task_id: str, prior: str | None, new: str | None
     ) -> None:
-        """Publish ``obsidian.task.priority_changed`` (Slice 2 US21).
+        """Publish ``obsidian.task.priority_changed``.
 
-        ``prior`` / ``new`` carry the canonical D18 enum strings
+        ``prior`` / ``new`` carry the canonical priority enum strings
         (``"highest"``, ``"high"``, ``"medium"``, ``"low"``,
         ``"lowest"``) or ``None`` for "no priority". The handler
         consumes enums; the emoji-to-enum translation is the
@@ -401,7 +393,7 @@ class ObsidianFsWatcher:
     async def _publish_due_date_change(
         self, task_id: str, prior: str | None, new: str | None
     ) -> None:
-        """Publish ``obsidian.task.due_date_changed`` (Slice 3 round-trip).
+        """Publish ``obsidian.task.due_date_changed``.
 
         ``prior`` / ``new`` carry the canonical ``YYYY-MM-DD`` strings
         the renderer emits / the ``_DUE_DATE_RE`` regex matches — or
@@ -456,7 +448,7 @@ def _parse_line_markers(
 
         - [<m>] <title> 🆔 lithos:<id> ... [<prio>] [📅 <date>]
 
-    where ``<prio>`` is one of the D18 priority emoji (or absent)
+    where ``<prio>`` is one of the five priority emoji (or absent)
     and ``<date>`` is the YYYY-MM-DD form Tasks plugin renders. The
     priority emoji is mapped to its canonical enum string via
     :data:`EMOJI_TO_PRIORITY`; the due date is yielded verbatim as a
@@ -474,8 +466,7 @@ def _parse_line_markers(
     Lines that don't start with ``- [<m>] `` (header comments, blank
     lines, free-text) are skipped silently. A matching prefix without
     a ``🆔 lithos:<id>`` marker is also skipped — it's a task-shaped
-    line the projection didn't write, which is out of scope for
-    Slice 2.
+    line the projection didn't write.
 
     Unknown checkbox markers (anything outside :data:`VALID_STATUS_MARKERS`)
     are skipped with a debug log; the user typed something we don't

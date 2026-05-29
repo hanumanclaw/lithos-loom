@@ -2,21 +2,20 @@
 
 Takes the list of ``ParsedTaskLine`` produced by ``task_line_parser``
 and returns ``TaskCreatePlan`` entries with dependency edges derived
-from indentation per the locked decisions in
-``docs/prd/bulk-task-import.md``:
+from indentation:
 
-- **D63** Top-level tasks are flat (no ``depends_on`` between them).
-- **D64** Indented children represent composition: parent gets
+- Top-level tasks are flat (no ``depends_on`` between them).
+- Indented children represent composition: parent gets
   ``metadata.depends_on = [child_line_numbers]``; children have NO
   ``depends_on`` back to the parent. Parent is marked complete
   manually after all children are done.
-- **D65** Sibling children of a parent are parallelizable by default
+- Sibling children of a parent are parallelizable by default
   (``parallelizable = True``, no ``depends_on`` between siblings).
   When the parent carries the ``[sequential]`` marker
   (``is_sequential_parent = True``), that parent's children form a
   chain: child[i] depends on child[i-1].
-- **D66** Parent tasks with empty descriptions (just a heading) are
-  flagged as validation errors.
+- Parent tasks with empty descriptions (just a heading) are flagged
+  as validation errors.
 
 The builder is I/O-free. Line-number references in
 ``depends_on_line_numbers`` are resolved to Lithos task ids at
@@ -61,16 +60,16 @@ def build_plan(
     Returns:
         (plans, errors). ``plans`` preserves the input order (caller
         topologically sorts at task-create time). ``errors`` contains
-        D66 empty-parent violations only — D62 cross-project tag
-        violations come from the parser itself and are passed
-        through the CLI separately.
+        empty-parent violations only — cross-project tag violations
+        come from the parser itself and are passed through the CLI
+        separately.
     """
     plans: list[TaskCreatePlan] = []
     errors: list[ValidationError] = []
 
-    # Map line_number → list of child line_numbers (for D64 parent.depends_on).
+    # Map line_number → list of child line_numbers (parent.depends_on).
     children_of: dict[int, list[int]] = {ln.line_number: [] for ln in lines}
-    # Map line_number → parent line_number (for D65 sibling sequencing).
+    # Map line_number → parent line_number (for sibling sequencing).
     parent_of: dict[int, int | None] = {ln.line_number: None for ln in lines}
     # Stack of (indent, line_number) tracking the open ancestor chain.
     stack: list[tuple[int, int]] = []
@@ -93,12 +92,12 @@ def build_plan(
     # set, so build a fast lookup.
     line_by_number: dict[int, ParsedTaskLine] = {ln.line_number: ln for ln in lines}
 
-    # D66: empty parent detection. A line that has children AND is_empty
+    # Empty parent detection. A line that has children AND is_empty
     # is an empty-parent error. (An empty leaf is fine — it just becomes
     # a Lithos task with an empty description; today Lithos would
     # presumably reject it on its own, but the operator shouldn't write
-    # one and we don't need to second-guess. The PRD specifically
-    # targets the "empty parent reading as a heading" case.)
+    # one and we don't need to second-guess. The validated case is the
+    # "empty parent reading as a heading" anti-pattern.)
     for line in lines:
         if line.is_empty and children_of[line.line_number]:
             errors.append(
@@ -113,14 +112,13 @@ def build_plan(
                 )
             )
 
-    # Build per-task depends_on + parallelizable per D63 / D64 / D65.
+    # Build per-task depends_on + parallelizable.
     for line in lines:
         own_children = children_of[line.line_number]
         parent_ln = parent_of[line.line_number]
 
-        # Depends_on: parents depend on children (D64). Children that
-        # are siblings of a [sequential] parent ALSO depend on their
-        # previous sibling (D65).
+        # Depends_on: parents depend on children. Children of a
+        # [sequential] parent ALSO depend on their previous sibling.
         depends_on: list[int] = list(own_children)
 
         if parent_ln is not None:
@@ -132,10 +130,10 @@ def build_plan(
                     depends_on.append(siblings[idx - 1])
 
         # Parallelizable: True for siblings under a non-sequential
-        # parent (D65 default). False for top-level tasks (D63 — they
-        # have no parallelism contract), for parent tasks themselves
-        # (they're gated on their children), and for siblings of a
-        # [sequential] parent (they're explicitly serialized).
+        # parent. False for top-level tasks (they have no parallelism
+        # contract), for parent tasks themselves (they're gated on
+        # their children), and for siblings of a [sequential] parent
+        # (they're explicitly serialized).
         parallelizable = False
         if parent_ln is not None:
             parent_line = line_by_number[parent_ln]

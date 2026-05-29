@@ -1,4 +1,4 @@
-"""``note-push`` subscription handler (Slice 5 US34).
+"""``note-push`` subscription handler.
 
 Consumes ``obsidian.note.modified`` events emitted by
 :class:`~lithos_loom.sources.obsidian_dir_watcher.ObsidianDirWatcher`

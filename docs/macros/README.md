@@ -2,10 +2,10 @@
 
 User-installed Templater macros that complete the Obsidian-side capture flows for `lithos-loom`. Each macro lives in this folder as a `.md` file containing only a Templater `<%* %>` execution block — copy the file verbatim into your vault's Templater Template Folder, no editing required.
 
-| Macro | Slice | Purpose |
-|-------|-------|---------|
-| [`capture-task.md`](capture-task.md) | Slice 3 (US24-27) | Single-modal form to create a new Lithos task from inside Obsidian. Inserts a wikilink to the projected line at cursor. |
-| [`create-project.md`](create-project.md) | Slice 5 (US36) | Single-modal form to create a new Lithos project-context doc. Inserts a wikilink to the projected vault file at cursor. |
+| Macro | Purpose |
+|-------|---------|
+| [`capture-task.md`](capture-task.md) | Single-modal form to create a new Lithos task from inside Obsidian. Inserts a wikilink to the projected line at cursor. |
+| [`create-project.md`](create-project.md) | Single-modal form to create a new Lithos project-context doc. Inserts a wikilink to the projected vault file at cursor. |
 
 ---
 
@@ -31,7 +31,7 @@ Creates a new Lithos task from a one-dialog form, then inserts a wikilink at cur
 The intuitive "insert the task line at cursor" model has a fatal architectural flaw: the daemon's projection already places the canonical line in the configured `tasks_file`. If the macro ALSO inserts the line at cursor, you end up with the same task in two places — and only the projection's copy gets updates. Worse, if both files match a Tasks-plugin daily query, the task renders **twice** in the daily view.
 
 The wikilink shape sidesteps that:
-- **One source of truth** for the actionable task: the configured `tasks_file`, managed by the daemon. Tick/cancel/priority edits there flow back to Lithos via the Slice 2 handlers.
+- **One source of truth** for the actionable task: the configured `tasks_file`, managed by the daemon. Tick/cancel/priority/due-date edits there flow back to Lithos via the `obsidian-status-transition` / `-priority-changed` / `-due-date-changed` handlers.
 - **Capture context preserved** in the current note: a clickable reference that says "I had this thought while writing about X". Doesn't double-render in Tasks queries (it's not a `- [ ]` line).
 - **Greppable**: the trailing `🆔 lithos:<id>` is searchable from anywhere in the vault if you forget where you captured it.
 - **Config-aware**: the wikilink target is resolved at macro fire time from `lithos-loom obsidian-sync show`, so hosts that customise `[obsidian_sync].tasks_file` get a working link without editing the macro.
@@ -134,7 +134,7 @@ Creates a new Lithos project-context doc from a one-dialog form, then inserts a 
 
 ## Why a wikilink, not the doc content itself?
 
-Same logic as `capture-task` — the daemon's projection is the single source of truth for the vault file. Inserting the content at cursor would create a stale duplicate that doesn't track Lithos updates. The wikilink gives a clickable navigation handle to the canonical doc; clicking opens the projected file, which is editable in Obsidian and pushed back via Slice 5's note-push handler.
+Same logic as `capture-task` — the daemon's projection is the single source of truth for the vault file. Inserting the content at cursor would create a stale duplicate that doesn't track Lithos updates. The wikilink gives a clickable navigation handle to the canonical doc; clicking opens the projected file, which is editable in Obsidian and pushed back via the `note-push` handler.
 
 ## Prerequisites
 

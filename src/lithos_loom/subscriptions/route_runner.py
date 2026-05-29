@@ -1,11 +1,10 @@
-"""RouteRunner — claim-bound bus subscriber that runs plugins (Slice 0 US5).
+"""RouteRunner — claim-bound bus subscriber that runs plugins.
 
-This is the legacy poll-claim-execute behaviour preserved by the locked
-decisions, re-implemented as a special subscriber type sitting on the
-in-process :class:`EventBus`. It listens for ``lithos.task.created`` /
-``lithos.task.released`` events whose tags match the route's
-``RouteMatch.tags``, claims the task via Lithos, runs the configured
-plugin subprocess, and applies the resulting status:
+A special subscriber type sitting on the in-process :class:`EventBus`.
+It listens for ``lithos.task.created`` / ``lithos.task.released`` events
+whose tags match the route's ``RouteMatch.tags``, claims the task via
+Lithos, runs the configured plugin subprocess, and applies the resulting
+status:
 
 * ``status="succeeded"`` → ``task_complete`` (releases all claims)
 * ``status="failed"`` → ``task_release`` + ``[BlockerFailed]`` finding
@@ -16,9 +15,8 @@ The runner is instantiated directly by the route-runner child entry
 point (one runner per route) — it does **not** go through the
 ``lithos_loom.subscriptions`` entry-point registry, because routes have
 distinct semantics (claim-bound, plugin-driven) from the generic fire-
-and-forget subscriptions that registry serves. Per integration.md D4,
-routes and subscriptions share an internal type but are distinct TOML
-stanzas.
+and-forget subscriptions that registry serves. Routes and subscriptions
+share an internal type but are distinct TOML stanzas.
 """
 
 from __future__ import annotations

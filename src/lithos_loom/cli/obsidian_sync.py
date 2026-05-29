@@ -1,7 +1,7 @@
-"""``lithos-loom obsidian-sync`` sub-app (Slice 3 capture-macro helper).
+"""``lithos-loom obsidian-sync`` sub-app.
 
 Exposes the configured ``[obsidian_sync]`` block to operators and to
-the Slice 3 capture macro. The macro needs the configured
+the capture macro. The macro needs the configured
 ``tasks_file`` (which is operator-configurable — see
 ``src/lithos_loom/config.py:188``) to build a wikilink pointing at
 the right projection file, rather than hardcoding the default

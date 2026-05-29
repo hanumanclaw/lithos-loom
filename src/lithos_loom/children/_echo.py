@@ -1,8 +1,8 @@
-"""Test-only echo child (Slice 0 US1).
+"""Test-only echo child.
 
 Sleeps until SIGTERM; the supervisor's behavioural tests use this as a
-stand-in for real category children (e.g. the route-runner child added in
-Story 5). Flags exist purely to drive failure-path tests:
+stand-in for real category children. Flags exist purely to drive
+failure-path tests:
 
 * ``--config PATH`` — accepted to match the supervisor's invocation contract;
   unused.

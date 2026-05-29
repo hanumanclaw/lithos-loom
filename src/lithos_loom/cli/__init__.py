@@ -1,6 +1,6 @@
-"""CLI sub-apps for the Slice 3 capture-macro surface (and future
-operator surfaces). Kept separate from :mod:`lithos_loom.main` so
-``main.py`` stays scannable as more subcommand groups land."""
+"""CLI sub-apps for the capture-macro surface and other operator
+surfaces. Kept separate from :mod:`lithos_loom.main` so ``main.py``
+stays scannable as more subcommand groups land."""
 
 from __future__ import annotations
 

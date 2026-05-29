@@ -1,10 +1,10 @@
 """Shared atomic file-write helper for projection subscriptions.
 
-Extracted from :mod:`._obsidian_projection` so the upcoming
-project-context projection (Slice 4) and any future per-file
-projection can share the same temp + fsync + rename contract without
-copy-paste. The strategy and load-bearing invariants are unchanged
-from the original site — only the import surface moved.
+Extracted from :mod:`._obsidian_projection` so the project-context
+projection and any future per-file projection can share the same
+temp + fsync + rename contract without copy-paste. The strategy and
+load-bearing invariants are unchanged from the original site — only
+the import surface moved.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ async def write_file_atomic(path: Path, content: str) -> None:
        could poll with ``sync_state.last_written_hash`` pointing at
        the new content while the file still showed the old, mis-firing
        per-task suppression. The same window exists for any per-file
-       projection (Slice 4 onwards).
+       projection.
     2. The caller's failure-rollback contract. The caller catches
        ``Exception`` to roll back ``sync_state`` when the rename
        didn't apply, and lets ``CancelledError`` propagate without

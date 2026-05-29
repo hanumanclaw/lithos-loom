@@ -4,18 +4,16 @@ milestone: M0
 status: draft
 target_version: 0.1.0
 references:
-  - docs/PLAN.md (locked decisions, build order, repo layout)
-  - lithos-lens/docs/prd/milestone-1-operator-view.md (test PRD target — 237 lines, 28 stories)
+  - docs/SPECIFICATION.md (implemented surface — architecture, plugin contract, event bus)
+  - docs/prd/archive/integration.md (Obsidian bridge PRD — shipped)
+  - docs/prd/archive/PLAN.md (original build plan — shipped)
   - /home/dns/projects/lithos/code/lithos/docs/SPECIFICATION.md (Lithos task + knowledge surface)
-  - /home/dns/agents/ralph-dev/ralph-plus-plus/ (source of salvageable runner/ helpers)
-  - Lithos KB projects/lithos-loom/lithos-loom-architecture-design.md
-  - Lithos KB projects/lithos-loom/conveyer-notes.md
 labels: [needs-triage, mvp, lithos-loom, orchestrator, plugin-contract]
 ---
 
 # Lithos Loom — MVP (Proof of Concept)
 
-> **Re-prioritisation notice (2026-05-05):** This MVP is now **Track 2** of a two-track plan. **Track 1** ([docs/prd/integration.md](integration.md)) is the Lithos ↔ Obsidian bridge and ships first; it pre-invests the `sources → bus → subscribers` architecture so the plugins below slot into the existing bus without rewriting the daemon. The 35 user stories in this PRD are **unchanged in scope and intent** — only the architecture they sit on top of and the sequencing relative to Track 1 have changed. See [docs/PLAN.md](../PLAN.md) for the integrated decision table (D1–D22) and [docs/prd/integration.md](integration.md) for Track 1 detail.
+> **Status (2026-05-29):** The Obsidian bridge has shipped, and the orchestration spine described in this PRD (supervisor + bus + sources + subscribers + plugin-runner + `result.json` contract) is in place. What remains unbuilt is the plugin **bodies** — `prd-decompose`, `story-implement`, `story-review-human`. Scaffolding exists under `src/lithos_loom/plugins/`; this PRD captures the contract those bodies must satisfy. See [docs/SPECIFICATION.md](../SPECIFICATION.md) §5 (plugin contract) and §2 (architecture) for the implemented surface.
 
 ## Problem Statement
 
@@ -134,7 +132,7 @@ Vertical-slice, ordered by build sequence. Each is independently grabbable.
 **Concurrency posture (MVP):**
 
 - Multiple tasks may run concurrently if they belong to different projects or are explicitly `parallelizable`
-- Within a project, default is one in-flight task at a time (project-affinity = T3 from PLAN.md)
+- Within a project, default is one in-flight task at a time (project-affinity)
 - Configurable `orchestrator.max_concurrency` (default 4)
 
 **Lithos version pre-requisite:**
@@ -196,7 +194,7 @@ The following are explicitly deferred to the full PRD (`docs/prd/full.md`) and m
 
 ## Further Notes
 
-- **The salvaging from Ralph++** is done by lifting source files into `lithos_loom/runner/` and adapting them. The Ralph++ project itself is not retained as a runtime dependency. This is by design: Loom replaces Ralph++ as the user's coding orchestration approach (locked decision in PLAN.md).
+- **The salvaging from Ralph++** is done by lifting source files into `lithos_loom/runner/` and adapting them. The Ralph++ project itself is not retained as a runtime dependency. This is by design: Loom replaces Ralph++ as the user's coding orchestration approach.
 - **The result.json schema** is intentionally compatible with the Ralph++ unattended-mode contract documented in the Lithos KB note `ralph-plus-plus-unattended-mode-mvp.md`. This means that, transitionally, if Ralph++ ships `--unattended` before Loom is fully built, a Loom route could invoke Ralph++ as a one-shot plugin without contract changes. This is a useful fallback but is not part of the MVP build path.
 - **The Pocock-style PRD shape** is the input contract for `prd-decompose`. Any PRD that conforms to the shape used in `lithos-lens/docs/prd/milestone-1-operator-view.md` (numbered "## User Stories" with `As a <role>, I want <X>, so that <Y>` lines) decomposes reliably. Other PRD shapes may decompose poorly until `prd-decompose` learns more shapes (deferred).
 - **Why `gh pr view` polling instead of webhooks** — webhooks require public ingress, port forwarding, and a webhook secret. Polling adds latency (default 60s) but is operationally trivial. Webhook receiver is full-PRD scope.

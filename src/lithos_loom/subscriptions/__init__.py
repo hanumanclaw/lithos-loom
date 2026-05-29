@@ -1,7 +1,5 @@
 """Subscription registry: TOML config → bus subscriptions → retry runner.
 
-The Slice 0 US4 surface:
-
 * :class:`SubscriptionContext` — shared services injected into every handler
   invocation (Lithos client + scoped logger).
 * :class:`SubscriptionRunner` — owns the consumer task that drains a single
@@ -15,13 +13,12 @@ The Slice 0 US4 surface:
 * :func:`discover_handlers` — looks up handlers via the
   ``lithos_loom.subscriptions.handlers`` Python entry-point group.
 
-Slice 0 ships a single bundled handler (``noop``, in :mod:`._noop`) used
-for tests + smoke checks. Real handlers — ``obsidian-projection``,
-``obsidian-status-transition``, etc. — arrive in Slice 1+ as separate
-modules registered via the same entry-point group.
+A bundled ``noop`` handler (in :mod:`._noop`) is available for tests and
+smoke checks. Real handlers are registered via the same entry-point group.
 
-Idempotency is the handler's responsibility (D12 fire-and-forget +
-sources are re-authoritative on restart, D11/D13). The runner assumes it.
+Idempotency is the handler's responsibility: the bus is fire-and-forget
+with bounded buffers, and sources are re-authoritative on restart. The
+runner assumes idempotency and never deduplicates events.
 """
 
 from __future__ import annotations
@@ -64,9 +61,8 @@ class SubscriptionContext:
     explicitly so [Friction] posts carry a real agent and the call
     matches the Lithos spec for ``lithos_finding_post``.
 
-    Slice 0 carries only the Lithos client + agent_id + a scoped logger;
-    later slices will add filesystem helpers, the project list, etc. as
-    handlers need them.
+    Carries the Lithos client + agent_id + a scoped logger. Additional
+    fields can be added here as handlers need them.
     """
 
     lithos: Any  # LithosClient — Any avoids a heavy import-time cycle
@@ -139,12 +135,9 @@ class SubscriptionRunner:
         if not task_id:
             # Non-task event (e.g. obsidian.note.modified, lithos.note.*):
             # there is no Lithos task to scope the finding to. Log loudly so
-            # the [Friction] signal is not silently lost. Slice 1+ may
-            # elaborate this with a subscription-declared task scope or a
-            # configured infrastructure task; the Lithos spec requires a
-            # real task_id for lithos_finding_post (see
-            # /home/dns/projects/lithos/code/lithos/docs/SPECIFICATION.md
-            # §5.4 lithos_finding_post).
+            # the [Friction] signal is not silently lost. The Lithos spec
+            # requires a real task_id for lithos_finding_post (see
+            # docs/SPECIFICATION.md §5.4 lithos_finding_post).
             self.ctx.logger.warning("%s (no task_id in event payload)", summary)
             return
 
@@ -211,9 +204,6 @@ def discover_handlers() -> dict[str, Handler]:
 # ── where compilation ──────────────────────────────────────────────────
 
 
-# Slice 0 deliberately ships an empty allow-list of helpers. Slice 1 will
-# populate this with `is_human_actionable`, `route_name_to_tag`,
-# `slugify`, etc. as those helpers land.
 _ALLOWED_PREDICATE_HELPERS: dict[str, Any] = {}
 
 

@@ -1,5 +1,5 @@
 """ObsidianDirWatcher — polling source for vault edits to project-context
-docs under ``<vault>/<projects_dir>/<slug>/<filename>.md`` (Slice 5 US33).
+docs under ``<vault>/<projects_dir>/<slug>/<filename>.md``.
 
 Parallel to :class:`~lithos_loom.sources.obsidian_fs_watcher.ObsidianFsWatcher`
 but per-file rather than single-file:
@@ -9,14 +9,13 @@ but per-file rather than single-file:
 * Project-context docs live in MANY files; this watcher walks the
   directory tree, tracks per-file hashes, and emits per-file events.
 
-D27 explanation for why we don't parameterise the single-file watcher
-instead: the shapes are different (per-file vs per-task state keying,
-directory walk vs single read, body-only diff vs whole-line diff).
-Bolting both shapes onto one class would couple unrelated logic — both
-watchers live side-by-side in the obsidian-sync child.
+The shapes are different from the single-file watcher (per-file vs
+per-task state keying, directory walk vs single read, body-only diff vs
+whole-line diff), so both watchers live as separate classes side-by-side
+in the obsidian-sync child rather than sharing one parameterised class.
 
-D28 body-only invariant
------------------------
+Body-only invariant
+-------------------
 
 Operator frontmatter edits MUST NOT push back to Lithos. The renderer
 overwrites frontmatter on every projection write (``lithos_version``
@@ -50,7 +49,7 @@ records body hash at write time so a watcher poll that sees the new
 file also sees the matching body-hash baseline. Local in-memory
 ``_observed_body_hashes`` layers on top so successive polls comparing
 against the same operator-edit baseline don't re-emit the same change
-twice (US33: at-most-one event per actual body transition).
+twice (at-most-one event per actual body transition).
 
 Event payload shape::
 
@@ -71,12 +70,12 @@ What this watcher does NOT do
 -----------------------------
 
 * **File added** (no prior projection): logged at DEBUG and skipped.
-  Operator-created project context docs go through the Slice 5
-  ``project create`` CLI (PR #5 — not yet wired); a bare new file
-  with a manually-typed frontmatter is treated as a stale draft.
-* **File removed**: logged at DEBUG and skipped. The projection
-  will re-create on the next bootstrap; mirroring the delete to
-  Lithos is out of scope for Slice 5.
+  New project-context docs must be created via the ``project create``
+  CLI or Lithos API; a bare new file with manually-typed frontmatter
+  is treated as a stale draft.
+* **File removed**: logged at DEBUG and skipped. The projection will
+  re-create on the next bootstrap; mirroring the delete to Lithos is
+  out of scope.
 * **Malformed frontmatter**: logged at WARNING and skipped — the
   parse returns no ``lithos_id`` so we have nothing to push against.
 """
@@ -184,12 +183,12 @@ class ObsidianDirWatcher:
         for path in sorted(self.projects_root.rglob("*.md")):
             if not path.is_file():
                 continue
-            # Skip per-project task-archive files (Slice 6 US45/D31).
-            # They carry no ``lithos_id`` frontmatter (D37), so without
-            # this they'd log a "no lithos_id" WARNING on every first
-            # sight; excluding them here keeps operator edits to archive
-            # files fully inert (no push, no reopen-request finding) and
-            # keeps them out of ``_last_seen_file_hashes`` entirely.
+            # Skip per-project task-archive files. They carry no
+            # ``lithos_id`` frontmatter, so without this they'd log a
+            # "no lithos_id" WARNING on every first sight; excluding
+            # them here keeps operator edits to archive files fully
+            # inert (no push, no reopen-request finding) and keeps
+            # them out of ``_last_seen_file_hashes`` entirely.
             if path.name.endswith("-done.md"):
                 continue
             current_files.add(path)
@@ -307,8 +306,8 @@ class ObsidianDirWatcher:
 
         if current_body_hash == baseline_body_hash:
             # Body unchanged → frontmatter-only edit (operator added a
-            # Dataview field, fixed a typo in a tag list, etc.). D28
-            # invariant: absorb silently.
+            # Dataview field, fixed a typo in a tag list, etc.). Absorb
+            # silently — frontmatter edits must not push back to Lithos.
             logger.debug(
                 "ObsidianDirWatcher: %s body unchanged for doc %s "
                 "(frontmatter-only edit); absorbing",

@@ -1,8 +1,8 @@
-"""Bundled noop handler for tests + entry-point smoke (Slice 0 US4).
+"""Bundled noop handler for tests and entry-point smoke.
 
 Real handlers — ``obsidian-projection``, ``obsidian-status-transition``,
-etc. — arrive in Slice 1+ as separate modules registered against the
-``lithos_loom.subscriptions.handlers`` entry-point group.
+etc. — are registered via the ``lithos_loom.subscriptions.handlers``
+entry-point group.
 """
 
 from __future__ import annotations

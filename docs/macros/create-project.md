@@ -1,5 +1,5 @@
 <%*
-// create-project.md — Slice 5 project-creation macro for lithos-loom.
+// create-project.md — project-creation macro for lithos-loom.
 //
 // Install: copy this file (verbatim) into your vault's Templater
 // Template Folder, then bind Obsidian's "Templater: Insert

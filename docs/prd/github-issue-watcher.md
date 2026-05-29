@@ -4,9 +4,10 @@ milestone: Track 1 (Slices 7.1 + 7.2)
 status: draft
 target_version: 0.3.0
 references:
-  - docs/prd/integration.md (Track 1 PRD, D7 enable_github_issues default-false)
-  - docs/prd/task-archive.md (D31-D39 — per-project archive shape this reuses)
-  - docs/prd/full.md (full-system PRD where GH was originally scoped)
+  - docs/SPECIFICATION.md (event bus, projection rules, finding prefixes this PRD extends)
+  - docs/prd/archive/integration.md (Obsidian bridge PRD — shipped; D7 default-off scoping)
+  - docs/prd/archive/task-archive.md (per-project archive shape this reuses — shipped)
+  - docs/prd/full.md (where GH was originally scoped as A7)
 labels: [needs-triage, lithos-loom, github, integration]
 ---
 

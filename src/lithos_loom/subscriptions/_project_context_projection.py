@@ -1,11 +1,11 @@
-"""``project-context-projection`` subscription handler (Slice 4 US29).
+"""``project-context-projection`` subscription handler.
 
 Consumes ``lithos.note.{created,updated,deleted}`` events emitted by
 :class:`~lithos_loom.sources.lithos_note_stream.LithosNoteStream` and
 writes/rewrites/removes per-project-context Markdown files under
 ``<vault>/<projects_dir>/<slug>/<filename>.md``.
 
-D26 puts the filter (path-prefix + tag) at the subscription, not the
+The filter (path-prefix + tag) lives at the subscription, not the
 source — the source publishes ALL ``lithos.note.*`` events. The
 projection drops any note whose ``path`` doesn't start with
 ``projects/`` or whose tags don't include ``project-context``.
@@ -101,8 +101,7 @@ def make_handler(
     from ``cfg.obsidian_sync`` and the per-doc state living in
     ``sync_state``. ``sync_state=None`` (test default) constructs a
     fresh isolated state — the projection still works, just without
-    a dir-watcher consumer to coordinate with (relevant once Slice 5
-    lands).
+    a dir-watcher consumer to coordinate with.
 
     ``cfg.obsidian_sync`` must be set; the obsidian-sync child's
     spawn gate guarantees this, but we assert for defensive
@@ -157,8 +156,9 @@ def make_handler(
             await _handle_deleted(note_id, path, projects_root, sync_state, ctx)
             return
 
-        # Path-prefix filter at the boundary (D26). The source publishes
-        # all note events; we only project docs under ``projects/``.
+        # Path-prefix filter at the subscription boundary. The source
+        # publishes all note events; we only project docs under
+        # ``projects/``.
         # We MUST get path from the SSE event because ``lithos_read``
         # does not return ``path`` in its response (it lives in
         # ``metadata.namespace`` as the directory only, no filename).
@@ -291,15 +291,13 @@ async def _project_note(
     ``path=""``. The SSE-published payload is the only authoritative
     source for the full path under projection.
 
-    Per-doc dedup uses a **whole-file hash** (not body-only). US30
-    requires frontmatter fields (``lithos_version``, ``status``,
-    ``tags``, ``lithos_updated_at``) to mirror Lithos, so a
-    version-bump or status-flip with unchanged body MUST still
-    rewrite the file. Hashing only the body would silently skip
-    those updates and leave stale frontmatter on disk — breaking
-    Slice 5's optimistic-lock contract (the projection's frontmatter
-    version is what the dir-watcher reads to provide
-    ``expected_version`` for push-back).
+    Per-doc dedup uses a **whole-file hash** (not body-only). Frontmatter
+    fields (``lithos_version``, ``status``, ``tags``, ``lithos_updated_at``)
+    must mirror Lithos, so a version-bump or status-flip with unchanged
+    body MUST still rewrite the file. Hashing only the body would silently
+    skip those updates and leave stale frontmatter on disk — breaking the
+    optimistic-lock contract (the projection's frontmatter version is what
+    the dir-watcher reads to provide ``expected_version`` for push-back).
 
     Path migration: if the note's vault path differs from what we
     last wrote (e.g. doc moved from ``projects/foo/context.md`` to
@@ -311,9 +309,9 @@ async def _project_note(
     new write fails.
 
     Self-write coordination: ``record_project_context_write`` fires
-    *before* the atomic rename so a concurrent Slice 5 dir-watcher
-    poll that sees the new file also sees the matching coordination
-    state. On write failure, sync_state is rolled back to its
+    *before* the atomic rename so a concurrent dir-watcher poll that
+    sees the new file also sees the matching coordination state. On
+    write failure, sync_state is rolled back to its
     *prior* state (not cleared) — preserving the prior_path memory
     so the next event can retry the migration with the same
     cleanup semantics rather than treating it as a fresh
@@ -321,8 +319,7 @@ async def _project_note(
     """
     # Inject SSE-derived path + slug into the Note so the renderer's
     # frontmatter carries the ``slug`` field (without this, queries
-    # filtering on ``slug:`` in the vault break — the slug
-    # convention is part of the D25 frontmatter contract).
+    # filtering on ``slug:`` in the vault break).
     # ``projects/<slug>/...`` → ``<slug>``; lithos_path was already
     # validated to start with ``projects/`` at the handler boundary,
     # so the indexing here is safe (split yields at least 2 parts).
@@ -330,11 +327,10 @@ async def _project_note(
     note_for_render = dataclasses.replace(note, path=lithos_path, slug=slug)
     rendered = render_doc(note_for_render)
     rendered_file_hash = hashlib.sha256(rendered.encode("utf-8")).digest()
-    # Body-only hash is what Slice 5's dir-watcher reads as the
-    # baseline for its body-only diff. Recording it here means the
-    # watcher can suppress its own self-write detection on either
-    # body change AND see that frontmatter-only operator edits are
-    # the only thing that should be silently absorbed.
+    # Body-only hash is what the dir-watcher reads as the baseline for
+    # its body-only diff. Recording it here means the watcher can
+    # suppress its own self-write detection on body changes AND absorb
+    # frontmatter-only operator edits silently.
     rendered_body_hash = compute_body_hash(rendered)
 
     # Lithos path is ``projects/<slug>/<filename>.md``; strip the

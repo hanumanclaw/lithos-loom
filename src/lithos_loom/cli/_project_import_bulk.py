@@ -6,9 +6,8 @@ orchestration, dry-run rendering, async Lithos calls, partial-failure
 recovery — lives here so ``project.py`` stays under the 800-line
 file cap.
 
-See ``docs/prd/bulk-task-import.md`` for the decision table (D56–D75)
-and the execution-resolved decisions (E1–E8) in
-``~/.claude/plans/make-a-plan-to-frolicking-sonnet.md``.
+See ``docs/prd/archive/bulk-task-import.md`` for the original decision
+table and rationale.
 """
 
 from __future__ import annotations
@@ -28,14 +27,14 @@ from lithos_loom.task_line_parser import ParsedTaskLine, ValidationError
 
 _LOG = logging.getLogger(__name__)
 
-# Prefix the D75 default-slug derivation strips from file stems. The
+# Prefix stripped from file stems when deriving a default slug. The
 # strip is case-insensitive at the prefix boundary but the stem
 # survives otherwise (e.g. ``project-Organising.md`` → ``Organising``
 # before slugification). Frontmatter ``title`` is NEVER stripped —
 # operator intent is respected.
 _PROJECT_FILENAME_PREFIX = "project-"
 
-# Typo-suggestion edit distance threshold per D73. Ratio uses
+# Typo-suggestion edit distance threshold. Ratio uses
 # ``SequenceMatcher.ratio()`` which is 1.0 for identical strings; 0.75
 # corresponds roughly to edit distance ≤ 2 for slugs of typical length.
 _TYPO_SIMILARITY_THRESHOLD = 0.75
@@ -126,18 +125,19 @@ def validate_import_flags(
     if tasks_only and slug is None:
         typer.echo(
             "lithos-loom: --tasks-only requires --slug (frontmatter is ignored "
-            "for routing in tasks-only mode — D70 safety against silent "
+            "for routing in tasks-only mode — required to prevent silent "
             "mis-routing)",
             err=True,
         )
         raise typer.Exit(2)
 
 
-# ── D75: prefix-strip slug derivation ───────────────────────────────────
+# ── Prefix-strip slug derivation ────────────────────────────────────────
 
 
 def resolve_default_slug_from_stem(source: Path) -> str:
-    """Derive a default slug from the source file stem with D75 prefix-strip.
+    """Derive a default slug from the source file stem, stripping the
+    ``project-`` prefix if present.
 
     When the stem starts with ``project-`` (case-insensitive), strip it
     BEFORE slugification — the prefix is a common filesystem-organisation
@@ -162,11 +162,11 @@ def resolve_default_slug_from_stem(source: Path) -> str:
 
 
 def stem_was_prefix_stripped(source: Path) -> bool:
-    """Whether D75 prefix-strip applied for this source. Used by --dry-run output."""
+    """Whether the ``project-`` prefix-strip applied. Used by --dry-run output."""
     return source.stem.lower().startswith(_PROJECT_FILENAME_PREFIX)
 
 
-# ── D68: validate-all-then-abort report ────────────────────────────────
+# ── Validate-all-then-abort report ──────────────────────────────────────
 
 
 def render_validation_report(errors: list[ValidationError]) -> str:
@@ -190,7 +190,7 @@ def render_validation_report(errors: list[ValidationError]) -> str:
     return f"{header}\n{body}{footer}"
 
 
-# ── D72: dry-run preview ───────────────────────────────────────────────
+# ── Dry-run preview ───────────────────────────────────────────────────
 
 
 _DRY_RUN_BANNER = "NO CHANGES MADE — re-run without --dry-run to apply"
@@ -254,10 +254,10 @@ def _format_task_tree(plans: list[TaskCreatePlan], *, slug: str) -> list[str]:
     parent for visual clarity. Each line shows description + tags +
     priority + parallelizable flag + depends_on hint.
 
-    The auto-added ``#project/<slug>`` tag (US88 / D61) is included
-    in the rendered tag list so the preview is a faithful reflection
-    of what gets written. The parser strips a matching project tag
-    from ``line.tags`` (its job is cross-project detection) and
+    The auto-added ``#project/<slug>`` tag is included in the rendered
+    tag list so the preview is a faithful reflection of what gets
+    written. The parser strips a matching project tag from ``line.tags``
+    (its job is cross-project detection) and
     :func:`create_tasks` re-adds it at write time; here we mirror that
     re-addition for preview fidelity.
     """
@@ -323,7 +323,7 @@ def _find_parent_line_number(plans: list[TaskCreatePlan], child: TaskCreatePlan)
     return -1  # shouldn't happen for non-top-level lines
 
 
-# ── D73: typo hint for tasks-only "project not found" ──────────────────
+# ── Typo hint for tasks-only "project not found" ───────────────────────
 
 
 def render_typo_hint(unknown_slug: str, known_slugs: list[str]) -> str:
@@ -343,7 +343,7 @@ def render_typo_hint(unknown_slug: str, known_slugs: list[str]) -> str:
     return f"; did you mean: {candidates}?"
 
 
-# ── Tasks-only preflight (D70 + D71 + D73) ─────────────────────────────
+# ── Tasks-only preflight ────────────────────────────────────────────────
 
 
 async def check_tasks_only_preflight(
@@ -371,7 +371,7 @@ async def check_tasks_only_preflight(
         try:
             project_id = await _resolve_project_id(client, slug)
             if project_id is None:
-                # D73: typo hint
+                # Typo hint: suggest close slug matches.
                 all_projects = await client.note_list(
                     path_prefix="projects/", limit=500
                 )
@@ -384,7 +384,7 @@ async def check_tasks_only_preflight(
                     exit_code=1,
                 )
             elif lithos_id_in_frontmatter is not None:
-                # D71: verify lithos_id resolves to the named slug
+                # Verify lithos_id in the frontmatter resolves to the named slug.
                 frontmatter_note = await client.note_read(id=lithos_id_in_frontmatter)
                 if frontmatter_note is None:
                     preflight_error = TasksOnlyPreflightError(
@@ -437,12 +437,12 @@ async def _list_existing_tasks_for_project(
 ) -> list[Task]:
     """Return all tasks (any status) whose ``metadata.project == slug``.
 
-    Per D60 / US81–82 the existence check that gates ``--tasks-only``
-    refusal counts ALL existing project tasks — open, completed, and
-    cancelled. The render layer reads ``metadata["project"]`` for the
-    canonical project association (``render.py:119``); the actual
-    ``#project/<slug>`` tag is also written to the task at creation
-    time (US88) so Lithos-side ``task_list`` tag filters find them.
+    The existence check that gates ``--tasks-only`` refusal counts ALL
+    existing project tasks — open, completed, and cancelled. The render
+    layer reads ``metadata["project"]`` for the canonical project
+    association (``render.py:119``); the ``#project/<slug>`` tag is also
+    written to the task at creation time so Lithos-side ``task_list`` tag
+    filters find them.
     """
     all_tasks = await client.task_list()
     return [task for task in all_tasks if task.metadata.get("project") == slug]
@@ -531,8 +531,8 @@ async def create_tasks(
             if plan.parallelizable:
                 metadata["parallelizable"] = True
 
-            # US88 / D61: auto-add the project routing tag if the
-            # source line didn't already carry it. The parser strips
+            # Auto-add the project routing tag if the source line didn't
+            # already carry it. The parser strips
             # ``#project/<slug>`` from the per-line tag list (since
             # it's a routing concern, not user metadata), so this is
             # always the canonical write site for it. Set on the task

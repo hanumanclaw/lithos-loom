@@ -1,13 +1,14 @@
 """Top-level CLI dispatcher for the ``lithos-loom`` binary.
 
-Subcommands per ``docs/PLAN.md`` and ``docs/prd/integration.md`` Slice 0:
+Subcommands:
 
 * ``lithos-loom run`` — start the daemon (supervisor + child processes)
-* ``lithos-loom doctor`` — verify the vault is writable (Slice 1 US15);
-  Lithos-connectivity probe (US-35) is tracked as a follow-up
+* ``lithos-loom doctor`` — verify the vault is writable and project
+  TOML entries match Lithos; Lithos-connectivity probe is tracked as a
+  follow-up
 * ``lithos-loom validate-config`` — typecheck the TOML config
 * ``lithos-loom validate-config --dry-run`` — also poll Lithos and print
-  which routes / subscriptions would fire for each open task (Slice 0 US6)
+  which routes / subscriptions would fire for each open task
 * ``lithos-loom config --show`` — print the merged effective config
 """
 
@@ -48,7 +49,6 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=True,
 )
-# Slice 3 sub-apps for the capture-macro CLI surface.
 app.add_typer(task_app, name="task")
 app.add_typer(project_app, name="project")
 app.add_typer(obsidian_sync_app, name="obsidian-sync")
@@ -102,13 +102,12 @@ def doctor(
         help="Explicit TOML config path.",
     ),
 ) -> None:
-    """Verify the vault is writable and (eventually) Lithos is reachable.
+    """Verify the vault is writable and project TOML entries match Lithos.
 
-    Slice 1 US15 ships the three vault probes (vault_path exists,
-    ``_lithos/`` creatable, write+read round-trip). The
-    Lithos-connectivity probe (MVP US-35) is tracked as a follow-up;
-    the doctor output always includes a placeholder line for it so
-    the deferral is visible.
+    Runs three vault probes (vault_path exists, ``_lithos/`` creatable,
+    write+read round-trip) and verifies every TOML ``[projects.<slug>]``
+    entry has a matching Lithos project-context doc. A Lithos-connectivity
+    probe is tracked as a follow-up.
 
     Exit codes: 0 if all checks passed (or were skipped); 1 if any
     check failed; 2 if the config couldn't be loaded.
@@ -123,7 +122,7 @@ def doctor(
     else:
         typer.echo("  ⊘ vault probe skipped: no [obsidian_sync] in config")
 
-    # Slice 4 US32: TOML project entries must match Lithos. Skip
+    # TOML project entries must match Lithos project-context docs. Skip
     # cleanly when [projects] is empty; otherwise spin up a one-shot
     # LithosClient. Transport failures surface as a single failing
     # check rather than crashing the doctor run.
@@ -214,7 +213,7 @@ def _load_or_exit(config: Path | None) -> LoomConfig:
         sys.exit(1)
 
 
-# ── --dry-run simulation (Slice 0 US6) ─────────────────────────────────
+# ── --dry-run simulation ───────────────────────────────────────────────
 
 
 def _run_dry_run(cfg: LoomConfig) -> int:

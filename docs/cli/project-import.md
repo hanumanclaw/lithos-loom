@@ -6,7 +6,7 @@ Import a local Markdown file as a Lithos project — and (by default) extract it
 lithos-loom project import <source> [flags]
 ```
 
-This is the canonical doc for the command. The PRD that drove its design is at [`docs/prd/bulk-task-import.md`](../prd/bulk-task-import.md) (decisions D56–D75).
+This is the canonical doc for the command. The PRD that drove its design is at [`docs/prd/archive/bulk-task-import.md`](../prd/archive/bulk-task-import.md).
 
 ---
 
@@ -38,15 +38,15 @@ For each `- [ ]` open-task line in the source body, a Lithos task is created wit
 | Lithos field | Source |
 |---|---|
 | `title` | the line text after stripping `- [ ]`, tags, priority emojis, `[sequential]` marker |
-| `tags` | the line's `#foo` tags + auto-added `#project/<slug>` (US88) |
+| `tags` | the line's `#foo` tags + auto-added `#project/<slug>` |
 | `metadata.project` | the importing project's slug |
 | `metadata.priority` | mapped from priority emoji if present |
-| `metadata.depends_on` | child task ids when this line had indented children below it (D64) |
-| `metadata.parallelizable` | `true` when this line is a sibling under a non-`[sequential]` parent (D65) |
+| `metadata.depends_on` | child task ids when this line had indented children below it |
+| `metadata.parallelizable` | `true` when this line is a sibling under a non-`[sequential]` parent |
 
-The matched task lines are **stripped from the persisted doc body** (D59) — the project-context doc holds narrative only; tasks live as Lithos task entities (single source of truth).
+The matched task lines are **stripped from the persisted doc body** — the project-context doc holds narrative only; tasks live as Lithos task entities (single source of truth).
 
-`- [x]`, `- [/]`, `- [-]`, `- [>]` and any other markers stay verbatim in the body — only `- [ ]` open tasks are extracted (D58). Migrating completed-task history is a separate feature ([`task-archive.md`](../prd/task-archive.md), queued).
+`- [x]`, `- [/]`, `- [-]`, `- [>]` and any other markers stay verbatim in the body — only `- [ ]` open tasks are extracted.
 
 ---
 
@@ -62,13 +62,13 @@ lithos-loom project import /path/to/source.md
 
 ### `--tasks-only`
 
-Skips doc creation; just imports tasks against an existing project. **Requires `--slug`**. Refuses if the project doesn't exist (suggests typo matches per D73) or already has tasks (unless `--force-tasks` is passed).
+Skips doc creation; just imports tasks against an existing project. **Requires `--slug`**. Refuses if the project doesn't exist (suggests typo matches when edit-distance ≤ 2) or already has tasks (unless `--force-tasks` is passed).
 
 ```bash
 lithos-loom project import /path/to/new-tasks.md --tasks-only --slug my-project
 ```
 
-`--tasks-only` ignores frontmatter `title` and any `tags:` for project routing — D70 safety to prevent silent mis-routing. If the source file's frontmatter has a `lithos_id` AND it doesn't resolve to the same project as `--slug`, the import is refused (D71).
+`--tasks-only` ignores frontmatter `title` and any `tags:` for project routing — a safety check to prevent silent mis-routing. If the source file's frontmatter has a `lithos_id` AND it doesn't resolve to the same project as `--slug`, the import is refused.
 
 ### `--no-tasks` (escape hatch)
 
@@ -82,7 +82,7 @@ lithos-loom project import /path/to/doc.md --no-tasks
 
 ## Task extraction rules
 
-### Line filter (D67)
+### Line filter
 
 Only `- [ ]` at line start (after optional leading whitespace) counts as a task. **Not parsed:**
 
@@ -93,7 +93,7 @@ Only `- [ ]` at line start (after optional leading whitespace) counts as a task.
 
 This restriction means the parser won't accidentally pick up example task lines you wrote in code samples or quoted material.
 
-### Tags (D40 / D61)
+### Tags
 
 Tags matching `#[A-Za-z0-9_/-]+` after a whitespace boundary are extracted from each line. All-digit tags (`#123`) are NOT parsed — they stay as literal text in the task description (so issue references like `#42` are preserved).
 
@@ -101,7 +101,7 @@ Tags matching `#[A-Za-z0-9_/-]+` after a whitespace boundary are extracted from 
 
 `#project/<importing-slug>` is silently consumed (it's auto-added anyway).
 
-### Priority emojis (D61)
+### Priority emojis
 
 Mapped to `metadata.priority`:
 
@@ -115,7 +115,7 @@ Mapped to `metadata.priority`:
 
 Multiple priority emojis on one line: highest precedence wins; all are stripped from the description.
 
-### `[sequential]` marker (D65)
+### `[sequential]` marker
 
 Append the literal token `[sequential]` to a parent task's description to flip its children from parallel (default) to a sequential chain — `child[i].depends_on = child[i-1]`.
 
@@ -128,11 +128,11 @@ Append the literal token `[sequential]` to a parent task's description to flip i
 
 The marker is case-sensitive (lowercase `s`), must be a standalone token (won't false-positive on prose like "sequential planning"), and only takes effect on tasks that have indented children.
 
-### Hierarchy from indentation (D63 / D64)
+### Hierarchy from indentation
 
-- **Top-level tasks** (no indent) are flat: no `depends_on` between them. Doc ordering imposes no execution semantics (D63).
-- **Indented children** represent composition: parent gets `metadata.depends_on = [child_ids]`; children have NO `depends_on` back to the parent. Parent is marked complete manually after all children are done (D64).
-- **Sibling children** are parallelizable by default (D65); `[sequential]` on the parent flips them to a chain.
+- **Top-level tasks** (no indent) are flat: no `depends_on` between them. Doc ordering imposes no execution semantics.
+- **Indented children** represent composition: parent gets `metadata.depends_on = [child_ids]`; children have NO `depends_on` back to the parent. Parent is marked complete manually after all children are done.
+- **Sibling children** are parallelizable by default; `[sequential]` on the parent flips them to a chain.
 
 Mixed indentation (tabs + spaces in the same doc) is supported — anything with a strictly-deeper leading-whitespace count than the previous line is treated as a child. Pure-tab and pure-spaces docs work intuitively; mixed indentation gives you what you wrote.
 
@@ -147,7 +147,7 @@ Mixed indentation (tabs + spaces in the same doc) is supported — anything with
 
 ---
 
-## Slug derivation (D75)
+## Slug derivation
 
 Priority order:
 
@@ -155,7 +155,7 @@ Priority order:
 2. Slugified frontmatter `title` (NOT prefix-stripped — frontmatter is explicit operator intent).
 3. Slugified file stem, with a leading `project-` prefix stripped first.
 
-The D75 prefix-strip lets you keep filesystem-organisation prefixes:
+The prefix-strip lets you keep filesystem-organisation prefixes:
 
 ```bash
 # File: ~/Dropbox/.../projects/project-organising-myself.md
@@ -175,14 +175,14 @@ WOULD CREATE project:
 
 ---
 
-## Validation (D68: validate-all-then-abort)
+## Validation (validate-all-then-abort)
 
 The import refuses upfront — **before any Lithos writes** — when any of these occur. All problems are reported in one pass so you can fix everything in one edit cycle:
 
 | Problem | Exit |
 |---|---|
-| Cross-project tag (`#project/<other-slug>`) on any line (D62) | 2 |
-| Empty parent (parent task is just `- [ ]` with indented children below) (D66) | 2 |
+| Cross-project tag (`#project/<other-slug>`) on any line | 2 |
+| Empty parent (parent task is just `- [ ]` with indented children below) | 2 |
 | Invalid slug (doesn't match `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`) | 2 |
 
 Greenfield-only refusals:
@@ -196,9 +196,9 @@ Greenfield-only refusals:
 
 | Problem | Exit |
 |---|---|
-| `--slug` not provided (D70: frontmatter ignored for routing in tasks-only mode) | 2 |
-| Project doesn't exist for slug | 1 (error suggests near-miss matches per D73) |
-| Source `lithos_id` resolves to a different project than `--slug` (D71) | 2 |
+| `--slug` not provided (frontmatter is ignored for routing in tasks-only mode) | 2 |
+| Project doesn't exist for slug | 1 (error suggests near-miss matches when edit-distance ≤ 2) |
+| Source `lithos_id` resolves to a different project than `--slug` | 2 |
 | Project already has tasks AND `--force-tasks` not passed | 1 (error suggests `--force-tasks`) |
 
 ---
@@ -208,7 +208,7 @@ Greenfield-only refusals:
 Prints the full plan and exits without any Lithos mutations. The same read-only pre-flight as a real run is performed first, so problems surface before you commit:
 
 - **Greenfield**: a `note_list` against `projects/<slug>/` checks for slug collision. Exits 1 with the same "slug already exists; did you mean `--tasks-only --slug X`?" message a real run would give.
-- **`--tasks-only`**: verifies the project exists (with typo-hint on miss per D73), and that any `lithos_id` in frontmatter resolves to the same slug (D71). Exits 1 (project missing) or 2 (lithos_id mismatch) on pre-flight failure.
+- **`--tasks-only`**: verifies the project exists (with typo-hint on miss), and that any `lithos_id` in frontmatter resolves to the same slug. Exits 1 (project missing) or 2 (lithos_id mismatch) on pre-flight failure.
 
 If the pre-flight passes, the full plan is printed. No `note_write` / `task_create` / `task_cancel` calls are made under any code path.
 
@@ -279,7 +279,7 @@ If zero tasks were created before the failure (failure happened during doc-creat
 | Flag | Default | Purpose |
 |---|---|---|
 | `<source>` (positional) | required | Path to the local Markdown file. |
-| `--slug`, `-s` | derived | Project slug. Greenfield: optional (default per D75). `--tasks-only`: required. |
+| `--slug`, `-s` | derived | Project slug. Greenfield: optional (see "Slug derivation" above). `--tasks-only`: required. |
 | `--tags` | none | Comma-separated extra tags for the project doc (greenfield only; ignored with `--tasks-only`). Union'd with frontmatter `tags:` + `project-context`. |
 | `--tasks-only` | false | Skip doc creation; just import tasks against an existing project. Requires `--slug`. |
 | `--no-tasks` | false | Skip task extraction entirely. Mutually exclusive with `--tasks-only`. |
@@ -326,7 +326,7 @@ lithos-loom project import ~/Dropbox/obsidian/dave/projects/project-website-rede
 # → /home/dns/Dropbox/obsidian/dave/_lithos/projects/website-redesign/website-redesign-project-context.md
 ```
 
-The new project lands as `website-redesign` (D75 strip), the 14 tasks are created with `metadata.project = "website-redesign"` and `#project/website-redesign` tag, and the projected doc + tasks appear in your vault's `_lithos/` tree within ~250ms.
+The new project lands as `website-redesign` (the leading `project-` prefix is stripped), the 14 tasks are created with `metadata.project = "website-redesign"` and `#project/website-redesign` tag, and the projected doc + tasks appear in your vault's `_lithos/` tree within ~250ms.
 
 ### Recovering from a partial-import failure
 
@@ -375,7 +375,7 @@ echo "$result" | jq '.tasks_created'  # → 12
 
 ## See also
 
-- [`docs/prd/bulk-task-import.md`](../prd/bulk-task-import.md) — full design decision table (D56–D75), 24 user stories US76–US100.
+- [`docs/SPECIFICATION.md`](../SPECIFICATION.md) — the operator + integrator spec; §4.8 covers this command in summary, §7 covers projection and bidirectional sync.
+- [`docs/prd/archive/bulk-task-import.md`](../prd/archive/bulk-task-import.md) — original design decision table.
 - [`docs/macros/README.md`](../macros/README.md) — the Templater macros for `create-project` and `capture-task`. The `project import` CLI is intentionally not surfaced as a macro (it's a one-shot adoption tool, not a recurring capture flow).
-- [`docs/prd/integration.md`](../prd/integration.md) — Track 1 PRD context for project-context bidirectional sync (Slices 4–5), which is what carries the imported tasks back into the Obsidian projected views.
-- [`docs/prd/task-archive.md`](../prd/task-archive.md) — queued feature for migrating `- [x]` / `- [-]` completed-task history (out of scope for `project import`).
+- [`docs/prd/archive/task-archive.md`](../prd/archive/task-archive.md) — companion feature for migrating completed-task history.

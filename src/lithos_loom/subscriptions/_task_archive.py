@@ -1,4 +1,4 @@
-"""Per-project task archive subscription (Slice 6).
+"""Per-project task archive subscription.
 
 Appends every human-surfaced Lithos task that reaches a terminal state
 (``completed`` / ``cancelled``) to a per-project, append-only Markdown
@@ -8,19 +8,19 @@ queryable per-project history that outlives the global ``tasks.md``
 file's lingering window.
 
 The archive is a one-way, vault-only artifact derived from Lithos
-events — never Lithos-canonical, never regenerated. The Slice 5
-dir-watcher excludes ``-done.md`` files so operator edits to them are
-inert (no push, no reopen-request findings).
+events — never Lithos-canonical, never regenerated. The dir-watcher
+excludes ``-done.md`` files so operator edits to them are inert (no
+push, no reopen-request findings).
 
-Coupling with the tasks projection (D38 / D39), both running in the
-``obsidian-sync`` child over one shared :class:`ProjectionSyncState`:
+Coupling with the tasks projection, both running in the ``obsidian-sync``
+child over one shared :class:`ProjectionSyncState`:
 
-* **D38 — surfaced gate.** The projection sets ``sync_state.surfaced[id]``
+* **Surfaced gate.** The projection sets ``sync_state.surfaced[id]``
   when it writes an open actionable task line (and seeds it from the
   on-disk ``tasks.md`` at startup). The archiver only archives tasks
   with that flag set — automated / route-claimed-only work that never
   reached the operator's view is skipped.
-* **D39 — archive-then-evict.** On success the archiver sets
+* **Archive-then-evict.** On success the archiver sets
   ``sync_state.archived[id]``; the projection's flush-time eviction
   predicate drops the line from the global file in the same write the
   terminal event scheduled. A failed append leaves the flag unset, so
@@ -64,7 +64,7 @@ _TERMINAL_EVENTS: frozenset[str] = frozenset(
 )
 
 # Tasks whose ``metadata.project`` is missing, malformed, or unsafe land
-# here so metadata drift never silently drops an archive line (D36).
+# here so metadata drift never silently drops an archive line.
 _UNASSIGNED = "_unassigned"
 
 # A safe project slug for path construction: starts alphanumeric, then
@@ -80,7 +80,7 @@ def _safe_slug(value: object) -> str:
     """Return a filesystem-safe project slug, or ``_unassigned``.
 
     Guards against path traversal / nested-dir creation from a malformed
-    ``metadata.project`` value (D36 + path-safety). The rendered line may
+    ``metadata.project`` value. The rendered line may
     still echo the raw ``#project/<value>`` tag — that's cosmetic and
     matches what the global projection rendered for the same task; only
     the *path* is sanitised here.
@@ -134,10 +134,10 @@ def _append_line(path: Path, line: str) -> None:
     ``os.write`` may perform a short write (POSIX permits writing fewer
     bytes than requested), so we loop until the whole buffer is flushed —
     otherwise a partial write would leave a truncated archive line while
-    the caller goes on to mark the task archived, breaking the D39
-    no-data-loss contract. Raises ``OSError`` on any I/O failure so the
-    caller leaves the archived flag unset and the runner's retry/friction
-    policy takes over.
+    the caller goes on to mark the task archived, breaking the no-data-loss
+    contract. Raises ``OSError`` on any I/O failure so the caller leaves
+    the archived flag unset and the runner's retry/friction policy takes
+    over.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -196,8 +196,8 @@ def make_handler(
             )
             return
 
-        # D38 gate: only archive tasks the operator actually saw in the
-        # global projection. The projection sets ``surfaced`` when it
+        # Surfaced gate: only archive tasks the operator actually saw in
+        # the global projection. The projection sets ``surfaced`` when it
         # writes an open line and seeds it from disk on restart, so this
         # flag is the authoritative "was operator-visible" signal —
         # re-running ``would_be_actionable`` here would be redundant and
@@ -235,7 +235,7 @@ def make_handler(
         # Append first. On OSError do NOT touch ``archived`` / the cache
         # and re-raise → the runner retries, then posts a [Friction]
         # finding. The task stays in the global file (TTL fallback) until
-        # the append eventually succeeds (D39 no-data-loss).
+        # the append eventually succeeds (no-data-loss guarantee).
         _append_line(done_path, line)
 
         seen.add(task.id)
@@ -246,7 +246,7 @@ def make_handler(
         ctx.logger.info("task-archive: appended %s to %s", task.id, done_path.name)
         # Ask the projection to flush now that ``archived`` is set, so the
         # line is evicted from tasks.md causally (not racing the debounce
-        # timer). No-op when no projection is wired (D39).
+        # timer). No-op when no projection is wired.
         await _request_projection_evict()
 
     async def _request_projection_evict() -> None:

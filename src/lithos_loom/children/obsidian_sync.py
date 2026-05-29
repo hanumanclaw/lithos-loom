@@ -1,39 +1,30 @@
-"""Subprocess child that hosts the obsidian-sync runtime (Slice 1 US7+).
+"""Subprocess child that hosts the obsidian-sync runtime.
 
-Spawned by the :class:`~lithos_loom.supervisor.Supervisor` per the
-``obsidian-sync`` :class:`~lithos_loom.supervisor.CategorySpec` whenever
+Spawned by the :class:`~lithos_loom.supervisor.Supervisor` whenever
 the loaded config carries an ``[obsidian_sync]`` section. The supervisor
 gate is the presence test; this child is responsible for everything
 below that line.
 
-US7 shipped a stub that parked on SIGTERM. US8 replaced the park with
-the actual projection: a bus, a Lithos event-stream source, and a
-:class:`~lithos_loom.subscriptions.SubscriptionRunner` for each
-configured subscription whose ``action`` is in the child's allow-list.
-
-Slice 2 extends the allow-list. The actions this child hosts (see
-:data:`_CHILD_ACTIONS`) are now:
+The actions this child hosts (see :data:`_CHILD_ACTIONS`) are:
 
 * ``"obsidian-projection"`` — renders projected task lines into
-  ``_lithos/tasks.md`` (Slice 1 US8+).
+  ``_lithos/tasks.md``.
 * ``"obsidian-status-transition"`` — consumes the fs watcher's
   ``obsidian.task.status_changed`` events and pushes the
-  corresponding action to Lithos (Slice 2 US17–US19).
+  corresponding action to Lithos.
 * ``"obsidian-priority-changed"`` — consumes the fs watcher's
   ``obsidian.task.priority_changed`` events; pushes the new
   priority enum to Lithos via ``task_update(metadata={"priority":
-  <enum>})`` (Slice 2 US21).
+  <enum>})``.
 * ``"obsidian-due-date-changed"`` — consumes the fs watcher's
   ``obsidian.task.due_date_changed`` events; pushes the new
   ``YYYY-MM-DD`` date to Lithos via
-  ``task_update(metadata={"scheduled_for": <date>})``. Closes the
-  date-edit round-trip surfaced during Slice 3 manual testing —
-  without this, date edits in the file were silently overwritten
-  on the next projection rewrite.
+  ``task_update(metadata={"scheduled_for": <date>})``. Without this,
+  date edits in the file would be silently overwritten on the next
+  projection rewrite.
 
 Subscription actions outside the allow-list (e.g. generic ``noop``)
-are silently skipped here — they're routed to a different child in a
-future story.
+are silently skipped here — they're routed to a different child.
 
 Invocation contract (set by the supervisor):
 
@@ -235,10 +226,10 @@ async def _amain(cfg: LoomConfig) -> int:
                 downstream_spec.name,
             )
 
-    # task-archive (Slice 6) depends on the projection too: the
-    # projection populates ``sync_state.surfaced``, which is the
-    # archiver's D38 "was this task operator-visible" gate. Without it,
-    # nothing ever sets the flag, so the archiver would skip every task.
+    # The task-archive handler depends on the projection: the projection
+    # populates ``sync_state.surfaced``, which is the archiver's
+    # "was this task operator-visible" gate. Without it, nothing ever
+    # sets the flag, so the archiver would skip every task.
     if task_archive_spec is not None and projection_spec is None:
         logger.warning(
             "obsidian-sync: %r is configured but no obsidian-projection "
@@ -292,17 +283,14 @@ async def _amain(cfg: LoomConfig) -> int:
             installed.append(sig)
 
     try:
-        # Slice 2 US16/US23 wire the fs watcher as a first-class source
-        # whose lifecycle is gated on ``[obsidian_sync]`` alone, not on
-        # whether a projection subscription is present. Without
-        # projection state to compare against, the watcher's per-task
-        # transition check never fires (every parsed task has
+        # The fs watcher's lifecycle is gated on ``[obsidian_sync]``
+        # alone, not on whether a projection subscription is present.
+        # Without projection state to compare against, the watcher's
+        # per-task transition check never fires (every parsed task has
         # ``prior is None``) and no events are published — runtime
         # behaviour is identical to the previous "idle and warn" path,
-        # but the source itself is now independently spawnable so a
-        # future story (e.g. Slice 3's capture macro populating
-        # ``sync_state`` by another route) doesn't have to re-plumb
-        # the spawn gate.
+        # but the source itself is independently spawnable so the
+        # spawn gate doesn't have to be re-plumbed as more actions land.
         sync_state = ProjectionSyncState()
         bus = EventBus()
         fs_watcher = ObsidianFsWatcher(
@@ -310,8 +298,8 @@ async def _amain(cfg: LoomConfig) -> int:
             tasks_path=obs.vault_path / obs.tasks_file,
             sync_state=sync_state,
         )
-        # Slice 5 US33: spawn the dir-watcher alongside the file-watcher.
-        # SAME sync_state instance — the projection populates the per-doc
+        # Spawn the dir-watcher alongside the file-watcher. SAME
+        # sync_state instance — the projection populates the per-doc
         # body-hash baseline that the dir-watcher reads against, and the
         # note-push handler updates sync_state after a successful push so
         # the dir-watcher absorbs the post-push frontmatter rewrite as a
@@ -351,8 +339,7 @@ async def _amain(cfg: LoomConfig) -> int:
             # the source's bootstrap, which can fire dozens of created
             # events in quick succession) into a single flush at
             # quiescence. The disk-seeded content-hash check then turns
-            # a quiet-KB restart into zero on-disk writes (US14
-            # "idempotent re-runs").
+            # a quiet-KB restart into zero on-disk writes.
             my_handlers["obsidian-projection"] = make_obsidian_projection_handler(
                 cfg, debounce_seconds=0.05, sync_state=sync_state
             )
@@ -395,9 +382,9 @@ async def _amain(cfg: LoomConfig) -> int:
         if task_archive_spec is not None:
             logger.info("obsidian-sync: wiring subscription %r", task_archive_spec.name)
             # SAME sync_state instance: the projection sets surfaced[id]
-            # (the archiver's D38 gate) and reads archived[id] (set here)
-            # for its flush-time eviction. No debounce — the archiver does
-            # a single synchronous O_APPEND per event and never flushes.
+            # (the archiver's gate) and reads archived[id] (set here) for
+            # its flush-time eviction. No debounce — the archiver does a
+            # single synchronous O_APPEND per event and never flushes.
             my_handlers["task-archive"] = make_task_archive_handler(
                 cfg, sync_state=sync_state
             )
@@ -407,9 +394,9 @@ async def _amain(cfg: LoomConfig) -> int:
         # handler calls task_complete / task_cancel / finding_post.
         # LithosEventStream only spawns when projection is configured —
         # status-transition consumes obsidian-side events only. The
-        # LithosNoteStream (Slice 4) only spawns when the
-        # project-context-projection subscription is configured —
-        # otherwise nothing would consume its events.
+        # LithosNoteStream only spawns when the project-context-projection
+        # subscription is configured — otherwise nothing would consume
+        # its events.
         need_event_stream = projection_spec is not None
         need_note_stream = project_context_projection_spec is not None
         async with LithosClient(
@@ -430,8 +417,8 @@ async def _amain(cfg: LoomConfig) -> int:
             if need_event_stream:
                 events_url = cfg.orchestrator.lithos_url.rstrip("/") + "/events"
                 # Pull resolved-task history into the bootstrap so the
-                # US13 TTL-lingering window survives daemon restart
-                # (PR #21 review issue 1). The source fetches
+                # TTL-lingering window survives daemon restart (PR #21
+                # review issue 1). The source fetches
                 # completed + cancelled tasks at bootstrap via Lithos's
                 # server-side resolved_since filter (lithos#286) before
                 # publishing them as terminal events.
@@ -446,12 +433,11 @@ async def _amain(cfg: LoomConfig) -> int:
                 )
             if need_note_stream:
                 events_url = cfg.orchestrator.lithos_url.rstrip("/") + "/events"
-                # Second SSE source for note lifecycle events (Slice 4
-                # US28). Bootstraps via lithos_list(path_prefix=,
-                # tags=) so cold restart re-projects every existing
-                # project-context doc — the projection subscription's
-                # per-doc hash dedup short-circuits the writes when
-                # nothing changed.
+                # Second SSE source for note lifecycle events.
+                # Bootstraps via lithos_list(path_prefix=, tags=) so
+                # cold restart re-projects every existing project-context
+                # doc — the projection subscription's per-doc hash dedup
+                # short-circuits the writes when nothing changed.
                 note_source = LithosNoteStream(
                     client=lithos,
                     bus=bus,

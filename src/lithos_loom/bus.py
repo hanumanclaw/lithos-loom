@@ -1,12 +1,11 @@
-"""In-process pub/sub bus for sources and subscribers (Slice 0 US2).
+"""In-process pub/sub bus for sources and subscribers.
 
 One bus instance lives inside each supervisor child (e.g. the route-runner
-child added in Story 5; the obsidian-sync child added in Slice 1+). Sources
-publish typed :class:`Event` objects; subscribers receive the ones whose
-type, structural :class:`MatchFilter`, and optional ``where`` predicate all
-match.
+child or the obsidian-sync child). Sources publish typed :class:`Event`
+objects; subscribers receive the ones whose type, structural
+:class:`MatchFilter`, and optional ``where`` predicate all match.
 
-Delivery is **fire-and-forget with bounded queues** (locked decision D12):
+Delivery is **fire-and-forget with bounded queues**:
 
 * Each subscription has its own ``asyncio.Queue`` sized at subscribe time.
 * :meth:`EventBus.publish` writes into each matching queue with
@@ -153,7 +152,7 @@ class EventBus:
         ``where`` is an optional Python predicate evaluated last.
 
         ``queue_size`` must be >= 1 — unbounded queues defeat the
-        fire-and-forget bounded-buffer guarantee (D12).
+        fire-and-forget bounded-buffer guarantee.
 
         ``match`` is deep-copied so subsequent mutation of the caller's
         dict (or any nested dict/list within it) cannot silently change
@@ -162,7 +161,7 @@ class EventBus:
         if queue_size < 1:
             raise ValueError(
                 f"queue_size must be >= 1 (got {queue_size}); unbounded "
-                "queues are not allowed (D12 fire-and-forget bounded buffers)"
+                "queues are not allowed (fire-and-forget bounded buffers)"
             )
         sub = Subscription(
             event_types=frozenset(event_types),

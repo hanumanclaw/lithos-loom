@@ -1,13 +1,12 @@
 """Projected-line renderer shared between the projection subscription
-and the capture-macro CLI (Slice 1 + Slice 3).
+and the capture-macro CLI.
 
 Renders a single Tasks-plugin line for a Lithos task. Extracted from
-:mod:`lithos_loom.subscriptions._obsidian_projection` so the macro's
+:mod:`lithos_loom.subscriptions._obsidian_projection` so the
 ``lithos-loom task create`` CLI can produce a line identical to what
-the projection would write for the same task — that's what makes
-US25's "born projected" guarantee work end-to-end. A macro-inserted
-line and a projection-rewritten line must be byte-equal so the
-fs-watcher's self-write suppression treats them as the same content.
+the projection would write for the same task — a macro-inserted line
+and a projection-rewritten line must be byte-equal so the fs-watcher's
+self-write suppression treats them as the same content.
 
 The renderer is pure: given a :class:`~lithos_loom.lithos_client.Task`
 plus the route config and the local-tz "today", it returns a single-
@@ -20,8 +19,8 @@ Public surface:
 * :func:`render_line` — open-task line (``- [ ] ...``).
 * :func:`render_resolved_line` — terminal-state line (``- [x]`` /
   ``- [-]``) with the resolution date marker.
-* :data:`PRIORITY_EMOJI` — D18 enum (`docs/prd/integration.md:102`)
-  → Tasks-plugin emoji table.
+* :data:`PRIORITY_EMOJI` — priority enum → Tasks-plugin emoji table.
+  Values: ``highest``/``high``/``medium``/``low``/``lowest``.
 
 The helpers (:func:`priority_marker`, :func:`dep_markers`,
 :func:`due_date_str`, :func:`parse_scheduled_for`,
@@ -88,7 +87,9 @@ PRIORITY_EMOJI: dict[str, str] = {
     "low": "🔽",
     "lowest": "⏬",
 }
-"""D18 enum (`docs/prd/integration.md:102`) → Tasks-plugin emoji.
+"""Priority enum → Tasks-plugin emoji.
+
+Values: ``highest``/``high``/``medium``/``low``/``lowest``.
 
 Strict case-sensitive match: the Lithos surface owns this enum, and
 deviation would mean a task with a non-canonical priority value
@@ -131,11 +132,11 @@ def render_line(
 
     Titles with embedded newlines (rare in Lithos but possible) are
     collapsed to spaces so the markdown line stays single-line. The
-    ``🆔 lithos:<id>`` marker is what lets US14's dedup identify the
-    same task across rewrites.
+    ``🆔 lithos:<id>`` marker is what lets the projection's content-hash
+    dedup identify the same task across rewrites.
 
-    US13 keeps completed/cancelled lines around for
-    ``resolved_ttl_days`` (see :func:`render_resolved_line`).
+    Completed/cancelled lines are kept around for ``resolved_ttl_days``
+    (see :func:`render_resolved_line`).
     """
     title = " ".join(task.title.split())  # collapse \n, \r, runs of spaces
     parts: list[str] = [f"- [ ] {title}", f"🆔 lithos:{task.id}"]
@@ -197,7 +198,7 @@ def render_resolved_line(task: Task, status: str, resolved_at: date) -> str:
 
 
 def priority_marker(task: Task) -> str | None:
-    """Map ``task.metadata.priority`` (D18 enum) to its Tasks-plugin emoji.
+    """Map ``task.metadata.priority`` to its Tasks-plugin emoji.
 
     Returns ``None`` for absent / non-string / unknown-enum values so
     the renderer simply omits the marker. Unknown values are warn-
@@ -244,7 +245,7 @@ def validated_priority(task: Task) -> str | None:
 
 def dep_markers(task: Task) -> list[str]:
     """Render one ``⛔ lithos:<dep_id>`` marker per entry in
-    ``task.metadata.depends_on`` (D19).
+    ``task.metadata.depends_on``.
 
     Preserves list order; dedups duplicate IDs (first occurrence
     wins) since the marker is a visual signal not a count. Returns
@@ -288,9 +289,7 @@ def due_date_str(
     routes: Sequence[RouteConfig],
     today: date,
 ) -> str | None:
-    """D10 due-date semantics.
-
-    Hybrid policy from ``docs/prd/integration.md`` D10:
+    """Hybrid due-date policy for the ``📅`` marker.
 
     - ``task.metadata.scheduled_for`` (if present and parseable) is an
       explicit override and wins for all cases.

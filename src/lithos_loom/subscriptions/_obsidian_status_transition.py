@@ -1,21 +1,19 @@
-"""``obsidian-status-transition`` subscription handler (Slice 2 US17+).
+"""``obsidian-status-transition`` subscription handler.
 
 Consumes ``obsidian.task.status_changed`` events emitted by
 :class:`~lithos_loom.sources.obsidian_fs_watcher.ObsidianFsWatcher`
 and pushes the matching action to Lithos:
 
-* ``("[ ]", "[x]")`` → :meth:`LithosClient.task_complete` (US17)
-* ``("[ ]", "[-]")`` → :meth:`LithosClient.task_cancel`   (US18)
+* ``("[ ]", "[x]")`` → :meth:`LithosClient.task_complete`
+* ``("[ ]", "[-]")`` → :meth:`LithosClient.task_cancel`
 * ``("[x]", "[ ]")`` → :meth:`LithosClient.finding_post` with the
-  ``[ReopenRequested]`` prefix — D17 workaround until upstream
-  ``agent-lore/lithos#243`` adds a real ``task_reopen`` (US19)
-* ``("[ ]", "[/]")`` / ``("[ ]", "[>]")`` — silent no-op  (US20)
+  ``[ReopenRequested]`` prefix — workaround until upstream
+  ``agent-lore/lithos#243`` adds a real ``task_reopen``
+* ``("[ ]", "[/]")`` / ``("[ ]", "[>]")`` — silent no-op
 * anything else — silent no-op with a debug log
 
-The dispatch table is small and grows by one row per follow-up
-story. Unknown ``(prior, new)`` pairs naturally fall through to a
-debug-log skip, which is exactly the behaviour US20 specifies for
-``[/]``/``[>]`` markers; no special case needed.
+Unknown ``(prior, new)`` pairs naturally fall through to the debug-log
+skip path; no special case needed.
 
 The handler is **stateless** — no factory, no closure. Mirrors
 :mod:`._noop`'s shape and contrasts with
@@ -23,36 +21,32 @@ The handler is **stateless** — no factory, no closure. Mirrors
 state. The obsidian-sync child wires this module's :func:`handle`
 directly into its ``my_handlers`` dict.
 
-US22 idempotency pre-check
---------------------------
+Idempotency pre-check
+---------------------
 
 Before invoking any transition function, :func:`handle` calls
-:meth:`LithosClient.task_get` once (post-lithos#294 — claim
-serialization isn't needed here) to read the task's current state
+:meth:`LithosClient.task_get` once to read the task's current state
 from Lithos and passes the resulting :class:`Task` down to the
-transition function. Each function then runs its own skip
-predicate so the action is co-located with the predicate that
-guards it:
+transition function. Each function then runs its own skip predicate so
+the action is co-located with the predicate that guards it:
 
 * :func:`_complete` skips when ``status`` ∈ ``{completed, cancelled}``
-  (the task is already terminal; completing a cancelled task is
-  meaningless).
+  (the task is already terminal).
 * :func:`_cancel` skips when ``status`` ∈ ``{completed, cancelled}``
   (likewise terminal).
 * :func:`_reopen_request` skips when ``status != "completed"`` —
-  posting a ``[ReopenRequested]`` finding on an already-open task
-  is nonsensical; this is the projection-lag case where the user
-  unticked a line that Lithos was already showing as open.
+  posting a ``[ReopenRequested]`` finding on an already-open task is
+  nonsensical; this is the projection-lag case where the user unticked a
+  line that Lithos was already showing as open.
 
-``task_get`` returning ``None`` (task deleted upstream — explicit
-``task_not_found`` envelope from Lithos) is treated as a skip for
-all three transitions.
+``task_get`` returning ``None`` (task deleted upstream) is treated as a
+skip for all three transitions.
 
-The pre-check costs one extra RPC per dispatched event but
-guarantees source-replay on daemon restart is silent — re-reading
+The pre-check costs one extra RPC per dispatched event but guarantees
+source-replay on daemon restart is silent — re-reading
 ``_lithos/tasks.md`` after a restart no longer drives ``task_complete``
-/ ``task_cancel`` / ``finding_post`` calls that would otherwise
-fail or be redundant.
+/ ``task_cancel`` / ``finding_post`` calls that would otherwise fail or
+be redundant.
 """
 
 from __future__ import annotations
@@ -75,9 +69,9 @@ _TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "cancelled"})
 
 
 async def _complete(task_id: str, current: Task, ctx: SubscriptionContext) -> None:
-    """US17: ``[ ] → [x]`` — Obsidian tick → Lithos complete.
+    """``[ ] → [x]`` — Obsidian tick → Lithos complete.
 
-    US22 pre-check: skip when the task is already terminal.
+    Pre-check: skip when the task is already terminal.
     """
     if current.status in _TERMINAL_STATUSES:
         ctx.logger.info(
@@ -103,9 +97,9 @@ _CANCEL_REASON = "cancelled via Obsidian status flip"
 
 
 async def _cancel(task_id: str, current: Task, ctx: SubscriptionContext) -> None:
-    """US18: ``[ ] → [-]`` — Obsidian cancel marker → Lithos cancel.
+    """``[ ] → [-]`` — Obsidian cancel marker → Lithos cancel.
 
-    US22 pre-check: skip when the task is already terminal.
+    Pre-check: skip when the task is already terminal.
     """
     if current.status in _TERMINAL_STATUSES:
         ctx.logger.info(
@@ -139,21 +133,18 @@ _REOPEN_REQUEST_SUMMARY = "[ReopenRequested] task untoggled in Obsidian"
 async def _reopen_request(
     task_id: str, current: Task, ctx: SubscriptionContext
 ) -> None:
-    """US19: ``[x] → [ ]`` — Obsidian untick on completed task →
+    """``[x] → [ ]`` — Obsidian untick on completed task →
     ``[ReopenRequested]`` finding.
 
-    Workaround for D17 — Lithos doesn't yet have ``task_reopen``
-    (upstream ``agent-lore/lithos#243``). The finding gives lithos-lens
-    (and the operator) a signal that the completed task should be
-    revisited. The Lithos task itself stays in ``status=completed`` —
-    no automatic reopen. When #243 ships, this row can be replaced
-    with a real reopen call.
+    Workaround until upstream ``agent-lore/lithos#243`` adds a real
+    ``task_reopen``. The finding gives lithos-lens (and the operator) a
+    signal that the completed task should be revisited. The Lithos task
+    itself stays in ``status=completed`` — no automatic reopen.
 
-    US22 pre-check: skip when the task is NOT in ``status=completed``.
+    Pre-check: skip when the task is NOT in ``status=completed``.
     Posting ``[ReopenRequested]`` on an open task is nonsensical
-    (the task hasn't actually been resolved upstream — the projection
-    must have lagged). On a cancelled task it's also misleading; we
-    only post on genuinely completed tasks.
+    (the projection must have lagged). On a cancelled task it's also
+    misleading; we only post on genuinely completed tasks.
     """
     if current.status != "completed":
         ctx.logger.info(
@@ -177,8 +168,8 @@ async def _reopen_request(
 
 # Dispatch table. Each entry maps a ``(prior, new)`` checkbox-marker
 # pair to the coroutine that pushes the corresponding action to Lithos.
-# US20's silent no-op for ``[/]`` and ``[>]`` falls out of the missing-
-# entry path below — no explicit row needed.
+# Silent no-ops for ``[/]`` and ``[>]`` fall out of the missing-entry
+# path below — no explicit row needed.
 _TRANSITIONS: dict[tuple[str, str], TransitionFn] = {
     ("[ ]", "[x]"): _complete,
     ("[ ]", "[-]"): _cancel,
@@ -189,10 +180,9 @@ _TRANSITIONS: dict[tuple[str, str], TransitionFn] = {
 async def handle(event: Event, ctx: SubscriptionContext) -> None:
     """Dispatch a single ``obsidian.task.status_changed`` event.
 
-    US22: pre-check :meth:`LithosClient.task_get` once before
-    invoking the transition function. The dispatch-table miss path
-    short-circuits before the pre-check (so the silent no-op cases
-    in US20 don't incur the RPC).
+    Calls :meth:`LithosClient.task_get` once before invoking the
+    transition function. The dispatch-table miss path short-circuits
+    before the pre-check (so silent no-op cases don't incur the RPC).
     """
     payload = event.payload
     try:
@@ -209,11 +199,10 @@ async def handle(event: Event, ctx: SubscriptionContext) -> None:
 
     fn = _TRANSITIONS.get((prior, new))
     if fn is None:
-        # Unrecognised transition — includes the US20 cases (`[/]`,
-        # `[>]`) and anything weird the user might type. Debug-log
-        # for visibility but don't emit any side effect; the future
-        # status-transition rows fill in via the dispatch table, not
-        # by changing this fall-through.
+        # Unrecognised transition — includes the ``[/]`` and ``[>]``
+        # no-op cases and anything unusual the user might type. Debug-log
+        # for visibility but don't emit any side effect; new transitions
+        # fill in via the dispatch table, not by changing this fall-through.
         ctx.logger.debug(
             "obsidian-status-transition: no handler for transition "
             "%s→%s on task %s; skipping",
@@ -223,10 +212,9 @@ async def handle(event: Event, ctx: SubscriptionContext) -> None:
         )
         return
 
-    # US22: one task_get RPC per dispatched event, regardless of
-    # which transition fires (lithos#294 — no claims needed here).
-    # Each transition fn then runs its own skip predicate against
-    # ``current.status``.
+    # One task_get RPC per dispatched event, regardless of which
+    # transition fires. Each transition fn then runs its own skip
+    # predicate against ``current.status``.
     current = await ctx.lithos.task_get(task_id=task_id)
     if current is None:
         ctx.logger.info(

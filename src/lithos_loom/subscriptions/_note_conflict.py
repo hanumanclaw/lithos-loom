@@ -1,4 +1,4 @@
-"""Conflict resolver for the ``note-push`` handler (Slice 5 US35, D29).
+"""Conflict resolver for the ``note-push`` handler.
 
 Called inline from :mod:`._note_push` when ``lithos_write`` returns
 ``status="version_conflict"``. The operator's local body and Lithos's
@@ -6,7 +6,7 @@ canonical body have diverged: the operator edited locally while a
 parallel write (another agent, the projection itself, an MCP call)
 bumped the version upstream.
 
-Resolution strategy (D29):
+Resolution strategy:
 
 1. Render the canonical Lithos body into the form the projection
    would have written.

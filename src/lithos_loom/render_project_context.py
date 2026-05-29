@@ -1,14 +1,14 @@
-"""Renderer + frontmatter helpers for project-context vault projection (Slice 4).
+"""Renderer + frontmatter helpers for project-context vault projection.
 
 Pure functions only — given a :class:`~lithos_loom.lithos_client.Note`,
 :func:`render_doc` returns the Markdown string the projection writes
 to ``<vault>/_lithos/projects/<slug>/<filename>.md``. No I/O. Mirrors
 the design of :mod:`lithos_loom.render` for tasks.
 
-The frontmatter shape (D25) is YAML, with these keys:
+Frontmatter shape is YAML, with these keys:
 
 * ``lithos_id`` — UUID, the canonical KB identifier
-* ``lithos_version`` — int, used for optimistic locking on push-back (Slice 5)
+* ``lithos_version`` — int, used for optimistic locking on push-back
 * ``lithos_updated_at`` — ISO datetime, last server-side update
 * ``slug`` — string, redundant with directory name but useful for queries
 * ``status`` — ``active`` | ``archived`` | ``quarantined`` (omitted when None)
@@ -18,15 +18,15 @@ Body is ``# {title}\n\n{body}`` — matches
 :attr:`~lithos.knowledge.KnowledgeDocument.full_content` so the
 projected file is byte-comparable round-trip when nothing changes.
 
-Slice 5 (bidirectional sync) uses the same module via:
+The bidirectional sync layer uses the same module via:
 
 * :func:`extract_frontmatter` — splits a vault file into
   ``(frontmatter_dict, body_with_title)``. Used by the dir-watcher to
   parse ``lithos_id`` / ``lithos_version`` for push-back and by the
   note-push handler to recover body.
 * :func:`compute_body_hash` — SHA-256 of body-only (frontmatter
-  excluded). Used by the dir-watcher's body-only diff (D28: frontmatter
-  edits never push).
+  excluded). Used by the dir-watcher's body-only diff (frontmatter
+  edits must never push back to Lithos).
 
 The split is intentional: rendering and parsing are pure inverses
 under valid inputs, so a round-trip ``render_doc(...) -> extract_frontmatter(...)``
@@ -129,8 +129,8 @@ def _strip_leading_title(body: str, title: str) -> str:
 def _build_frontmatter(note: Note) -> dict[str, Any]:
     """Build the ordered frontmatter dict for a :class:`Note`.
 
-    Order matches D25 (id → version → updated_at → slug → status →
-    tags) — Python dicts preserve insertion order, and
+    Order: id → version → updated_at → slug → status → tags — Python
+    dicts preserve insertion order, and
     ``yaml.safe_dump(sort_keys=False)`` honours it. Stable key order
     is part of the byte-stable contract.
 
@@ -198,9 +198,9 @@ def extract_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 def compute_body_hash(text: str) -> bytes:
     """SHA-256 of the body half (frontmatter excluded).
 
-    Used by the Slice 5 dir-watcher to detect body-only changes
-    (D28 invariant: frontmatter edits never push). Files without
-    frontmatter hash the whole content — there's nothing to exclude.
+    Used by the dir-watcher to detect body-only changes (frontmatter
+    edits must not push back to Lithos). Files without frontmatter hash
+    the whole content — there's nothing to exclude.
 
     Returns raw bytes (not hex) so callers can do byte-compare; the
     fs-watcher's hash maps already use bytes for the same reason.

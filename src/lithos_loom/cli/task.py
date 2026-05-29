@@ -1,12 +1,12 @@
-"""``lithos-loom task`` sub-app (Slice 3, US24-27).
+"""``lithos-loom task`` sub-app.
 
 Currently exposes only ``create``, which the capture-macro Templater
 script shells out to. The CLI takes the prompted form fields, calls
 ``lithos_task_create`` (with metadata, post-lithos#295), and renders
-the projected line via the shared :mod:`lithos_loom.render` module
-so the output is byte-equal to what the projection will write on its
-next pass — that's what makes US25's "born projected" guarantee work
-end-to-end.
+the projected line via the shared :mod:`lithos_loom.render` module so
+the output is byte-equal to what the projection will write on its next
+pass — the "born projected" guarantee ensures macro-inserted lines and
+projection-rewritten lines are byte-equal.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ class UnknownProjectError(LithosLoomError):
 
 task_app = typer.Typer(
     name="task",
-    help="Task-creation CLI helpers (Slice 3+).",
+    help="Task-creation CLI helpers.",
     no_args_is_help=True,
 )
 
@@ -95,8 +95,8 @@ def task_create(
         "--target-file",
         help=(
             "Optional file to append the projected line to instead of "
-            "printing to stdout (US27). Created if missing; the line "
-            "is appended with a trailing newline. Mutually exclusive "
+            "printing to stdout. Created if missing; the line is "
+            "appended with a trailing newline. Mutually exclusive "
             "with --no-insert."
         ),
     ),
@@ -105,9 +105,8 @@ def task_create(
         "--no-insert",
         help=(
             "Don't emit the projected line anywhere — just create the "
-            "task and print its id (US27). Useful for scripted flows "
-            "that only need the task_id back. Mutually exclusive with "
-            "--target-file."
+            "task and print its id. Useful for scripted flows that only "
+            "need the task_id back. Mutually exclusive with --target-file."
         ),
     ),
     config: Path | None = typer.Option(
@@ -123,13 +122,13 @@ def task_create(
     (``projects/`` KB docs tagged ``project-context``) unioned with the
     local TOML ``[projects]`` table — so a project created via the
     create-project macro (Lithos-only, no TOML entry) is accepted.
-    Validates ``--priority`` against the D18 enum, then calls
+    Validates ``--priority`` against the priority enum, then calls
     ``lithos_task_create`` with the assembled metadata in a single
     RPC (lithos#295). On success, renders the projected line via
     the shared :func:`lithos_loom.render.render_line` so a macro-
     inserted line is byte-equal to what the projection will write.
 
-    Output mode (US27):
+    Output mode:
     * Default: print the projected line to stdout (macro inserts at cursor).
     * ``--target-file PATH``: append the line to PATH; nothing to stdout.
     * ``--no-insert``: print just the new task's id to stdout; the

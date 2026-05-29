@@ -1,5 +1,4 @@
-"""``obsidian-due-date-changed`` subscription handler (Slice 3
-round-trip).
+"""``obsidian-due-date-changed`` subscription handler.
 
 Consumes ``obsidian.task.due_date_changed`` events emitted by
 :class:`~lithos_loom.sources.obsidian_fs_watcher.ObsidianFsWatcher`

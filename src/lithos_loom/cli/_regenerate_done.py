@@ -1,7 +1,7 @@
 """Logic for ``lithos-loom project regenerate-done`` (rebuild a per-project
 task-archive done file from Lithos).
 
-The Slice 6 ``task-archive`` subscription only appends tasks the operator
+The ``task-archive`` subscription only appends tasks the operator
 *surfaced* in ``_lithos/tasks.md``, and only from the moment the daemon
 started archiving. This rebuilds ``<vault>/_lithos/projects/<slug>/<slug>-done.md``
 from scratch by querying Lithos for **every** resolved (completed +
@@ -100,9 +100,9 @@ async def collect_resolved_lines(*, cfg: LoomConfig, slug: str) -> list[str]:
 def build_done_content(lines: list[str]) -> str:
     """Render the full done-file body from ``lines``.
 
-    Bare Tasks-plugin lines, no header / frontmatter (D37), trailing
-    newline when non-empty so the file ends cleanly. Empty input yields
-    an empty string (the caller decides whether to write it)."""
+    Bare Tasks-plugin lines, no header / frontmatter, trailing newline
+    when non-empty so the file ends cleanly. Empty input yields an empty
+    string (the caller decides whether to write it)."""
     if not lines:
         return ""
     return "\n".join(lines) + "\n"

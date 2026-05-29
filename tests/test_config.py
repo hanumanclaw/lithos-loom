@@ -39,6 +39,40 @@ def test_lithos_url_env_override_wins(
     assert cfg.orchestrator.lithos_url == "http://override:9999"
 
 
+def test_lithos_url_env_override_preserves_obsidian_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: setting LITHOS_URL must not drop the [obsidian_sync] block.
+
+    Before this guard, the env-override path rebuilt LoomConfig field by field
+    and silently omitted obsidian_sync, disabling the Obsidian bridge for any
+    operator who followed the README's "set LITHOS_URL" quick start.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        dedent(
+            f"""
+            [orchestrator]
+            agent_id = "lithos-orchestrator-test"
+            lithos_url = "http://config:8765"
+
+            [obsidian_sync]
+            vault_path = "{vault}"
+            """
+        )
+    )
+    monkeypatch.setenv("LITHOS_LOOM_CONFIG", str(cfg_path))
+    monkeypatch.setenv("LITHOS_URL", "http://override:9999")
+
+    cfg = load_config()
+
+    assert cfg.orchestrator.lithos_url == "http://override:9999"
+    assert cfg.obsidian_sync is not None
+    assert cfg.obsidian_sync.vault_path == vault
+
+
 def test_missing_config_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LITHOS_LOOM_CONFIG", str(tmp_path / "nope.toml"))
     with pytest.raises(ConfigError, match="LITHOS_LOOM_CONFIG points at"):

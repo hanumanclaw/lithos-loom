@@ -1,4 +1,4 @@
-"""Plugin subprocess runner and ``result.json`` contract (Slice 0 US5).
+"""Plugin subprocess runner and ``result.json`` contract.
 
 Plugins are stateless subprocesses invoked with three flags:
 

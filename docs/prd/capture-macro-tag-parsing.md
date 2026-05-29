@@ -6,7 +6,7 @@ target_version: 0.2.0
 references:
   - docs/macros/capture-task.md (existing macro source)
   - docs/macros/README.md (operator-facing docs)
-  - docs/prd/integration.md (Slice 3 user stories US24-27)
+  - docs/SPECIFICATION.md (capture macro flow — §4.5 + Appendix A)
 labels: [needs-triage, lithos-loom, obsidian, capture-macro]
 ---
 

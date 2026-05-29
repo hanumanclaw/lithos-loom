@@ -10,7 +10,7 @@ falling back to plain ``config.toml``. This lets a single workstation host multi
 Loom configurations (e.g. one targeting a production Lithos, one targeting a
 local-development Lithos) and switch between them by exporting one env var.
 
-The TOML schema follows ``docs/prd/mvp.md`` US-4:
+The TOML schema is documented in ``docs/SPECIFICATION.md`` §3.1; the shape is:
 
     [orchestrator]
     agent_id = "lithos-orchestrator-<host>"
@@ -35,7 +35,7 @@ from __future__ import annotations
 import os
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast, overload
 
@@ -130,19 +130,19 @@ class RouteConfig:
     command: str
     match: RouteMatch
     human_blocking: bool = False
-    """Whether this route requires human action (US8 / Slice 1).
+    """Whether this route requires human action.
 
     Read by ``is_human_actionable``: a task whose tags match a route
     with ``human_blocking=True`` is projected into the operator's
     Obsidian view; routes with ``human_blocking=False`` are treated as
     autonomous (the daemon will handle them; hide from operator).
     """
-    max_runtime_seconds: int | None = None  # US-34
+    max_runtime_seconds: int | None = None
 
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """Per-subscription retry shape (Slice 0 US4).
+    """Per-subscription retry shape.
 
     ``initial_delay_seconds`` and ``max_delay_seconds`` are the bounds for
     the chosen backoff curve. ``exponential`` doubles each attempt up to
@@ -168,7 +168,7 @@ class SubscriptionConfig:
 
 @dataclass(frozen=True)
 class ObsidianSyncConfig:
-    """Vault-host configuration for the obsidian-sync child (Slice 1+).
+    """Vault-host configuration for the obsidian-sync child.
 
     Presence of this section on a host's TOML declares "this is the
     vault host." The supervisor uses ``cfg.obsidian_sync is not None``
@@ -176,33 +176,30 @@ class ObsidianSyncConfig:
 
     ``tasks_file`` is stored as a relative path and joined with
     ``vault_path`` only at use time. Existence of the vault is not
-    checked at parse time — that's ``lithos-loom doctor`` (US15).
+    checked at parse time — that's ``lithos-loom doctor``.
 
     Projection filter knobs (``include_blocked``, ``exclude_tags``) are
-    operator-level controls that ``is_human_actionable`` (US8) will
-    read alongside the route-author's ``human_blocking`` flag. These
-    are deliberately a small starter set; we expect the list to grow
-    as Slice 1 stories surface real filtering needs rather than
-    speculating now.
+    operator-level controls that ``is_human_actionable`` reads alongside
+    the route-author's ``human_blocking`` flag.
     """
 
     vault_path: Path
     tasks_file: Path = field(default=DEFAULT_OBSIDIAN_TASKS_FILE)
     resolved_ttl_days: int = DEFAULT_OBSIDIAN_RESOLVED_TTL_DAYS
     include_blocked: bool = True
-    """Project tasks whose ``metadata.depends_on`` is non-empty (US12 /
-    D6 revised default). Operators who don't want blocked work in
-    their daily view can set this to ``false``."""
+    """Project tasks whose ``metadata.depends_on`` is non-empty.
+    Operators who don't want blocked work in their daily view can set
+    this to ``false``."""
     exclude_tags: tuple[str, ...] = ()
     """Tags whose presence on a task suppresses projection. Generic
     operator-level denylist; matched against ``task.tags`` membership."""
     projects_dir: Path = field(default=DEFAULT_OBSIDIAN_PROJECTS_DIR)
-    """Where Slice 4's project-context projection writes per-project
-    docs under the vault. Default ``_lithos/projects`` mirrors the
-    Lithos-side ``knowledge/projects/<slug>/<filename>.md`` layout
-    one-to-one so the slug + filename map straight across. Stored as
-    a relative path; joined with ``vault_path`` only at use time
-    (same shape as ``tasks_file``)."""
+    """Where the project-context projection writes per-project docs
+    under the vault. Default ``_lithos/projects`` mirrors the Lithos-side
+    ``knowledge/projects/<slug>/<filename>.md`` layout one-to-one so
+    the slug + filename map straight across. Stored as a relative path;
+    joined with ``vault_path`` only at use time (same shape as
+    ``tasks_file``)."""
 
 
 @dataclass(frozen=True)
@@ -636,25 +633,16 @@ def _optional_float(
 
 
 def _apply_env_overrides(cfg: LoomConfig) -> LoomConfig:
-    """Apply env-var overrides for the small set of always-overridable fields."""
+    """Apply env-var overrides for the small set of always-overridable fields.
+
+    Uses ``dataclasses.replace`` rather than re-constructing both dataclasses
+    explicitly so a future field added to ``LoomConfig`` or
+    ``OrchestratorConfig`` can't be silently dropped here.
+    """
     url = os.environ.get("LITHOS_URL", "")
     if not url:
         return cfg
-    return LoomConfig(
-        orchestrator=OrchestratorConfig(
-            agent_id=cfg.orchestrator.agent_id,
-            lithos_url=url,
-            work_dir=cfg.orchestrator.work_dir,
-            max_concurrency=cfg.orchestrator.max_concurrency,
-            log_level=cfg.orchestrator.log_level,
-            retain_failed_workdirs=cfg.orchestrator.retain_failed_workdirs,
-        ),
-        projects=cfg.projects,
-        routes=cfg.routes,
-        subscriptions=cfg.subscriptions,
-        source_path=cfg.source_path,
-        environment=cfg.environment,
-    )
+    return replace(cfg, orchestrator=replace(cfg.orchestrator, lithos_url=url))
 
 
 def _required_str(d: dict[str, Any], key: str, path: Path, scope: str) -> str:

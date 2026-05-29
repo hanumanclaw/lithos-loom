@@ -1,16 +1,14 @@
-"""Supervisor: top-level lifecycle manager for the Loom daemon (Slice 0 US1).
+"""Supervisor: top-level lifecycle manager for the Loom daemon.
 
 Reads a ``LoomConfig``, fans out one subprocess child per *enabled category*,
 propagates a graceful shutdown to all of them on SIGTERM/SIGINT, and surfaces
 a single exit code summarising the run.
 
 A *category* is a coarse-grained piece of behaviour the operator might want
-to isolate from the rest — e.g. the route-runner (Story 5) or, on samsara
-only, the obsidian-sync child (Slice 1+). Per locked decision D3, categories
-run as subprocess children so a crash in one cannot take down siblings; v1
-lifecycle is monolithic and does not auto-restart (per integration.md Slice 0
-user story 5: "child crash detection (informational; restart not required in
-v1)").
+to isolate from the rest — e.g. the route-runner or the obsidian-sync child.
+Categories run as subprocess children so a crash in one cannot take down
+siblings; v1 lifecycle is monolithic and does not auto-restart (child crash
+detection is informational; restart is not required in v1).
 
 Concretely the supervisor:
 
@@ -231,11 +229,10 @@ class Supervisor:
 def default_categories() -> list[CategorySpec]:
     """Categories the supervisor spawns by default in ``lithos-loom run``.
 
-    Slice 0 registers the route-runner category (US5). Slice 1 US7 adds
-    the obsidian-sync category, gated on the presence of
-    ``[obsidian_sync]`` in the loaded config — implicit host gating so
-    operators deploy the section on the vault host and omit it on
-    headless hosts.
+    The route-runner category runs when routes are configured. The
+    obsidian-sync category runs when ``[obsidian_sync]`` is present in
+    the loaded config — operators deploy the section on the vault host
+    and omit it on headless hosts.
     """
     return [
         CategorySpec(

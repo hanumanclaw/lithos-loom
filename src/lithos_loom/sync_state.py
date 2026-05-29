@@ -1,13 +1,13 @@
 """Coordination state shared between the obsidian-projection writer and
-the obsidian-fs-watcher source (Slice 2 US23).
+the obsidian-fs-watcher source.
 
 The fs watcher and projection live in the same subprocess (the
 ``obsidian-sync`` child). The projection writes ``_lithos/tasks.md``;
 the watcher polls the same file. Without coordination, every projection
 write would trip the watcher and emit a spurious
 ``obsidian.task.status_changed`` event that the status-transition
-subscription would then echo back to Lithos — the feedback loop US23
-explicitly forbids.
+subscription would then echo back to Lithos — a feedback loop the
+coordination seam is designed to prevent.
 
 This module is the coordination seam: a single :class:`ProjectionSyncState`
 instance is constructed by the child and handed to both sides. The
@@ -26,7 +26,7 @@ Three pieces of state matter:
   user edits from projection-driven status changes on a per-task basis
   when the file content does differ (e.g. user edited an unrelated
   line, projection added a new task, etc.).
-* ``task_priority_markers`` (Slice 2 US21) — per-task priority enum
+* ``task_priority_markers`` — per-task priority enum
   (``"highest"``/``"high"``/``"medium"``/``"low"``/``"lowest"`` or
   ``None`` for no priority) the projection most recently emitted.
   Same role for ``obsidian.task.priority_changed`` as the status map
@@ -78,23 +78,22 @@ class ProjectionSyncState:
     """Per-task priority enum (``highest``/``high``/``medium``/
     ``low``/``lowest``) or ``None`` the projection most recently
     emitted, keyed by Lithos task id. Same role for the
-    ``obsidian.task.priority_changed`` event (Slice 2 US21) as
-    ``task_status_markers`` plays for ``status_changed``. ``None``
-    means "task is open but has no priority"; a key being absent
-    means the projection has never written that task. Resolved tasks
-    are not added here — the renderer drops priority on resolved
-    lines, so there's no projection baseline to compare against."""
+    ``obsidian.task.priority_changed`` event as ``task_status_markers``
+    plays for ``status_changed``. ``None`` means "task is open but has
+    no priority"; a key being absent means the projection has never
+    written that task. Resolved tasks are not added here — the renderer
+    drops priority on resolved lines, so there's no projection baseline
+    to compare against."""
 
     task_due_date_markers: dict[str, str | None] = field(default_factory=dict)
     """Per-task due date (``YYYY-MM-DD`` string, matching what the
     renderer emits in the ``📅`` marker) or ``None`` the projection
     most recently emitted. Same role for the
-    ``obsidian.task.due_date_changed`` event (Slice 3 round-trip) as
-    ``task_status_markers`` plays for ``status_changed``. ``None``
-    means "task is open but has no due date on the projected line";
-    a key being absent means the projection has never written that
-    task. Resolved tasks are not added here — the renderer drops
-    the due date on resolved lines."""
+    ``obsidian.task.due_date_changed`` event as ``task_status_markers``
+    plays for ``status_changed``. ``None`` means "task is open but has
+    no due date on the projected line"; a key being absent means the
+    projection has never written that task. Resolved tasks are not
+    added here — the renderer drops the due date on resolved lines."""
 
     write_version: int = 0
     """Monotonically incremented on each ``record_projection_write``
@@ -111,41 +110,39 @@ class ProjectionSyncState:
     note_file_hashes: dict[str, bytes] = field(default_factory=dict)
     """Per-project-context-doc **full-file** hash the projection most
     recently emitted (SHA-256 of the entire rendered output —
-    frontmatter + body), keyed by Lithos doc id (Slice 4).
+    frontmatter + body), keyed by Lithos doc id.
 
     Two purposes:
 
     * Projection self-dedup: skip the write if the freshly-rendered
       file would be byte-identical to what we last wrote. Must be
-      whole-file (not body-only) because US30 requires frontmatter
-      fields (``lithos_version``, ``status``, ``tags``,
-      ``lithos_updated_at``) to mirror Lithos — a version bump with
-      unchanged body MUST still rewrite the frontmatter, otherwise
-      Slice 5's optimistic-lock contract breaks.
-    * Slice 5 dir-watcher self-write suppression: the watcher
-      computes the on-disk hash and compares against this; a match
-      means "the projection wrote these exact bytes, suppress as
-      self-write."
+      whole-file (not body-only) because frontmatter fields
+      (``lithos_version``, ``status``, ``tags``, ``lithos_updated_at``)
+      must mirror Lithos — a version bump with unchanged body MUST still
+      rewrite the frontmatter, otherwise the optimistic-lock contract
+      for bidirectional sync breaks.
+    * Dir-watcher self-write suppression: the watcher computes the
+      on-disk hash and compares against this; a match means "the
+      projection wrote these exact bytes, suppress as self-write."
 
-    Body-only hash (``compute_body_hash``) is a separate concept
-    used by Slice 5's body-only diff for the D28 invariant (operator
-    frontmatter edits never push). It is NOT stored here — the
+    Body-only hash (``compute_body_hash``) is a separate concept used
+    by the dir-watcher's body-only diff (operator frontmatter edits
+    must not push back to Lithos). It is NOT stored here — the
     dir-watcher computes it on the fly when needed."""
 
     note_versions: dict[str, int] = field(default_factory=dict)
     """Per-project-context-doc ``lithos_version`` the projection most
-    recently wrote into vault frontmatter (Slice 4). The Slice 5
-    note-push handler reads this to provide ``expected_version`` to
-    ``lithos_write`` for optimistic locking. Keyed by Lithos doc id."""
+    recently wrote into vault frontmatter. The note-push handler reads
+    this to provide ``expected_version`` to ``lithos_write`` for
+    optimistic locking. Keyed by Lithos doc id."""
 
     note_body_hashes: dict[str, bytes] = field(default_factory=dict)
     """Per-project-context-doc **body-only** hash (SHA-256 of the
-    Markdown body, frontmatter excluded), keyed by Lithos doc id
-    (Slice 5).
+    Markdown body, frontmatter excluded), keyed by Lithos doc id.
 
-    Drives the dir-watcher's body-only diff (D28 invariant: frontmatter
-    edits never push). The watcher computes the on-disk body hash
-    every poll and compares against this baseline:
+    Drives the dir-watcher's body-only diff (frontmatter edits must
+    never push back to Lithos). The watcher computes the on-disk body
+    hash every poll and compares against this baseline:
 
     * Match → projection wrote this body (or operator edited only the
       frontmatter); suppress, no push.
@@ -153,16 +150,16 @@ class ProjectionSyncState:
       :attr:`note_file_hashes` → real operator body edit; emit
       ``obsidian.note.modified``.
 
-    Distinct from :attr:`note_file_hashes` because Slice 5's
-    note-push round-trip rewrites frontmatter (version bump) without
-    changing body, and the projection itself rewrites frontmatter
-    fields like ``lithos_updated_at`` on docs the operator didn't
-    touch. Whole-file hash alone would mis-classify both as user
-    body edits and trigger feedback-loop pushes."""
+    Distinct from :attr:`note_file_hashes` because the note-push
+    round-trip rewrites frontmatter (version bump) without changing
+    body, and the projection itself rewrites frontmatter fields like
+    ``lithos_updated_at`` on docs the operator didn't touch. Whole-file
+    hash alone would mis-classify both as user body edits and trigger
+    feedback-loop pushes."""
 
     note_projected_paths: dict[str, Path] = field(default_factory=dict)
     """Per-project-context-doc **absolute vault path** the projection
-    most recently wrote to, keyed by Lithos doc id (Slice 4).
+    most recently wrote to, keyed by Lithos doc id.
 
     Required for stale-file cleanup when a note's address changes
     while the projection's view of "where to write next" diverges
@@ -184,32 +181,30 @@ class ProjectionSyncState:
 
     surfaced: dict[str, bool] = field(default_factory=dict)
     """Per-task "was this task ever written into the global
-    ``_lithos/tasks.md`` projection" flag, keyed by Lithos task id
-    (Slice 6 task-archive). Set ``True`` by the obsidian-projection
-    ``handle`` the moment an open actionable task is added to render
-    state, and seeded at projection-handler init from the task ids
-    already present on disk in ``tasks.md`` (so tasks visible before a
-    restart survive the replay of their ``completed`` event).
+    ``_lithos/tasks.md`` projection" flag, keyed by Lithos task id.
+    Set ``True`` by the obsidian-projection handler the moment an open
+    actionable task is added to render state, and seeded at init from
+    the task ids already on disk in ``tasks.md`` (so tasks visible
+    before a restart survive the replay of their ``completed`` event).
 
-    Read by the ``task-archive`` subscription as its D38 gate: a task
-    that resolves without this flag set was never operator-visible
+    Read by the ``task-archive`` subscription as its surfaced-gate: a
+    task that resolves without this flag set was never operator-visible
     (background / route-claimed-only) and is NOT archived. Dropped by
     the archiver after a successful append (memory stays bounded by the
     open-task count).
 
-    Caveat: the D38 gate, like every subscription, only sees events the
-    bus actually delivered. If the bus drops a terminal event for the
+    Caveat: the surfaced-gate, like every subscription, only sees events
+    the bus actually delivered. If the bus drops a terminal event for the
     archiver's queue (back-pressure), that task is never archived — the
     line stays in ``tasks.md`` under the TTL fallback but no done-file
-    entry is written. The D39 no-data-loss contract covers archive-write
+    entry is written. The no-data-loss contract covers archive-write
     *failures* (retry/friction), not bus drops."""
 
     archived: dict[str, bool] = field(default_factory=dict)
     """Per-task "the task-archive subscription has durably appended this
     task to its per-project ``<slug>-done.md`` file" flag, keyed by
-    Lithos task id (Slice 6). Set ``True`` by the archiver only after
-    the O_APPEND write succeeds (or when a replayed task is found already
-    on disk).
+    Lithos task id. Set ``True`` by the archiver only after the O_APPEND
+    write succeeds (or when a replayed task is found already on disk).
 
     Read by the obsidian-projection's flush-time eviction predicate:
     an archived resolved task is evicted from ``tasks.md`` immediately,
@@ -227,9 +222,9 @@ class ProjectionSyncState:
 
     request_projection_flush: Callable[[], Awaitable[None]] | None = None
     """Hook the obsidian-projection installs so a sibling handler can
-    ask it to (re-)flush ``tasks.md`` (Slice 6 D39). Set by the
-    projection's ``make_handler`` to its debounced flush-scheduler;
-    ``None`` until then (and when no projection is wired).
+    ask it to (re-)flush ``tasks.md``. Set by the projection's
+    ``make_handler`` to its debounced flush-scheduler; ``None`` until
+    then (and when no projection is wired).
 
     The task-archive subscription calls this *after* it sets
     ``archived[id]``, so the resulting flush is guaranteed to see the
@@ -283,14 +278,14 @@ class ProjectionSyncState:
         projected_path: Path,
     ) -> None:
         """Capture the post-render state for a single project-context
-        doc the projection is about to commit (Slice 4 + Slice 5).
+        doc the projection is about to commit.
 
         Per-doc state lives in four parallel maps keyed by doc id:
         ``note_file_hashes`` (whole-file hash — used by the projection
         for self-dedup), ``note_body_hashes`` (body-only hash — used
-        by Slice 5's dir-watcher to suppress self-writes without
-        false-positive matches against frontmatter-only changes),
-        ``note_versions`` (the version Slice 5's note-push provides
+        by the dir-watcher to suppress self-writes without false-positive
+        matches against frontmatter-only changes),
+        ``note_versions`` (the version the note-push handler provides
         to ``expected_version`` for optimistic locking), and
         ``note_projected_paths`` (the absolute vault path of the
         current projection — used for stale-file cleanup on path

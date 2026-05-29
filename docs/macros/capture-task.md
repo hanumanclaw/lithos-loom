@@ -1,5 +1,5 @@
 <%*
-// capture-task.md — Slice 3 capture macro for lithos-loom.
+// capture-task.md — capture macro for lithos-loom.
 //
 // Install: copy this file (verbatim) into your vault's Templater
 // Template Folder, then bind Obsidian's "Templater: Insert

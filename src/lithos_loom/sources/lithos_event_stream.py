@@ -12,8 +12,8 @@ Lifecycle on ``run()``:
    The server immediately starts buffering events for this subscription.
 2. **Bootstrap (first attempt only).** One ``task_list(status="open")``
    call inside the SSE context. Each returned task is published as
-   ``lithos.task.created`` with the full poller-shaped payload. This is
-   the same source-replay guarantee D11/D13 ask for: subscribers can be
+   ``lithos.task.created`` with the full poller-shaped payload. This
+   provides the source-replay guarantee: subscribers can be
    re-authoritative on restart. Running inside the SSE context closes
    the snapshot/connect race — any state change that happens during the
    snapshot is buffered server-side and drained in step 3 (duplicates
@@ -138,7 +138,7 @@ class LithosEventStream:
     ``lithos.task.cancelled`` bus event.
 
     Set by the ``obsidian-sync`` child to
-    ``timedelta(days=resolved_ttl_days)`` so the US13 TTL-lingering
+    ``timedelta(days=resolved_ttl_days)`` so the TTL-lingering
     window survives daemon restart.
 
     ``None`` (default) means open-only bootstrap. Other source consumers
@@ -239,8 +239,7 @@ class LithosEventStream:
         ``status="completed"`` and ``status="cancelled"`` with a
         server-side ``resolved_since`` filter (lithos#286), and
         publish each as the appropriate terminal-event type —
-        restart-recovery for US13's TTL lingering (PR #21 review
-        issue 1).
+        restart-recovery for TTL lingering (PR #21 review issue 1).
 
         Returns the total number of events published.
         ``self._bootstrapped`` flips to ``True`` only after every
@@ -269,9 +268,9 @@ class LithosEventStream:
     async def _bootstrap_resolved(self) -> int:
         """Replay terminal tasks resolved within the configured window.
 
-        Required by the ``obsidian-projection`` US13 TTL-lingering
-        contract: on a fresh daemon start, Monday's completed tasks
-        must still appear in the operator's "done this week" view.
+        Required by the ``obsidian-projection`` TTL-lingering contract:
+        on a fresh daemon start, Monday's completed tasks must still
+        appear in the operator's "done this week" view.
         Without this, the in-memory state dict comes up empty after
         restart and resolved entries vanish until they're re-resolved.
 
@@ -574,8 +573,8 @@ def _event_payload(task: Task) -> Mapping[str, Any]:
     Mirrors :func:`lithos_loom.sources.lithos_poller._event_payload` so
     RouteRunner (and any future bus subscriber) is unaffected by the
     source swap. ``resolved_at`` is published as ISO 8601 so the
-    obsidian-projection handler (US13) can anchor ``✅``/``❌`` markers
-    and TTL eviction on Lithos's canonical timestamp instead of
+    obsidian-projection handler can anchor ``✅``/``❌`` markers and
+    TTL eviction on Lithos's canonical timestamp instead of
     receive-at time. The key matches Lithos's post-#286 column name.
     """
     return MappingProxyType(

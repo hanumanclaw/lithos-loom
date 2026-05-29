@@ -5,15 +5,11 @@ default). This module wraps the ``mcp`` SDK's ``sse_client`` +
 ``ClientSession`` into a lifetime-managed object that exposes only the
 calls Loom actually needs.
 
-Slice 0 surface (US3):
+Public surface:
 
-* :class:`Task` — frozen dataclass with the fields the poller reads.
+* :class:`Task` — frozen dataclass with the fields route-runner and subscriptions read.
 * :class:`LithosClient` — async context manager owning an MCP session.
-* :meth:`LithosClient.task_list` — minimum ``lithos_task_list`` call.
-
-Story 5 (route-runner subscriber) will extend this with ``task_claim``,
-``task_release``, ``task_renew``, ``task_complete``, ``task_update``, and
-``finding_post``. Other tools land as they're needed.
+* :meth:`LithosClient.task_list` — ``lithos_task_list`` wrapper.
 
 Errors returned by Lithos as ``{status: "error", code, message}`` envelopes
 surface as :class:`LithosClientError` so callers can switch on
@@ -115,7 +111,7 @@ Mirrors the Lithos-side ``WriteOutcome`` enum (``lithos/src/lithos/intake.py``).
 ``created`` / ``updated`` are success paths; everything else means the
 caller has to decide what to do. ``version_conflict`` and
 ``slug_collision`` are the two cases the bidirectional-sync path
-(Slice 5) reacts to programmatically.
+reacts to programmatically.
 """
 
 
@@ -130,8 +126,7 @@ class Task:
     written by both ``complete_task`` and ``cancel_task`` (lithos#286
     / PR #288, which also renamed it from ``completed_at`` server-side
     with no BC alias). The obsidian-projection handler uses it as the
-    resolution-date anchor for ``✅``/``❌`` markers and TTL eviction
-    (US13).
+    resolution-date anchor for ``✅``/``❌`` markers and TTL eviction.
 
     ``description``, ``created_by``, ``created_at``, and ``outcome``
     were added in lithos#294 (full task record on status + new
@@ -155,8 +150,7 @@ class Task:
 
 @dataclass(frozen=True)
 class Note:
-    """A full Lithos KB document as returned by ``lithos_read``
-    (Slice 4 + 5).
+    """A full Lithos KB document as returned by ``lithos_read``.
 
     Field set carries everything the projection layer needs to render
     a vault file with frontmatter: identity (``id``, ``path``,
@@ -1032,7 +1026,7 @@ class LithosClient:
                 return None
             raise
 
-    # ── KB-doc surface (Slice 4 + 5) ─────────────────────────────────
+    # ── KB-doc surface ────────────────────────────────────────────────
 
     async def note_read(
         self,
@@ -1098,9 +1092,9 @@ class LithosClient:
         ``status="version_conflict"`` with ``current_version`` populated
         if the operator's view is stale.
 
-        Defaults ``note_type`` to ``"concept"`` to match the D14
-        convention for project context docs (which use the ``concept``
-        enum value + a ``project-context`` tag, since the enum doesn't
+        Defaults ``note_type`` to ``"concept"`` to match the convention
+        for project context docs (which use the ``concept`` enum value
+        + a ``project-context`` tag, since the enum doesn't
         have a dedicated value).
         """
         agent_id = agent or self.agent_id
@@ -1177,7 +1171,7 @@ class LithosClient:
         lightweight :class:`NoteSummary` (no body).
 
         ``path_prefix`` is the cheapest server-side filter for
-        directory-scoped enumeration (``"projects/"`` for Slice 4).
+        directory-scoped enumeration (e.g. ``"projects/"`` for project-context docs).
         ``tags`` narrows further (e.g. ``["project-context"]``).
 
         ``limit`` is forwarded as-is; the projection bootstrap caps it
@@ -1353,9 +1347,9 @@ def _parse_task_get_response(result: CallToolResult) -> Task:
 def _parse_iso_datetime(value: Any) -> datetime | None:
     """Best-effort ISO-8601 datetime parse. Returns ``None`` for absent
     or unparseable values so a Lithos schema drift on optional fields
-    doesn't crash the client (US13 only needs ``resolved_at`` for
-    terminal-state rendering; missing values fall back to the bus event
-    timestamp at the projection layer)."""
+    doesn't crash the client (the projection only needs ``resolved_at``
+    for terminal-state rendering; missing values fall back to the bus
+    event timestamp at the projection layer)."""
     if value is None or value == "":
         return None
     if not isinstance(value, str):
@@ -1404,7 +1398,7 @@ def _raise_if_error_envelope(payload: Mapping[str, Any]) -> None:
     )
 
 
-# ── Note parse helpers (Slice 4 + 5) ───────────────────────────────────
+# ── Note parse helpers ──────────────────────────────────────────────────
 
 
 def _slug_from_path(path: str) -> str:

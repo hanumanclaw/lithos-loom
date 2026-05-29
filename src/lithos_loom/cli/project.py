@@ -1,12 +1,14 @@
-"""``lithos-loom project`` sub-app (Slice 3 capture-macro helper, Slice 4 D23/D30).
+"""``lithos-loom project`` sub-app.
 
-Slice 4 reframes the source of truth: per **D23**, **Lithos is the
-canonical project registry** (slug, status, tags, context body) and
-the TOML ``[projects.<slug>]`` table is just a host-local automation
-overlay (working-tree path, tool-config overrides). The intersection
-is the slug.
+Lithos is the canonical project registry (slug, status, tags, context
+body) and the TOML ``[projects.<slug>]`` table is a host-local automation
+overlay (working-tree path, tool-config overrides). The intersection is
+the slug.
 
-Per **D30** the default ``project list`` shape is therefore:
+The default ``project list`` shape enumerates Lithos via
+``lithos_list(path_prefix="projects/", tags=["project-context"])`` and
+marks each row with whether the local TOML has an automation entry for
+that slug::
 
     slug              status    local
     lithos-loom       active    ✓ (/home/dns/projects/lithos/code/lithos-loom)
@@ -14,18 +16,11 @@ Per **D30** the default ``project list`` shape is therefore:
     edgelands         active    ✗ (no TOML entry on this host)
     old-experiment    archived  ✓ (/home/dns/projects/old-experiment)
 
-— enumerating Lithos via ``lithos_list(path_prefix="projects/",
-tags=["project-context"])`` and marking each row with whether the
-local TOML has an automation entry for that slug.
-
-``--source toml`` preserves the pre-Slice-4 path for hosts that
-don't have a Lithos connection available (Track 2 plugin runners,
-disconnected workstations). The capture macro's
+``--source toml`` falls back to the local TOML ``[projects]`` table
+for hosts without a Lithos connection or when the operator wants to
+inspect their host-local overlay in isolation. The capture macro's
 ``--format json`` invocation gets a stable contract on both sources:
 a JSON array of slug strings, in alphabetical order.
-
-When Slice 5 lands the create-project macro + ``project import`` CLI,
-they live in this same sub-app.
 """
 
 from __future__ import annotations
@@ -68,7 +63,7 @@ from lithos_loom.task_line_parser import parse_doc
 
 project_app = typer.Typer(
     name="project",
-    help="Project-config-aware CLI helpers (Slice 3+).",
+    help="Project-config-aware CLI helpers.",
     no_args_is_help=True,
 )
 
@@ -80,21 +75,20 @@ _FORMAT_TEXT = "text"
 _FORMAT_JSON = "json"
 
 # Source modes. ``lithos`` (default) enumerates from the canonical KB
-# registry per D23. ``toml`` falls back to the local TOML
-# ``[projects]`` table — for hosts without a Lithos connection or
-# when the operator wants to inspect their host-local overlay in
-# isolation.
+# registry. ``toml`` falls back to the local TOML ``[projects]`` table
+# — for hosts without a Lithos connection or when the operator wants
+# to inspect their host-local overlay in isolation.
 _SOURCE_LITHOS = "lithos"
 _SOURCE_TOML = "toml"
 
 _PROJECTS_PATH_PREFIX = "projects/"
 _PROJECT_CONTEXT_TAG = "project-context"
-# The single file the project-create command writes per project. The
-# Slice 4 ``project list`` canonical-doc picker recognises BOTH
-# ``<slug>/context.md`` and ``<slug>/<slug>-project-context.md`` —
-# the latter is the prod convention. We default-create the latter so
-# `project create` lands the doc at the path ``project list`` will
-# happily pick up as the project's canonical context entry.
+# The single file the project-create command writes per project.
+# ``project list`` recognises BOTH ``<slug>/context.md`` and
+# ``<slug>/<slug>-project-context.md`` — the latter is the prod
+# convention. We default-create the latter so ``project create``
+# lands the doc at the path ``project list`` will pick up as the
+# project's canonical context entry.
 _DEFAULT_DOC_FILENAME_TEMPLATE = "{slug}-project-context.md"
 # Validation: a slug must start AND end with [a-z0-9], with hyphens
 # allowed only in between. Matches Lithos's directory-name convention
@@ -138,10 +132,10 @@ def project_list(
         "--source",
         "-s",
         help=(
-            "Where to enumerate from: 'lithos' (default, D23 canonical) "
-            "queries Lithos's projects/ KB. 'toml' falls back to the local "
-            "[projects] table — useful when Lithos is unreachable or you "
-            "want to inspect host-local overlay only."
+            "Where to enumerate from: 'lithos' (default) queries Lithos's "
+            "projects/ KB. 'toml' falls back to the local [projects] table "
+            "— useful when Lithos is unreachable or you want to inspect "
+            "host-local overlay only."
         ),
     ),
 ) -> None:
@@ -223,7 +217,7 @@ def _rows_from_toml(cfg: LoomConfig) -> list[_ProjectRow]:
 
 
 async def _rows_from_lithos(cfg: LoomConfig) -> list[_ProjectRow]:
-    """Default Slice 4 path. Enumerates Lithos via
+    """Enumerates Lithos via
     ``note_list(path_prefix="projects/", tags=["project-context"])``
     and joins against ``cfg.projects`` to mark local-overlay rows.
 
@@ -621,9 +615,9 @@ async def _check_slug_collision_async(*, cfg: LoomConfig, slug: str) -> None:
     :class:`_SlugCollisionError` / :class:`OSError` /
     :class:`LithosClientError` in a :class:`BaseExceptionGroup`).
 
-    Honours PRD D72: greenfield ``--dry-run`` runs the same collision
-    check the real run would, so the operator catches "slug already
-    exists" before committing to the real run.
+    ``--dry-run`` runs the same collision check the real run would,
+    so the operator catches "slug already exists" before committing
+    to the real run.
     """
     collision: _SlugCollisionError | None = None
     deferred_error: OSError | LithosClientError | None = None
@@ -722,7 +716,7 @@ def project_import(
         help=(
             "Project slug. In greenfield mode (default), optional — defaults "
             "to the slugified frontmatter title (or file stem with leading "
-            "'project-' stripped per D75). In --tasks-only mode, REQUIRED."
+            "'project-' stripped). In --tasks-only mode, REQUIRED."
         ),
     ),
     tags: str | None = typer.Option(
@@ -794,11 +788,10 @@ def project_import(
     """Import a local Markdown file as a Lithos project — including its open tasks.
 
     By default extracts ``- [ ]`` lines from the source body as Lithos
-    task entities (with dependency edges from indentation; D63–D66),
-    strips them from the persisted doc body (D59), and creates the
-    project doc + tasks atomically (well — abort-on-first-error per
-    D68, validate-all-then-abort per D68). Pass ``--no-tasks`` to
-    suppress task extraction.
+    task entities (with dependency edges from indentation), strips them
+    from the persisted doc body, and creates the project doc + tasks
+    (validate-all-then-abort on validation failures). Pass ``--no-tasks``
+    to suppress task extraction.
 
     Two modes:
 
@@ -806,7 +799,7 @@ def project_import(
       Refuses if the slug already exists.
     * **--tasks-only**: just creates tasks against an existing
       project. Requires --slug. Refuses if the project doesn't exist
-      (suggests typo matches per D73) or has existing tasks (unless
+      (suggests typo matches) or has existing tasks (unless
       --force-tasks is passed).
 
     Use ``--dry-run`` to preview the plan with no Lithos writes.
@@ -871,10 +864,10 @@ def project_import(
     if slug is not None:
         resolved_slug = slug
     elif isinstance(fm_title, str) and fm_title:
-        # D75: frontmatter title is explicit operator intent, NOT prefix-stripped
+        # Frontmatter title is explicit operator intent, NOT prefix-stripped.
         resolved_slug = _slugify(title)
     else:
-        # D75: default-slug from stem, prefix-stripped
+        # Default-slug from stem, prefix-stripped.
         resolved_slug = _slugify(resolve_default_slug_from_stem(source))
 
     if not _SLUG_RE.match(resolved_slug):
@@ -904,7 +897,7 @@ def project_import(
         plans = graph_plans
 
     # --dry-run: run the same read-only pre-flight the real run would,
-    # then print the plan (D72). Tasks-only verifies project exists +
+    # then print the plan. Tasks-only verifies project exists +
     # lithos_id consistency; greenfield verifies slug doesn't collide.
     # Both paths exit non-zero on pre-flight failure so the operator
     # catches the problem before committing.

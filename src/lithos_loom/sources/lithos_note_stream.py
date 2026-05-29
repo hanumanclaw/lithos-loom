@@ -1,5 +1,5 @@
 """LithosNoteStream — push-based source consuming Lithos's /events SSE for
-``note.{created,updated,deleted}`` (Slice 4 US28).
+``note.{created,updated,deleted}``.
 
 A thin sibling of :class:`~lithos_loom.sources.lithos_event_stream.LithosEventStream`,
 note-shaped. The reasoning for keeping these as separate classes rather
@@ -7,7 +7,7 @@ than parameterising one:
 
 - Half of ``LithosEventStream``'s body is task-domain plumbing —
   ``_known_tasks`` enrichment cache, ``_bootstrap_resolved`` for the
-  US13 TTL-lingering window, ``_with_terminal_status`` override,
+  the TTL-lingering window, ``_with_terminal_status`` override,
   ``task_list`` refresh on every SSE event. None of that applies to
   notes (no terminal state, no claims, no resolved-window replay,
   enrichment is the subscription's job because filtering is too).
@@ -72,9 +72,8 @@ _HANDLED_NOTE_EVENT_TYPES = (
     "note.deleted",
 )
 """Lithos-side note event types we subscribe to. Sent server-side as
-``?types=``. The set is fixed for v1 — Slice 4 only cares about
-project-context lifecycle. When future slices project other doctypes
-the source's tag is its event-type tuple, not its bootstrap query."""
+``?types=``. Currently covers only project-context lifecycle; future
+doc types would extend this tuple and the bootstrap query."""
 
 
 class NoteStreamClient(Protocol):
@@ -111,13 +110,13 @@ class LithosNoteStream:
     max_reconnect_backoff_seconds: float = 30.0
     bootstrap_path_prefix: str = "projects/"
     """Path prefix passed to ``note_list`` at bootstrap. ``"projects/"``
-    for the Slice 4 projection use case. A future "pull-all-KB-docs"
+    targets the project-context projection. A future "pull-all-KB-docs"
     subscription could spawn a separate instance with ``""``."""
     bootstrap_tags: tuple[str, ...] = ("project-context",)
     """Tag filter forwarded to ``note_list`` at bootstrap. Pinned to
-    ``"project-context"`` for Slice 4 so the bootstrap pulls only the
-    docs the projection actually projects (the subscription would
-    filter the rest out anyway — bootstrap just saves the round-trip)."""
+    ``"project-context"`` so the bootstrap pulls only the docs the
+    projection actually projects (the subscription would filter the rest
+    out anyway — bootstrap just saves the round-trip)."""
     bootstrap_limit: int = 100
     """Cap on bootstrap enumeration. Lithos's default page size is
     50; 100 comfortably covers the user's ~20-project working set."""

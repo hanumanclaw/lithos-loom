@@ -6,7 +6,7 @@ Rebuild a project's task-archive "done" file (`<vault>/_lithos/projects/<slug>/<
 lithos-loom project regenerate-done --slug <slug> [flags]
 ```
 
-This complements the live `task-archive` subscription (Slice 6 — see [`docs/prd/task-archive.md`](../prd/task-archive.md)). The subscription appends resolved tasks incrementally as they happen; this command rebuilds the whole file on demand.
+This complements the live `task-archive` subscription (see [`docs/SPECIFICATION.md`](../SPECIFICATION.md) §7.6 and the original PRD at [`docs/prd/archive/task-archive.md`](../prd/archive/task-archive.md)). The subscription appends resolved tasks incrementally as they happen; this command rebuilds the whole file on demand.
 
 ---
 
@@ -95,7 +95,7 @@ Safe, with one narrow caveat. The live archiver keeps appending **new** completi
 
 The one real race: a completion that lands **between** this command's read from Lithos and its atomic file replace is dropped from the rebuilt file. Mitigation: re-run the command, or run it when the project is quiet. A daemon restart re-syncs the archiver's dedup set from the regenerated file. Because the op is manual and re-runnable, there's no hard lock.
 
-The write itself is atomic (dot-prefixed temp + `os.replace`, the same #52-safe path the projection uses), and the dir-watcher excludes `-done.md`, so regenerating never triggers a `note-push` or reopen-request.
+The write itself is atomic (dot-prefixed temp + `os.replace`, the same Obsidian-Sync-safe path the projection uses), and the dir-watcher excludes `-done.md`, so regenerating never triggers a `note-push` or reopen-request.
 
 ---
 

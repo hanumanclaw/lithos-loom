@@ -4,20 +4,16 @@ milestone: M1–M5
 status: draft
 target_version: 1.0.0
 references:
-  - docs/PLAN.md (locked decisions, ambitious roadmap A1-A10)
-  - docs/prd/mvp.md (the MVP this builds upon)
+  - docs/SPECIFICATION.md (implemented surface — architecture, plugin contract, event bus)
+  - docs/prd/mvp.md (Track 2 plugin contract — orchestration shipped, plugin bodies queued)
+  - docs/prd/archive/integration.md (Obsidian bridge PRD — shipped)
   - /home/dns/projects/lithos/code/lithos/docs/SPECIFICATION.md (Lithos task + knowledge surface)
-  - Lithos KB projects/lithos-loom/lithos-loom-architecture-design.md
-  - Lithos KB projects/lithos-loom/lithos-loom-requirements.md
-  - Lithos KB projects/lithos-loom/lithos-loom-future-enhancements.md
-  - Lithos KB projects/lithos-loom/lithos-coding-mcp-requirements.md
-  - Lithos KB projects/lithos-loom/conveyer-notes.md
 labels: [needs-triage, lithos-loom, orchestrator, full-system]
 ---
 
 # Lithos Loom — Full Automated Workflow System
 
-> **Re-prioritisation notice (2026-05-05):** A1–A10 sequencing now follows **Track 1** completion. Track 1 (the Lithos ↔ Obsidian bridge — [docs/prd/integration.md](integration.md)) ships first; **Track 2** ([docs/prd/mvp.md](mvp.md)) ships second; the A1–A10 layer described below stacks on top. The `sources → bus → subscribers` architecture pre-invested in Track 1 makes A6 (A2A endpoint), A7 (GitHub webhook receiver), and the SSE event subscriber from US-53a additive (each is a new source) rather than refactors. See [docs/PLAN.md](../PLAN.md) for the integrated decision table (D1–D22).
+> **Status (2026-05-29):** The Obsidian bridge has shipped and the orchestration spine is in place. Track 2 plugin bodies (`prd-decompose`, `story-implement`, `story-review-human`) are queued; this roadmap layers on top of them. The `sources → bus → subscribers` architecture already shipped makes A6 (A2A endpoint), A7 (GitHub webhook receiver), and the SSE event subscriber from US-53a additive (each is a new source) rather than refactors. See [docs/SPECIFICATION.md](../SPECIFICATION.md) §2 for the implemented architecture.
 
 ## Problem Statement
 
@@ -39,7 +35,7 @@ The result: the MVP is a proof, not a daily-workflow tool. To replace Ralph++ as
 
 ## Solution
 
-Layer the ambitious roadmap items A1–A10 from PLAN.md onto the MVP. Each is independently shippable; this PRD enumerates what "done" means for each layer and how they fit together.
+Layer the ambitious roadmap items A1–A10 onto the Track 2 MVP. Each is independently shippable; this PRD enumerates what "done" means for each layer and how they fit together.
 
 The end state:
 
@@ -207,7 +203,7 @@ Ordered by ambitious-roadmap layer, build sequence within each layer.
 
 **Routing and chaining decisions:**
 
-- Tag-based handoffs remain the default (BR3 from PLAN.md)
+- Tag-based handoffs remain the default
 - `next_route` field in route config provides explicit chaining for sequential workflows (PRD-generate → PRD-review-agent → PRD-review-human → PRD-decompose), so the chain isn't fragile to tag rename
 - `conditions` field allows simple metadata-based branching (e.g. `task.meta.prd_lines > 500 → trigger:prd-split`) without invoking the brain
 - Brain (`decide-next`) is invoked only when configured via `decide_via_brain = true` on a route, or when `review_policy = "brain-decide"`
@@ -283,7 +279,7 @@ The following remain out of scope even for the full system, deferred to later ma
 
 ## Further Notes
 
-- **Build order in PLAN.md is the authoritative sequencing.** A1 → A2 → A3 → A9 (pulled forward) → A4 → A5 → A8 → A6 → A7 → A10. Each layer is independently shippable; the order minimises context-switches and brings the highest-leverage items earliest.
+- **Authoritative sequencing.** A1 → A2 → A3 → A9 (pulled forward) → A4 → A5 → A8 → A6 → A7 → A10. Each layer is independently shippable; the order minimises context-switches and brings the highest-leverage items earliest.
 - **Why A9 (`lithos-coding-mcp`) is pulled forward.** Without it, story prompts must include the entire PRD body. As PRD size grows this becomes the dominant cost. With it, Claude pulls relevant slices on demand and writes ADRs back, so the KB compounds as work happens. Once you've built A2 (`prd-generate` + `prd-review`) you'll feel the prompt-size pain immediately, so A9 should ship in week 2.
 - **The conveyor patterns explicitly adopted.** Stateless plugins; filesystem progress checkpoints; prefixed findings as machine-parseable breadcrumbs (`[Plan]`, `[Drift]`, `[Recovery]`, `[Friction]`, `[ReviewPending]`, `[Cost]`, `[BrainDecision]`); friction-loop self-improvement; stream-json captured to disk.
 - **The conveyor patterns explicitly NOT adopted.** Jira-as-queue (Lithos is the queue); tmux-per-worker (subprocess + work-dir is enough; tmux can be added per-plugin if useful for debugging); cron-only scheduling (Loom's daemon polls; cron-style scheduling is a `loom-improve` schedule helper, not the primary trigger).

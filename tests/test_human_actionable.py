@@ -1,11 +1,12 @@
-"""Unit tests for ``is_human_actionable`` (Slice 1 US8, D6 semantics).
+"""Unit tests for ``is_human_actionable``.
 
 The function is pure: ``(Task, routes, ObsidianSyncConfig) -> bool``.
 All tests construct minimal fixtures and assert the decision directly.
 
-D6 from ``docs/prd/integration.md``:
-  "Project a Lithos task iff is_human_actionable(task) — open AND not
-  claimable by any route, OR claimed by a human_blocking = true route."
+Projection rule: an open task is human-actionable iff (a) no route is
+claimable against it, OR (b) a ``human_blocking = true`` route currently
+holds the claim. A route is claimable when every tag in its ``match.tags``
+is present on the task (same all-tags semantic the bus enforces).
 """
 
 from __future__ import annotations
@@ -74,10 +75,24 @@ def test_open_orphan_with_no_routes_is_actionable() -> None:
 
 
 def test_open_task_with_no_matching_route_is_actionable() -> None:
-    """A task whose tags don't intersect any route's match.tags is an
+    """A task whose tags don't fully cover any route's match.tags is an
     orphan — no automation will pick it up."""
     routes = [_route("r1", tags=("trigger:other",), human_blocking=False)]
     assert is_human_actionable(_task(tags=("needs-review",)), routes, _cfg()) is True
+
+
+def test_multi_tag_route_partial_overlap_treats_task_as_orphan() -> None:
+    """Regression: a multi-tag route ``["trigger:foo", "needs:bar"]`` must
+    NOT be considered claimable against a task tagged only ``trigger:foo``.
+
+    The bus matcher requires all listed tags to be present, so the
+    route-runner would never claim the task. Before this guard, the
+    helper used any-overlap semantics and reported the task as claimable,
+    hiding it from Obsidian permanently — the worst kind of silent loss.
+    """
+    routes = [_route("multi", tags=("trigger:foo", "needs:bar"), human_blocking=False)]
+    task = _task(tags=("trigger:foo",))  # missing "needs:bar"
+    assert is_human_actionable(task, routes, _cfg()) is True
 
 
 # ── D6 second disjunct: claimed by a human_blocking route ──────────────

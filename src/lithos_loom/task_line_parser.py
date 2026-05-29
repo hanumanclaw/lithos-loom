@@ -1,17 +1,16 @@
 """Pure parser for `- [ ]` task lines in a project import source doc.
 
-Used by Slice 5's bulk-task-import enhancement on ``project import``
-(see ``docs/prd/bulk-task-import.md``). Extracts open-task lines, parses
-Tasks-plugin metadata (tags, priority emojis, ``#project/<slug>``
-routing), and returns the doc body with extracted lines stripped — so
-the project-context doc stores narrative only, and tasks live as real
-Lithos task entities (D59 single source of truth).
+Extracts open-task lines, parses Tasks-plugin metadata (tags, priority
+emojis, ``#project/<slug>`` routing), and returns the doc body with
+extracted lines stripped — so the project-context doc stores narrative
+only, and tasks live as real Lithos task entities (tasks are the single
+source of truth, not prose).
 
 The module is intentionally I/O-free. The CLI layer (``cli/project.py``)
 owns reading the file and writing to Lithos; this module just parses.
 
-The ``TAG_REGEX`` is exported so a future capture-macro-tag-parsing PRD
-can reuse the exact same contract (per D61 cross-reference to D40).
+The ``TAG_REGEX`` is exported so other CLI surfaces can reuse the same
+tag-parsing contract.
 """
 
 from __future__ import annotations
@@ -20,12 +19,11 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-# Tag pattern per D61 (cross-references D40 in the capture-macro PRD).
-# Allowed chars: ``[A-Za-z0-9_/-]``. Must be preceded by whitespace or
-# line start so ``foo#bar`` (where ``#bar`` isn't a tag) isn't picked
-# up. The all-digit exclusion (``#123`` isn't a tag) is applied in the
-# extractor below, not in the regex itself — keeping the exported regex
-# simple so callers can swap their own filter if needed.
+# Tag pattern: allowed chars ``[A-Za-z0-9_/-]``. Must be preceded by
+# whitespace or line start so ``foo#bar`` (where ``#bar`` isn't a tag)
+# isn't picked up. The all-digit exclusion (``#123`` isn't a tag) is
+# applied in the extractor below, not in the regex itself — keeping the
+# exported regex simple so callers can swap their own filter if needed.
 TAG_REGEX = re.compile(r"(?:^|(?<=\s))#[A-Za-z0-9_/-]+")
 
 # Priority emojis recognised on import. Order = precedence: when
@@ -41,7 +39,7 @@ PRIORITY_EMOJI_MAP: dict[str, str] = {
 }
 
 # Marker an operator puts in a parent task description to flip its
-# children from parallel (D65 default) to sequential. Case-sensitive
+# children from parallel (the default) to sequential. Case-sensitive
 # and must be a standalone token so it can't false-positive on
 # ``[sequential planning]`` or similar prose.
 _SEQUENTIAL_MARKER = "[sequential]"
@@ -49,7 +47,7 @@ _SEQUENTIAL_MARKER = "[sequential]"
 # Task-line detector: ``- [ ]`` after optional leading whitespace.
 # Captures the indent prefix and the rest of the line. Other markers
 # (``[x]``, ``[/]``, ``[-]``, ``[>]``) are intentionally NOT matched —
-# per D58 they stay verbatim in the body as historical context.
+# they stay verbatim in the body as historical context.
 _TASK_LINE_RE = re.compile(r"^(\s*)-\s+\[ \]\s*(.*)$")
 
 # Fenced code block opener/closer: 3+ backticks or 3+ tildes at line
@@ -59,14 +57,14 @@ _FENCE_RE = re.compile(r"^(?P<marker>`{3,}|~{3,})")
 
 # Blockquote: ``>`` after optional leading whitespace. We treat the
 # whole line as quoted (no nested-quote parsing); any ``- [ ]`` inside
-# is ignored per D67.
+# is ignored.
 _BLOCKQUOTE_RE = re.compile(r"^\s*>")
 
-# Auto-added project-routing tag prefix per D61. Tags of the form
+# Auto-added project-routing tag prefix. Tags of the form
 # ``#project/<slug>`` are filtered out of the per-task tag list:
 # matching importing slug → silently consumed (auto-added later);
 # different slug → flagged as ``cross_project_tag`` for validation
-# refusal per D62.
+# refusal.
 _PROJECT_TAG_PREFIX = "project/"
 
 ValidationKind = Literal[
@@ -97,7 +95,10 @@ class ParsedTaskLine:
 
 @dataclass(frozen=True)
 class ValidationError:
-    """One problem in the source doc (surfaced via the D68 abort report)."""
+    """One validation problem found in the source doc.
+
+    Surfaced via the validate-all-then-abort report before any Lithos writes.
+    """
 
     line_number: int
     kind: ValidationKind
@@ -111,9 +112,9 @@ def parse_doc(
 
     Single-pass state machine tracking three contexts (top-level,
     fenced-code-block, blockquote). Only matches ``- [ ]`` at line
-    start (after optional leading whitespace) per D67. Lines inside
-    code blocks or blockquotes are ignored as task candidates and pass
-    through to the stripped body verbatim.
+    start (after optional leading whitespace). Lines inside code blocks
+    or blockquotes are ignored as task candidates and pass through to
+    the stripped body verbatim.
 
     Returns:
         (parsed_lines, errors, stripped_body) where ``parsed_lines``
@@ -243,14 +244,14 @@ def _extract_tags(text: str, importing_slug: str) -> tuple[list[str], str | None
     """Return (tags, cross_project_tag_or_None, text_with_tags_stripped).
 
     Iterates ``TAG_REGEX`` matches in source order, deduping. All-digit
-    matches (e.g. ``#123``) are NOT tags per D40 — they stay as
-    literal text in the description.
+    matches (e.g. ``#123``) are NOT tags — they stay as literal text in
+    the description (so issue references like ``#123`` are preserved).
 
     ``#project/<importing-slug>`` is silently consumed (auto-added
     later if missing). ``#project/<other-slug>`` is captured into the
-    ``cross_project_tag`` return slot for validation refusal per D62 —
-    the first such tag wins; subsequent ones are ignored (the whole
-    import will abort regardless).
+    ``cross_project_tag`` return slot for validation refusal — the first
+    such tag wins; subsequent ones are ignored (the whole import will
+    abort regardless).
     """
     tags: list[str] = []
     seen: set[str] = set()
