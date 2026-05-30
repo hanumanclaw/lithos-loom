@@ -1,9 +1,10 @@
 # lithos-loom
 
-Workflow orchestration daemon for [Lithos](https://github.com/agent-lore/lithos) tasks. Two surfaces:
+Workflow orchestration daemon for [Lithos](https://github.com/agent-lore/lithos) tasks. Three surfaces:
 
 - **Obsidian bridge.** Projects open Lithos tasks into an Obsidian-Tasks-compatible inbox; pushes tick / priority / due-date / body edits back to Lithos; bidirectionally syncs project-context docs; Templater macros + CLI for capture, project create, and project import.
 - **Route-runner.** Subscribes to Lithos's SSE event stream, matches `lithos.task.created` and `lithos.task.released` events against TOML-configured routes (a task must carry every tag in the route's `match.tags`), claims tasks collision-safely, and dispatches subprocess plugins. Plugin scaffolding for `prd-decompose`, `story-implement`, `story-review-human` is in place; bodies are stubs. Tag edits on existing tasks don't trigger pickup today — they arrive as `task.updated`, which the route-runner doesn't subscribe to.
+- **GitHub issue watcher.** Polls every project-context doc tagged `github-watch` for new and updated open issues on its mapped GitHub repo, materialises each unseen issue as a Lithos task carrying `metadata.github_issue_url`, and keeps the two sides aligned both directions: GH→Lithos mirrors title / body / labels / close; Lithos→GH mirrors completion / cancellation (as `state_reason=completed` / `not_planned`) and title renames. Reopen on the GH side posts a one-shot `[ReopenRequested]` finding. Per-project mapping is set via `lithos-loom project set-github-repo`; per-host gate is `[github_watcher] enabled = true`.
 
 It is the orchestration layer that connects Lithos to coding agents — replacing the [Ralph++](https://github.com/snarktank/ralph) approach with a fine-grained, fault-tolerant pipeline whose state lives in Lithos and whose hot state lives on the host filesystem.
 
@@ -12,6 +13,7 @@ It is the orchestration layer that connects Lithos to coding agents — replacin
 - **[`docs/SPECIFICATION.md`](docs/SPECIFICATION.md)** — architecture, full TOML reference, CLI reference, plugin contract, event bus, projection rules, finding prefixes, error codes. Start here.
 - [`docs/cli/project-import.md`](docs/cli/project-import.md) — `project import` full reference.
 - [`docs/cli/project-regenerate-done.md`](docs/cli/project-regenerate-done.md) — `project regenerate-done` full reference.
+- [`docs/cli/project-set-github-repo.md`](docs/cli/project-set-github-repo.md) — `project set-github-repo` / `enable-github` / `disable-github` reference.
 - [`docs/macros/README.md`](docs/macros/README.md) — Templater macro install + behaviour notes.
 - [`docs/result-schema.json`](docs/result-schema.json) — plugin `result.json` JSON Schema.
 - [`docs/prd/`](docs/prd/) — PRDs for queued work (Track 2 plugin bodies, A1–A10 roadmap, GitHub watcher, capture-macro tag parsing). Shipped PRDs are under [`docs/prd/archive/`](docs/prd/archive/).
@@ -137,6 +139,8 @@ Lithos and Influx run as docker services because they're services — long-lived
 | `lithos-loom project create --title T [--slug S] …` | Create a new Lithos project-context doc. Used by the `create-project` macro. |
 | `lithos-loom project import <source> [flags]` | Import an existing Markdown file as a Lithos project; extract `- [ ]` lines as Lithos tasks. See [`docs/cli/project-import.md`](docs/cli/project-import.md). |
 | `lithos-loom project regenerate-done --slug S [flags]` | Rebuild `<slug>-done.md` from Lithos (all resolved tasks). See [`docs/cli/project-regenerate-done.md`](docs/cli/project-regenerate-done.md). |
+| `lithos-loom project set-github-repo <slug> <owner/name>` | Bind a GH repo to a project for the issue watcher. See [`docs/cli/project-set-github-repo.md`](docs/cli/project-set-github-repo.md). |
+| `lithos-loom project enable-github <slug>` / `disable-github <slug>` | Toggle GH issue watching for a project (preserves the repo mapping). |
 | `lithos-loom obsidian-sync show [--format text\|json]` | Print the resolved `[obsidian_sync]` block. Used by the capture macro. |
 
 Full CLI reference (every flag, every exit code) is in [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md) §4.

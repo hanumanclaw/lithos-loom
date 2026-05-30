@@ -149,6 +149,19 @@ def apply_marker(body: str | None, task_id: str) -> str:
     return f"{text}\n\n{canonical}"
 
 
+def strip_marker(body: str | None) -> str:
+    """Return ``body`` with any ``<!-- lithos:<id> -->`` marker removed.
+
+    Slice 7.2 mirrors GH issue body → Lithos task description. The Loom-
+    managed marker is bookkeeping noise from the operator's perspective
+    and must not bleed into the projected task surface, so it is stripped
+    before comparison + write.
+    """
+    if not body:
+        return ""
+    return _MARKER_RE.sub("", body).strip()
+
+
 # ── gh auth token resolver ────────────────────────────────────────────
 
 
@@ -233,10 +246,43 @@ class GitHubClient:
         absolute and carry their own query string, so they bypass the
         ``base_url`` + ``path`` concatenation.
         """
+        return await self._request_with_rate_limit_retry(
+            "GET", url, params=params, json=None
+        )
+
+    async def _patch(self, path: str, *, json: dict[str, Any]) -> httpx.Response:
+        url = f"{self.base_url}{path}"
+        return await self._request_with_rate_limit_retry(
+            "PATCH", url, params=None, json=json
+        )
+
+    async def _request_with_rate_limit_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None,
+        json: dict[str, Any] | None,
+    ) -> httpx.Response:
+        """Issue a request, sleeping until ``X-RateLimit-Reset`` on 403+remaining=0.
+
+        Shared by GET (issue listing, single-issue fetch) and PATCH
+        (marker write, title update, close mirror) because PRD #70
+        requires graceful backoff for *all* GitHub operations — the
+        earlier code only retried GETs and converted rate-limited
+        PATCHes into dropped auth-style failures (PR-review finding 5,
+        2026-05-30).
+        """
         attempts = 0
         while True:
             attempts += 1
-            response = await self.http.get(url, params=params, headers=self._headers())
+            response = await self.http.request(
+                method,
+                url,
+                params=params,
+                json=json,
+                headers=self._headers(),
+            )
             if response.status_code != 403:
                 return response
             # 403 is overloaded: rate-limit signal vs permission-denied. Distinguish
@@ -246,10 +292,6 @@ class GitHubClient:
             if attempts > self._max_rate_limit_retries:
                 raise GitHubRateLimitError(f"rate limit retries exhausted for {url}")
             await _wait_for_rate_limit_reset(response)
-
-    async def _patch(self, path: str, *, json: dict[str, Any]) -> httpx.Response:
-        url = f"{self.base_url}{path}"
-        return await self.http.patch(url, json=json, headers=self._headers())
 
     async def list_issues_since(
         self,
@@ -322,6 +364,46 @@ class GitHubClient:
             f"/repos/{repo}/issues/{number}", json={"body": body}
         )
         _raise_for_status(response, repo=repo)
+
+    async def update_issue_fields(
+        self,
+        repo: str,
+        number: int,
+        *,
+        title: str | None = None,
+        state: str | None = None,
+        state_reason: str | None = None,
+    ) -> Issue | None:
+        """PATCH the issue with only the non-None fields. Slice-7.2 surface.
+
+        Used by the Lithos→GH push handler:
+
+        - title push (operator renamed the Lithos task) → ``title=...``
+        - close mirror (Lithos task completed / cancelled) →
+          ``state="closed"`` + ``state_reason="completed"|"not_planned"``
+
+        Returns the post-PATCH Issue (so callers can verify state), or
+        ``None`` when no fields were supplied (defensive no-op so handlers
+        that pre-compute "nothing changed" don't burn a request).
+
+        ``body`` updates remain on :meth:`update_issue_body` — that path
+        also re-fetches before writing to dodge clobbering operator edits
+        of the linkage marker (D46). Title / state writes touch
+        independent fields and have no marker-collision risk.
+        """
+        payload: dict[str, Any] = {}
+        if title is not None:
+            payload["title"] = title
+        if state is not None:
+            payload["state"] = state
+        if state_reason is not None:
+            payload["state_reason"] = state_reason
+        if not payload:
+            return None
+        response = await self._patch(f"/repos/{repo}/issues/{number}", json=payload)
+        _raise_for_status(response, repo=repo)
+        parsed = _parse_issues_response([response.json()], repo=repo)
+        return parsed[0] if parsed else None
 
 
 # ── Response error handling ───────────────────────────────────────────

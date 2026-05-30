@@ -1,15 +1,20 @@
 # `lithos-loom project set-github-repo` / `enable-github` / `disable-github`
 
 Three sibling subcommands that configure the per-project GitHub issue
-watcher (Slice 7.1 — see [`docs/SPECIFICATION.md`](../SPECIFICATION.md)
-§2.2 and §4.10–§4.12). They manage two tags on the canonical
-project-context doc (`projects/<slug>/<slug>-project-context.md`):
+watcher — see [`docs/SPECIFICATION.md`](../SPECIFICATION.md) §2.2 and
+§4.10–§4.12. They manage two tags on the canonical project-context
+doc (`projects/<slug>/<slug>-project-context.md`):
 
 - **`github-repo:<owner>/<name>`** — exactly one per project; carries
   the repo mapping. Replaces an existing tag on re-run so a typo is
   fixable.
 - **`github-watch`** — presence enables the watcher's polling for the
   project. Removing it pauses watching without losing the repo mapping.
+- **`github-exclude-label:<name>`** (zero or more) — drop matching
+  issues at import time. Edit the tag list directly via MCP / Lithos to
+  add or remove these; no dedicated CLI command yet.
+- **`github-exclude-author:<login>`** (zero or more) — same shape;
+  drop issues opened by these GitHub logins (e.g. `dependabot[bot]`).
 
 The host-side watcher subprocess is gated separately by
 `[github_watcher].enabled` in TOML; the CLI does not start or stop the
@@ -94,4 +99,4 @@ github watching enabled on projects/lithos-loom/lithos-loom-project-context.md
 ## See also
 
 - [`docs/SPECIFICATION.md`](../SPECIFICATION.md) §2.2 — full data flow for the GitHub issue mirror.
-- [`docs/prd/github-issue-watcher.md`](../prd/github-issue-watcher.md) — design decisions D45 (storage), D46 (linkage marker), D47 (closure mapping), D50 (per-host gate).
+- [`docs/prd/archive/github-issue-watcher.md`](../prd/archive/github-issue-watcher.md) — design decisions D45 (storage), D46 (linkage marker), D47 (closure mapping), D50 (per-host gate), plus Slice 7.2 stories #71–#75 covering bidirectional close + drift sync.

@@ -27,8 +27,10 @@ from lithos_loom.lithos_client import Note, NoteSummary, WriteResult
 from lithos_loom.sources.github_issue_watcher import (
     GITHUB_ISSUE_EVENT_TYPE,
     GitHubIssueWatcher,
+    WatchedRepo,
     format_cursors,
     parse_cursors,
+    parse_stuck,
 )
 
 # ── Cursor doc format ─────────────────────────────────────────────────
@@ -80,12 +82,23 @@ def test_parse_cursors_accepts_z_suffix() -> None:
 # ── Test plumbing ─────────────────────────────────────────────────────
 
 
-def _summary(*, slug: str, repo: str | None, watching: bool) -> NoteSummary:
+def _summary(
+    *,
+    slug: str,
+    repo: str | None,
+    watching: bool,
+    exclude_labels: tuple[str, ...] = (),
+    exclude_authors: tuple[str, ...] = (),
+) -> NoteSummary:
     tags: list[str] = ["project-context"]
     if repo is not None:
         tags.append(f"{GITHUB_REPO_TAG_PREFIX}{repo}")
     if watching:
         tags.append(GITHUB_WATCH_TAG)
+    for label in exclude_labels:
+        tags.append(f"github-exclude-label:{label}")
+    for author in exclude_authors:
+        tags.append(f"github-exclude-author:{author}")
     return NoteSummary(
         id=f"doc-{slug}",
         title=slug.title(),
@@ -148,6 +161,7 @@ def _make_watcher(
     github: Any,
     lithos: Any,
     bus: EventBus | None = None,
+    dispatch: Any = None,
 ) -> GitHubIssueWatcher:
     return GitHubIssueWatcher(
         github=cast(GitHubClient, github),
@@ -156,6 +170,7 @@ def _make_watcher(
         poll_interval_seconds=60,
         coord_doc_path="projects/_lithos-loom-internal/github-watcher-state.md",
         agent_id="test-agent",
+        dispatch=dispatch,
     )
 
 
@@ -185,8 +200,8 @@ async def test_refresh_watch_list_picks_up_watched_projects() -> None:
     watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
     await watcher._refresh_watch_list()
     assert watcher._watch_list == {
-        "lithos-loom": "agent-lore/lithos-loom",
-        "lithos": "agent-lore/lithos",
+        "lithos-loom": WatchedRepo(repo="agent-lore/lithos-loom"),
+        "lithos": WatchedRepo(repo="agent-lore/lithos"),
     }
     # Watch-tag filter actually flows into the query.
     call = lithos.note_list.await_args
@@ -205,7 +220,68 @@ async def test_refresh_watch_list_skips_projects_without_repo_tag() -> None:
     )
     watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
     await watcher._refresh_watch_list()
-    assert watcher._watch_list == {"lithos": "agent-lore/lithos"}
+    assert watcher._watch_list == {"lithos": WatchedRepo(repo="agent-lore/lithos")}
+
+
+@pytest.mark.asyncio
+async def test_refresh_resets_cursor_when_exclude_filter_changes() -> None:
+    """PR-review finding 5 (round 3, 2026-05-30): when the operator
+    relaxes a ``github-exclude-label:`` tag, the watcher must drop the
+    repo cursor so previously-skipped issues re-surface. Otherwise the
+    cursor sits past their ``updated_at`` and the next poll won't see
+    them until someone edits them on GitHub.
+    """
+    lithos = _fake_lithos_client(
+        note_list_return=[
+            _summary(
+                slug="lithos-loom",
+                repo="agent-lore/lithos-loom",
+                watching=True,
+                exclude_labels=("automated",),
+            )
+        ]
+    )
+    watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
+    await watcher._refresh_watch_list()
+    # Watcher polled for a while; cursor is set.
+    watcher._cursors["agent-lore/lithos-loom"] = datetime(2026, 5, 29, tzinfo=UTC)
+
+    # Operator removes the exclude tag.
+    lithos.note_list = AsyncMock(
+        return_value=[
+            _summary(
+                slug="lithos-loom",
+                repo="agent-lore/lithos-loom",
+                watching=True,
+                exclude_labels=(),
+            )
+        ]
+    )
+    await watcher._refresh_watch_list()
+
+    # Cursor reset — next poll bootstrap-walks open issues so the
+    # previously-excluded ones surface.
+    assert "agent-lore/lithos-loom" not in watcher._cursors
+
+
+@pytest.mark.asyncio
+async def test_refresh_resets_cursor_when_repo_unwatched_and_rewatched() -> None:
+    """Removing the watch enrolment and re-adding it later must not
+    silently resume from the stale cursor — operator might have meant
+    a clean re-bootstrap."""
+    lithos = _fake_lithos_client(
+        note_list_return=[
+            _summary(slug="lithos-loom", repo="agent-lore/lithos-loom", watching=True)
+        ]
+    )
+    watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
+    await watcher._refresh_watch_list()
+    watcher._cursors["agent-lore/lithos-loom"] = datetime(2026, 5, 29, tzinfo=UTC)
+
+    # Disable watching.
+    lithos.note_list = AsyncMock(return_value=[])
+    await watcher._refresh_watch_list()
+    assert "agent-lore/lithos-loom" not in watcher._cursors
 
 
 @pytest.mark.asyncio
@@ -218,12 +294,16 @@ async def test_refresh_watch_list_preserves_state_on_transport_failure() -> None
     )
     watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
     await watcher._refresh_watch_list()
-    assert watcher._watch_list == {"lithos-loom": "agent-lore/lithos-loom"}
+    assert watcher._watch_list == {
+        "lithos-loom": WatchedRepo(repo="agent-lore/lithos-loom")
+    }
     # Second call raises transport error.
     lithos.note_list.side_effect = OSError("connection refused")
     await watcher._refresh_watch_list()
     # State preserved.
-    assert watcher._watch_list == {"lithos-loom": "agent-lore/lithos-loom"}
+    assert watcher._watch_list == {
+        "lithos-loom": WatchedRepo(repo="agent-lore/lithos-loom")
+    }
 
 
 # ── _load_cursors_from_coord_doc ──────────────────────────────────────
@@ -276,7 +356,7 @@ async def test_poll_one_repo_publishes_issue_events() -> None:
     github = _fake_github_client()
     github.list_issues_since = AsyncMock(return_value=[issue])
     watcher = _make_watcher(github=github, lithos=_fake_lithos_client(), bus=bus)
-    watcher._watch_list = {"lithos-loom": "agent-lore/lithos-loom"}
+    watcher._watch_list = {"lithos-loom": WatchedRepo(repo="agent-lore/lithos-loom")}
 
     await watcher._poll_one_repo(slug="lithos-loom", repo="agent-lore/lithos-loom")
 
@@ -286,12 +366,11 @@ async def test_poll_one_repo_publishes_issue_events() -> None:
     assert event.payload["slug"] == "lithos-loom"
     assert event.payload["repo"] == "agent-lore/lithos-loom"
     assert event.payload["number"] == 42
-    # Cursor advanced PAST the issue's updated_at (GitHub's `since` is
-    # inclusive, so the next poll would re-fetch the boundary issue
-    # forever without the +1s nudge).
-    assert watcher._cursors["agent-lore/lithos-loom"] == issue.updated_at + timedelta(
-        seconds=1
-    )
+    # Cursor sits exactly at the boundary issue's updated_at; the +1s
+    # nudge that used to live here was removed because it silently
+    # dropped same-second sibling updates (PR-review finding 3,
+    # 2026-05-30). Idempotent replay is the safer tradeoff.
+    assert watcher._cursors["agent-lore/lithos-loom"] == issue.updated_at
 
 
 @pytest.mark.asyncio
@@ -376,21 +455,268 @@ async def test_poll_one_repo_advances_cursor_to_latest_when_multiple_issues() ->
     watcher = _make_watcher(github=github, lithos=_fake_lithos_client(), bus=bus)
 
     await watcher._poll_one_repo(slug="x", repo="agent-lore/lithos-loom")
-    # Cursor is max(updated_at) + 1s; see _CURSOR_ADVANCE rationale.
-    assert watcher._cursors["agent-lore/lithos-loom"] == late.updated_at + timedelta(
-        seconds=1
-    )
+    # PR-review finding 3 (2026-05-30): cursor is exactly max(updated_at).
+    # The earlier +1s nudge silently dropped any *other* issue updated
+    # within the same wall second; correctness beats one extra idempotent
+    # task_list call.
+    assert watcher._cursors["agent-lore/lithos-loom"] == late.updated_at
 
 
 @pytest.mark.asyncio
-async def test_poll_one_repo_cursor_advances_past_boundary_to_break_replay_loop() -> (
-    None
-):
-    """Soak 2026-05-29: GitHub's `since=` filter is inclusive, so
-    persisting the exact observed-max ``updated_at`` re-fetched the
-    same boundary issue every poll forever (visible in the soak log as
-    ``cursor T → T``). The cursor advance must move strictly past the
-    boundary so a second poll with no new activity returns nothing.
+async def test_poll_one_repo_holds_cursor_when_dispatch_fails_mid_batch() -> None:
+    """PR-review finding 1 (2026-05-30): with the bus path, a queue-full
+    drop or a handler exception silently advanced the cursor past
+    issues that were never reconciled. With an injected inline
+    dispatcher the watcher walks issues in updated_at-asc order and
+    holds the cursor at the last successfully dispatched issue's
+    timestamp; the failed issue's updated_at is re-fetched next poll.
+    """
+    bus = EventBus()
+    bus.subscribe(event_types=(GITHUB_ISSUE_EVENT_TYPE,), queue_size=16)
+    first = _make_issue(
+        number=1, updated_at=datetime(2026, 5, 29, 10, 0, 0, tzinfo=UTC)
+    )
+    second = _make_issue(
+        number=2, updated_at=datetime(2026, 5, 29, 11, 0, 0, tzinfo=UTC)
+    )
+    third = _make_issue(
+        number=3, updated_at=datetime(2026, 5, 29, 12, 0, 0, tzinfo=UTC)
+    )
+    github = _fake_github_client()
+    github.list_issues_since = AsyncMock(return_value=[first, second, third])
+
+    dispatched: list[int] = []
+
+    async def flaky_dispatch(event: Any) -> None:
+        n = event.payload["number"]
+        dispatched.append(n)
+        if n == 2:
+            raise RuntimeError("Lithos went away")
+
+    watcher = _make_watcher(
+        github=github,
+        lithos=_fake_lithos_client(),
+        bus=bus,
+        dispatch=flaky_dispatch,
+    )
+
+    await watcher._poll_one_repo(slug="x", repo="agent-lore/lithos-loom")
+
+    # Issue 1 dispatched, issue 2 failed → loop stopped; issue 3 never tried.
+    assert dispatched == [1, 2]
+    # Cursor sits at the latest successful issue (1), not the failed one
+    # (2) and not the latest seen (3) — next poll re-fetches 2 onward.
+    assert watcher._cursors["agent-lore/lithos-loom"] == first.updated_at
+
+
+@pytest.mark.asyncio
+async def test_poll_one_repo_does_not_advance_cursor_when_first_issue_fails() -> None:
+    """First-issue dispatch failure: cursor stays at its prior value
+    (or absent) so the next poll re-fetches the same boundary.
+    """
+    bus = EventBus()
+    bus.subscribe(event_types=(GITHUB_ISSUE_EVENT_TYPE,), queue_size=16)
+    issue = _make_issue(
+        number=1, updated_at=datetime(2026, 5, 29, 10, 0, 0, tzinfo=UTC)
+    )
+    github = _fake_github_client()
+    github.list_issues_since = AsyncMock(return_value=[issue])
+
+    async def failing_dispatch(_: Any) -> None:
+        raise RuntimeError("Lithos went away")
+
+    watcher = _make_watcher(
+        github=github,
+        lithos=_fake_lithos_client(),
+        bus=bus,
+        dispatch=failing_dispatch,
+    )
+    prior = datetime(2026, 5, 1, tzinfo=UTC)
+    watcher._cursors["agent-lore/lithos-loom"] = prior
+
+    await watcher._poll_one_repo(slug="x", repo="agent-lore/lithos-loom")
+
+    assert watcher._cursors["agent-lore/lithos-loom"] == prior
+
+
+@pytest.mark.asyncio
+async def test_stuck_issue_retried_by_number_next_poll() -> None:
+    """PR-review finding 2 (round 4, 2026-05-30): an issue that failed
+    dispatch during bootstrap (cursor None) and then closes on GH
+    before the next poll would disappear from the next state="open"
+    walk. The watcher now re-fetches stuck issues by number via
+    ``get_issue`` so the close-before-retry race no longer strands the
+    linked Lithos task.
+    """
+    bus = EventBus()
+    bus.subscribe(event_types=(GITHUB_ISSUE_EVENT_TYPE,), queue_size=16)
+    open_issue = _make_issue(
+        number=42, updated_at=datetime(2026, 5, 29, 10, 0, 0, tzinfo=UTC)
+    )
+    closed_issue = _make_issue(
+        number=42,
+        state="closed",
+        state_reason="completed",
+        updated_at=datetime(2026, 5, 29, 11, 0, 0, tzinfo=UTC),
+    )
+    github = _fake_github_client()
+    # First poll fetches open, dispatch fails, issue gets stuck.
+    # Second poll's retry-by-number sees the closed state.
+    github.list_issues_since = AsyncMock(side_effect=[[open_issue], []])
+    github.get_issue = AsyncMock(return_value=closed_issue)
+
+    attempt_count = 0
+
+    async def flaky_dispatch(event: Any) -> None:
+        nonlocal attempt_count
+        attempt_count += 1
+        # First call (during initial bootstrap) raises.
+        # Second call (the by-number retry) succeeds.
+        if attempt_count == 1:
+            raise RuntimeError("transient")
+
+    watcher = _make_watcher(
+        github=github,
+        lithos=_fake_lithos_client(),
+        bus=bus,
+        dispatch=flaky_dispatch,
+    )
+
+    # First poll: bootstrap, fails, issue 42 is stuck.
+    await watcher._poll_one_repo(slug="x", repo="agent-lore/lithos-loom")
+    assert 42 in watcher._stuck_issues.get("agent-lore/lithos-loom", set())
+
+    # Second poll: get_issue returns closed state, dispatch succeeds,
+    # stuck set drains.
+    await watcher._poll_one_repo(slug="x", repo="agent-lore/lithos-loom")
+    github.get_issue.assert_awaited_with("agent-lore/lithos-loom", 42)
+    assert watcher._stuck_issues.get("agent-lore/lithos-loom", set()) == set()
+
+
+@pytest.mark.asyncio
+async def test_stuck_issue_dropped_when_gh_returns_404() -> None:
+    """Operator deleted the issue between polls. get_issue returns None;
+    the stuck entry drops without further retry."""
+    bus = EventBus()
+    bus.subscribe(event_types=(GITHUB_ISSUE_EVENT_TYPE,), queue_size=16)
+    github = _fake_github_client()
+    github.list_issues_since = AsyncMock(return_value=[])
+    github.get_issue = AsyncMock(return_value=None)
+
+    async def dispatch_ok(_: Any) -> None:
+        return None
+
+    watcher = _make_watcher(
+        github=github,
+        lithos=_fake_lithos_client(),
+        bus=bus,
+        dispatch=dispatch_ok,
+    )
+    watcher._stuck_issues["agent-lore/lithos-loom"] = {42}
+
+    await watcher._poll_one_repo(slug="x", repo="agent-lore/lithos-loom")
+
+    assert "agent-lore/lithos-loom" not in watcher._stuck_issues
+
+
+@pytest.mark.asyncio
+async def test_stuck_issue_auth_error_does_not_drop_entry() -> None:
+    """PR-review finding 2 (round 5, 2026-05-30): an auth failure on
+    get_issue used to drop the stuck entry as if it were permanent.
+    Credentials can be rotated later — the entry must stay so the
+    eventual recovery picks it up. Only None (issue genuinely deleted
+    on GH) or a successful dispatch retires the entry."""
+    from lithos_loom.github_client import GitHubAuthError
+
+    bus = EventBus()
+    bus.subscribe(event_types=(GITHUB_ISSUE_EVENT_TYPE,), queue_size=16)
+    github = _fake_github_client()
+    github.list_issues_since = AsyncMock(return_value=[])
+    github.get_issue = AsyncMock(side_effect=GitHubAuthError("403 denied"))
+
+    async def dispatch_ok(_: Any) -> None:
+        return None
+
+    watcher = _make_watcher(
+        github=github,
+        lithos=_fake_lithos_client(),
+        bus=bus,
+        dispatch=dispatch_ok,
+    )
+    watcher._stuck_issues["agent-lore/lithos-loom"] = {42}
+
+    await watcher._poll_one_repo(slug="x", repo="agent-lore/lithos-loom")
+
+    # Stuck entry preserved despite the auth error — operator might
+    # repair credentials and the next poll picks it up.
+    assert 42 in watcher._stuck_issues["agent-lore/lithos-loom"]
+
+
+@pytest.mark.asyncio
+async def test_stuck_issues_persist_and_reload_through_coord_doc() -> None:
+    """PR-review finding 3 (round 5, 2026-05-30): the stuck-issue set
+    rides on the coord doc so daemon restart preserves repair records.
+    Without persistence, an issue stuck between an incomplete
+    task_create + marker write and the next retry can be lost when
+    the daemon restarts."""
+    body = format_cursors(
+        {"owner/x": datetime(2026, 5, 29, tzinfo=UTC)},
+        stuck={"owner/x": {42, 99}, "owner/y": {7}},
+    )
+    assert "stuck:owner/x#42" in body
+    assert "stuck:owner/x#99" in body
+    assert "stuck:owner/y#7" in body
+    # And it round-trips through the parser.
+    assert parse_stuck(body) == {
+        "owner/x": {42, 99},
+        "owner/y": {7},
+    }
+    # Cursors are still parseable too — stuck rows are ignored by parse_cursors.
+    assert parse_cursors(body) == {"owner/x": datetime(2026, 5, 29, tzinfo=UTC)}
+
+
+@pytest.mark.asyncio
+async def test_stuck_issue_still_failing_defers_new_fetch() -> None:
+    """If a stuck retry still fails, the watcher skips the regular fetch
+    so we don't accumulate fresh stuck entries on top of the unresolved
+    ones."""
+    bus = EventBus()
+    bus.subscribe(event_types=(GITHUB_ISSUE_EVENT_TYPE,), queue_size=16)
+    github = _fake_github_client()
+    github.list_issues_since = AsyncMock(return_value=[])
+    github.get_issue = AsyncMock(
+        return_value=_make_issue(
+            number=42, updated_at=datetime(2026, 5, 29, tzinfo=UTC)
+        )
+    )
+
+    async def still_failing(_: Any) -> None:
+        raise RuntimeError("still down")
+
+    watcher = _make_watcher(
+        github=github,
+        lithos=_fake_lithos_client(),
+        bus=bus,
+        dispatch=still_failing,
+    )
+    watcher._stuck_issues["agent-lore/lithos-loom"] = {42}
+
+    await watcher._poll_one_repo(slug="x", repo="agent-lore/lithos-loom")
+
+    # 42 stays in the stuck set; regular fetch was skipped this poll.
+    assert 42 in watcher._stuck_issues["agent-lore/lithos-loom"]
+    github.list_issues_since.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_poll_one_repo_boundary_replay_is_accepted() -> None:
+    """The cursor is held at the boundary timestamp rather than nudged
+    past it. PR-review finding 3 (2026-05-30): the earlier +1s nudge
+    avoided a single idempotent re-fetch but dropped same-second sibling
+    updates outright. Same-second drops are a correctness failure for an
+    inbound mirror; idempotent replay is not. The handler short-circuits
+    on the marker → open-task path so the cost is at most one extra
+    Lithos round-trip per repo per poll.
     """
     bus = EventBus()
     bus.subscribe(event_types=(GITHUB_ISSUE_EVENT_TYPE,), queue_size=16)
@@ -400,17 +726,13 @@ async def test_poll_one_repo_cursor_advances_past_boundary_to_break_replay_loop(
     github = _fake_github_client()
     github.list_issues_since = AsyncMock(return_value=[boundary])
     watcher = _make_watcher(github=github, lithos=_fake_lithos_client(), bus=bus)
-    # Cursor sits exactly at the boundary issue's updated_at — replays
-    # the exact state the soak log showed.
     watcher._cursors["agent-lore/lithos-loom"] = boundary.updated_at
 
     await watcher._poll_one_repo(slug="x", repo="agent-lore/lithos-loom")
 
-    # Cursor moved strictly past the boundary — next poll's since=
-    # would no longer pull the boundary issue back.
-    assert watcher._cursors["agent-lore/lithos-loom"] > boundary.updated_at, (
-        "cursor must advance past the boundary to break the inclusive-since replay loop"
-    )
+    # Cursor stays at the boundary — same-second sibling updates still
+    # get pulled on the next poll.
+    assert watcher._cursors["agent-lore/lithos-loom"] == boundary.updated_at
 
 
 @pytest.mark.asyncio
@@ -439,8 +761,8 @@ async def test_poll_one_repo_drops_repo_on_404() -> None:
     bus = EventBus()
     watcher = _make_watcher(github=github, lithos=_fake_lithos_client(), bus=bus)
     watcher._watch_list = {
-        "ghost": "missing/repo",
-        "real": "agent-lore/lithos-loom",
+        "ghost": WatchedRepo(repo="missing/repo"),
+        "real": WatchedRepo(repo="agent-lore/lithos-loom"),
     }
     watcher._cursors["missing/repo"] = datetime(2026, 5, 28, tzinfo=UTC)
 
@@ -579,6 +901,133 @@ async def test_persist_cursors_merges_pending_advances_on_version_conflict() -> 
 
 
 @pytest.mark.asyncio
+async def test_persist_cursors_keeps_stuck_deletions_through_version_conflict() -> None:
+    """PR-review finding 3 (round 6, 2026-05-30): a stuck row drained
+    locally must stay deleted even when a CAS conflict reloads the
+    remote stuck-set that still carries it. Without the per-number
+    tombstone, the union-merge re-adds the row from the remote and
+    the next write resurrects it.
+    """
+    T1 = datetime(2026, 5, 29, tzinfo=UTC)
+    # Remote coord doc still has stuck entry that we already drained locally.
+    remote_body = format_cursors({"owner/x": T1}, stuck={"owner/x": {42, 99}})
+    remote_note = Note(
+        id="coord-id",
+        title="GitHub Watcher State",
+        body=remote_body,
+        version=9,
+        updated_at=None,
+        tags=(),
+        status="active",
+        note_type="concept",
+        path="projects/_lithos-loom-internal/github-watcher-state.md",
+        slug="_lithos-loom-internal",
+    )
+    final_note = Note(
+        id="coord-id",
+        title="GitHub Watcher State",
+        body="",
+        version=10,
+        updated_at=None,
+        tags=(),
+        status="active",
+        note_type="concept",
+        path="projects/_lithos-loom-internal/github-watcher-state.md",
+        slug="_lithos-loom-internal",
+    )
+    lithos = _fake_lithos_client(note_read_return=remote_note)
+    lithos.note_write = AsyncMock(
+        side_effect=[
+            WriteResult(status="version_conflict", current_version=9),
+            WriteResult(status="updated", note=final_note),
+        ]
+    )
+    watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
+    watcher._coord_doc_id = "coord-id"
+    watcher._coord_doc_version = 7
+    watcher._cursors = {"owner/x": T1}
+    watcher._last_persisted_cursors = {"owner/x": T1}
+    # We had {42, 99} stuck persisted; we just drained #42 locally,
+    # leaving #99. Remote still carries both.
+    watcher._stuck_issues = {"owner/x": {99}}
+    watcher._last_persisted_stuck = {"owner/x": {42, 99}}
+
+    await watcher._persist_cursors()
+
+    body_written = lithos.note_write.await_args_list[1].kwargs["content"]
+    # #42 is gone from the persisted body — the local drain survived
+    # the CAS conflict.
+    assert "stuck:owner/x#42" not in body_written
+    # #99 is still there.
+    assert "stuck:owner/x#99" in body_written
+    # In-memory matches.
+    assert watcher._stuck_issues == {"owner/x": {99}}
+
+
+@pytest.mark.asyncio
+async def test_persist_cursors_keeps_deletions_through_version_conflict() -> None:
+    """PR-review finding 1 (round 5, 2026-05-30): a cursor we intend to
+    delete must not silently come back when a version_conflict triggers
+    reload-then-merge. Without tracking deletion tombstones, the reload
+    re-populates ``_cursors`` from the remote (which still contains the
+    row we wanted gone) and the next write persists the stale row.
+
+    Scenario: in-memory has dropped repo X (operator disabled watching).
+    Remote coord doc still has X→T1. The persist conflicts, reloads X
+    back, merges pending (empty) — without the fix, X resurrects.
+    """
+    T1 = datetime(2026, 5, 28, tzinfo=UTC)
+    remote_body = format_cursors({"owner/x": T1})
+    remote_note = Note(
+        id="coord-id",
+        title="GitHub Watcher State",
+        body=remote_body,
+        version=9,
+        updated_at=None,
+        tags=(),
+        status="active",
+        note_type="concept",
+        path="projects/_lithos-loom-internal/github-watcher-state.md",
+        slug="_lithos-loom-internal",
+    )
+    final_note = Note(
+        id="coord-id",
+        title="GitHub Watcher State",
+        body="",
+        version=10,
+        updated_at=None,
+        tags=(),
+        status="active",
+        note_type="concept",
+        path="projects/_lithos-loom-internal/github-watcher-state.md",
+        slug="_lithos-loom-internal",
+    )
+    lithos = _fake_lithos_client(note_read_return=remote_note)
+    lithos.note_write = AsyncMock(
+        side_effect=[
+            WriteResult(status="version_conflict", current_version=9),
+            WriteResult(status="updated", note=final_note),
+        ]
+    )
+    watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
+    watcher._coord_doc_id = "coord-id"
+    watcher._coord_doc_version = 7
+    # Operator just disabled watching for X — in-memory is empty, but the
+    # _last_persisted snapshot still carries X (it was persisted earlier).
+    watcher._cursors = {}
+    watcher._last_persisted_cursors = {"owner/x": T1}
+
+    await watcher._persist_cursors()
+
+    # Two writes: first conflicted, second succeeded with X *gone*.
+    assert lithos.note_write.await_count == 2
+    body_written = lithos.note_write.await_args_list[1].kwargs["content"]
+    assert "owner/x" not in body_written
+    # In-memory state confirms the deletion stuck.
+    assert "owner/x" not in watcher._cursors
+
+
+@pytest.mark.asyncio
 async def test_persist_cursors_gives_up_after_max_cas_attempts() -> None:
     """Three back-to-back conflicts surface a warning and bail without
     spinning forever; the next poll will retry."""
@@ -678,6 +1127,45 @@ async def test_persist_cursors_is_noop_when_unchanged_since_last_write() -> None
     # — no Lithos round-trip, no version bump.
     await watcher._persist_cursors()
     assert lithos.note_write.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_persist_cursors_writes_empty_map_when_slug_removed() -> None:
+    """PR-review finding 1 (round 4, 2026-05-30): when the last watched
+    slug is disabled, the in-memory cursor map empties — but the coord
+    doc still holds the prior cursor rows. Without persisting the
+    empty map, a daemon restart re-loads the stale rows; a subsequent
+    re-enable resumes from the stale timestamp and can miss issues
+    created during the disabled window.
+    """
+    written_note = Note(
+        id="coord-id",
+        title="GitHub Watcher State",
+        body="",
+        version=3,
+        updated_at=None,
+        tags=(),
+        status="active",
+        note_type="concept",
+        path="projects/_lithos-loom-internal/github-watcher-state.md",
+        slug="_lithos-loom-internal",
+    )
+    lithos = _fake_lithos_client(
+        write_result=WriteResult(status="updated", note=written_note)
+    )
+    watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
+    watcher._coord_doc_id = "coord-id"
+    watcher._coord_doc_version = 2
+    # Coord doc had a cursor; the watch list was just cleared, dropping
+    # the in-memory cursor too.
+    watcher._last_persisted_cursors = {"x/y": datetime(2026, 5, 29, tzinfo=UTC)}
+    watcher._cursors = {}
+
+    await watcher._persist_cursors()
+    # Coord doc rewritten with the empty cursor map — stale row is gone.
+    assert lithos.note_write.await_count == 1
+    write_kwargs = lithos.note_write.await_args.kwargs
+    assert "x/y" not in write_kwargs["content"]
 
 
 @pytest.mark.asyncio
@@ -826,7 +1314,7 @@ async def test_bootstrap_loads_watch_list_and_subscribes_bus() -> None:
     )
     watcher = _make_watcher(github=_fake_github_client(), lithos=lithos, bus=bus)
     await watcher._bootstrap()
-    assert watcher._watch_list == {"x": "agent-lore/x"}
+    assert watcher._watch_list == {"x": WatchedRepo(repo="agent-lore/x")}
     assert watcher._coord_doc_subscription is not None
     # Subscribed to lithos.note.* events.
     assert watcher._coord_doc_subscription.event_types == frozenset(
@@ -992,8 +1480,8 @@ async def test_poll_all_repos_iterates_watch_list() -> None:
     github.list_issues_since = AsyncMock(side_effect=fake_list)
     watcher = _make_watcher(github=github, lithos=_fake_lithos_client(), bus=bus)
     watcher._watch_list = {
-        "a": "owner/a",
-        "b": "owner/b",
+        "a": WatchedRepo(repo="owner/a"),
+        "b": WatchedRepo(repo="owner/b"),
     }
 
     await watcher._poll_all_repos()
@@ -1038,7 +1526,7 @@ async def test_poll_loop_persists_cursors_after_pass() -> None:
 
     watcher = _make_watcher(github=github, lithos=lithos, bus=bus)
     watcher._sleep = fake_sleep
-    watcher._watch_list = {"a": "owner/a"}
+    watcher._watch_list = {"a": WatchedRepo(repo="owner/a")}
 
     with pytest.raises(StopAsyncIteration):
         await watcher._poll_loop()
@@ -1078,7 +1566,7 @@ async def test_poll_loop_backs_off_on_exception() -> None:
     # Force a crash inside the poll pass.
     lithos.note_write.side_effect = RuntimeError("boom")
     watcher = _make_watcher(github=github, lithos=lithos, bus=bus)
-    watcher._watch_list = {"a": "owner/a"}
+    watcher._watch_list = {"a": WatchedRepo(repo="owner/a")}
     watcher._cursors = {"owner/a": datetime(2026, 5, 29, tzinfo=UTC)}
 
     sleep_calls: list[float] = []

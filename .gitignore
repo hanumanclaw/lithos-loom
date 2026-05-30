@@ -196,6 +196,10 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Claude Code / VS Code local config (per-developer, not shared)
+.claude/
+.vscode/
+
 # PyPI configuration file
 .pypirc
 

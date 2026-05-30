@@ -119,14 +119,43 @@ Other `result.json` fields (`metadata_updates`, `artifacts`, `commits`, `spawned
 **GitHub issue mirror (GitHub → Lithos).**
 `GitHubIssueWatcher` (running in the github-watcher child) polls every repo flagged for watching on its `[github_watcher].poll_interval_seconds` cadence (default 60s). Watch eligibility is derived from project-context tags: a doc with both a `github-watch` tag and a `github-repo:<owner>/<name>` tag enrols its slug → repo mapping. The watcher subscribes to `lithos.note.{created,updated}` on the in-process bus so a `project enable-github <slug>` mid-run takes effect without a daemon restart. Per-repo `updated_at` cursors persist in a daemon-owned Lithos doc (default `projects/_lithos-loom-internal/github-watcher-state.md`, configurable) so cold restart doesn't re-walk every open issue. Coord-doc writes are CAS-protected: on `version_conflict` the watcher merges the just-observed cursor advances with the remote cursors (latest timestamp wins per repo) and retries, so concurrent writes don't lose progress. Per-repo polls split into two paths: **bootstrap** (no cursor yet for this repo) lists `state=open` with full `Link: rel="next"` pagination so every open issue surfaces in one cycle regardless of historical-closure volume; **incremental** (cursor present) lists `state=all` since the cursor with the same pagination so closes on previously-seen issues — their `updated_at` advances at close time — surface alongside fresh opens. Each issue surfaced this poll publishes one `github.issue.seen` event onto the in-process bus; the auto-wired `github-issue-sync` subscriber resolves an `<!-- lithos:<task_id> -->` linkage marker in the issue body, then takes one of these branches:
 
-- Marker → open Lithos task: no-op (steady state).
-- Marker → open Lithos task, GH closed-completed: `lithos_task_complete`.
-- Marker → open Lithos task, GH closed-not_planned: `lithos_task_cancel`.
-- Marker → terminal Lithos task: no-op (idempotent close mirror).
+- Marker → open Lithos task: drift-sync only (title / body / labels — see below).
+- Marker → open Lithos task, GH closed-completed: drift-sync + `lithos_task_complete`.
+- Marker → open Lithos task, GH closed-not_planned: drift-sync + `lithos_task_cancel`.
+- Marker → terminal Lithos task: drift-sync only (idempotent close mirror). If GH state transitioned from closed back to open and `metadata.github_state_snapshot != "open"` on the task, also post a `[ReopenRequested]` finding (de-duped via the snapshot field).
 - Marker → missing task (operator force-deleted): create a fresh task; the marker writer overwrites the stale id.
 - No marker, Lithos task carries `metadata.github_issue_url` for this URL: re-write the canonical marker on GitHub. No duplicate task.
-- No marker, no matching task, GH open: `lithos_task_create` with `title=issue.title`, `description=issue.body`, `tags=issue.labels + ["github-issue"]`, `metadata={project, github_issue_url, github_issue_number, github_labels}`. Then write the canonical `<!-- lithos:<task_id> -->` marker into the issue body via `PATCH /repos/{owner}/{repo}/issues/{n}` — fetched fresh via `get_issue` immediately before the PATCH so an operator edit during the poll-to-PATCH window survives.
+- No marker, no matching task, GH open: `lithos_task_create` with `title=issue.title`, `description=issue.body`, `tags=issue.labels + ["github-issue"]`, `metadata={project, github_issue_url, github_issue_number, github_labels, github_state_snapshot=issue.state}`. Then write the canonical `<!-- lithos:<task_id> -->` marker into the issue body via `PATCH /repos/{owner}/{repo}/issues/{n}` — fetched fresh via `get_issue` immediately before the PATCH so an operator edit during the poll-to-PATCH window survives.
 - No marker, no matching task, GH closed: skip (historic closures are not backfilled).
+
+**Per-project exclude filters.** The watcher ships each event with the project's import-time filters, sourced from these tag conventions on the project-context doc:
+
+- `github-exclude-label:<name>` — drop the issue at import time if it carries this label.
+- `github-exclude-author:<login>` — drop if the GH author login matches (e.g. `dependabot[bot]`).
+
+Filters apply only on the create branch (no marker + no matching URL + GH open). Already-linked tasks are unaffected if an exclude tag is added after import — the PRD explicitly locks "exclude is only at import time" so the operator never has a once-imported task quietly stranded.
+
+**Dispatch contract (GH → Lithos).** The watcher source dispatches each issue inline to the `github-issue-sync` handler before advancing the persistent cursor — the bus path is reserved for tests that assert on queue contents. Cursor advancement is per-issue: the watcher walks GitHub's `updated_at`-ascending list, advances the in-memory cursor to each issue's timestamp only after dispatch succeeds, and halts the loop on the first exception so the next poll re-fetches starting from the failed boundary. Issues that failed dispatch are tracked in a `_stuck_issues: dict[str, set[int]]` map and retried by direct `github.get_issue` lookup at the top of the next poll — that path is independent of the cursor and the `state=` filter, so a bootstrap walk that's about to lose a closed-before-retry issue still gets it. The stuck set is persisted in the coord doc as `stuck:<owner>/<name>#<number>` rows alongside the cursor rows, so daemon restart between a partial reconciliation (e.g. `task_create` succeeded, marker PATCH failed) and the next retry preserves the repair record. CAS-write semantics protect both halves: deletion tombstones are tracked at function entry for both cursors and stuck rows so a `version_conflict` reload-then-merge doesn't resurrect locally-drained state.
+
+**Dispatch contract (Lithos → GH).** The push direction uses the bus because `LithosEventStream` already serves multiple subscribers across child processes. The consumer loop classifies handler exceptions: permanent errors (`GitHubAuthError`, `GitHubRepoNotFoundError`) log `[Friction]` and drop without retry — retry won't help. Other `GitHubError` subclasses (transients — 5xx, network blips, rate-limit exhausted) retry with exponential backoff capped at 60s, up to 8 attempts (inter-attempt waits 2/4/8/16/32/60/60 s ≈ 3 minutes total before drop). Outages outlasting that budget are caught by the **periodic reconciliation sweep**: every `[github_watcher].reconcile_interval_minutes` (default 60) the child re-fetches open Lithos tasks plus completed + cancelled tasks resolved within `resolved_replay_days` (skipped entirely when `resolved_replay_days = 0`), filters to those carrying `metadata.github_issue_url`, and re-dispatches each one through the push handler. Terminal tasks dispatch both a synthetic `task.updated` (so title drift reconciles) AND the matching close event. The handler is idempotent (re-fetches GH before PATCH) so the sweep is a no-op in steady state. The sweep keeps recovery cadence within the configured interval even without a daemon restart; set to 0 to disable.
+
+**Drift sync** (GH → Lithos, Slice 7.2). Every poll that matches a known Lithos task layers three checks on top of the close mirror:
+
+- **Title drift** — `issue.title != task.title` → `task_update(title=issue.title)`.
+- **Body drift** — `strip_marker(issue.body) != task.description` → `task_update(description=...)`. The `<!-- lithos:<id> -->` marker is never reflected into the Lithos task description.
+- **Label diff** — read `metadata.github_labels` snapshot; compute `removed = old − new` and `added = new − old`; new tag set is `(task.tags − removed) | added`. Operator-added Lithos tags never in any GH snapshot survive untouched. The snapshot in metadata rolls forward to `issue.labels`.
+- **State snapshot** — `metadata.github_state_snapshot` rolls forward to `issue.state` on every poll. Reopen detection compares the *prior* value before drift sync overwrites it.
+
+All four drifts in one poll batch into a single `task_update` call. Steady-state polls (nothing changed) cost zero round-trips.
+
+**GitHub issue mirror (Lithos → GitHub, Slice 7.2).**
+The `github-issue-push` subscription (auto-wired in the github-watcher child) consumes `lithos.task.{created,completed,cancelled,updated}` events from `LithosEventStream` on the in-process bus. The `task.created` event is the open-task snapshot replay surface at daemon startup — a Lithos rename that happened while the watcher was down only re-fires as `task.created` on restart, so the title branch consumes it identically to `task.updated`. The handler branches as follows:
+
+- `lithos.task.completed` → fetch GH issue; if not already closed-as-completed, `PATCH state=closed state_reason=completed`.
+- `lithos.task.cancelled` → same, with `state_reason=not_planned`.
+- `lithos.task.updated` → if `task.title` differs from the current GH issue title, `PATCH title`.
+
+Tasks without `metadata.github_issue_url` are filtered at the handler entry (the by-far-common case) and stay silent at INFO. GH errors (404 / auth) during the push surface as `[Friction]` log lines, not retries — a permanent failure shouldn't loop.
 
 Pull requests are filtered at parse time (presence of GitHub's `pull_request` field on the row). A 404 on a watched repo drops it from the in-memory watch list with a `[Friction]` log line; the next bus-driven refresh re-adds the slug if the operator fixes the typo. GitHub rate-limit responses (403 with `X-RateLimit-Remaining: 0`) trigger a sleep until `X-RateLimit-Reset`; a 403 with non-zero remaining surfaces as auth/permission error rather than retried indefinitely.
 
@@ -265,6 +294,19 @@ poll_interval_seconds = 60                                     # incremental pol
 coord_doc_path        = "projects/_lithos-loom-internal/github-watcher-state.md"
 # Lithos doc the watcher uses to persist per-repo updated_at cursors.
 # Must be a relative Lithos doc path (no leading `/`, no `..`).
+resolved_replay_days  = 7
+# How far back the embedded LithosEventStream replays resolved task
+# events at bootstrap. A Lithos task that closes (or gets renamed) while
+# the watcher is down is mirrored to GH on restart via the replay; the
+# push handler is idempotent (refetches GH before PATCH) so a too-large
+# window only costs harmless re-checks. Set to 0 to disable replay (the
+# push handler then only fires for events that arrive live).
+reconcile_interval_minutes = 60
+# Cadence of the periodic Lithos→GH reconciliation sweep. Catches drift
+# left over from outages longer than the in-memory retry budget — every
+# interval the child scans Lithos for open + recently-resolved tasks
+# carrying metadata.github_issue_url and replays each through the push
+# handler. Set to 0 to disable the sweep.
 ```
 
 ### 3.2 Validation
@@ -556,7 +598,7 @@ Sources are async coroutines spawned by their owning child. They consume externa
 
 | Source | Spawned by | Bootstrap | Reconnect |
 |---|---|---|---|
-| `LithosEventStream` | route-runner + obsidian-sync (independently) | `lithos_task_list(status='open', with_claims=true)` → re-emit `lithos.task.created` per task. | Exponential backoff with `Last-Event-ID` resume. |
+| `LithosEventStream` | route-runner + obsidian-sync + github-watcher (independently) | `lithos_task_list(status='open', with_claims=true)` → re-emit `lithos.task.created` per task. | Exponential backoff with `Last-Event-ID` resume. |
 | `LithosNoteStream` | obsidian-sync (when `project-context-projection` is configured) + github-watcher | `lithos_list(path_prefix='projects/', tags=['project-context'])` → re-emit `lithos.note.created` per match. | Exponential backoff with `Last-Event-ID` resume. |
 | `ObsidianFSWatcher` | obsidian-sync | Polls `<vault>/<tasks_file>` on a 250ms cadence; emits when a line diverges from the last-known state. | n/a (polling). |
 | `ObsidianDirWatcher` | obsidian-sync (when `note-push` is configured) | Walks `<vault>/<projects_dir>/**/*.md` on the same cadence; computes body-only hashes. | n/a. Excludes files ending in `-done.md` (the per-project archive). |
@@ -576,7 +618,8 @@ Subscriptions resolve their `action` field against the `lithos_loom.subscription
 | `project-context-projection` | `_project_context_projection` | `lithos.note.*` | Re-fetches via `lithos_read`, writes `<vault>/<projects_dir>/<slug>/<filename>.md` atomically. |
 | `note-push` | `_note_push` | `obsidian.note.modified` | `lithos_write(id, content, expected_version)`; on conflict, runs the conflict resolver. |
 | `task-archive` | `_task_archive` | `lithos.task.completed` / `lithos.task.cancelled` | Appends a Tasks-plugin line to `<vault>/<projects_dir>/<slug>/<slug>-done.md` (O_APPEND); marks the task as archived so the projection evicts it on next flush. |
-| `github-issue-sync` | `_github_issue_sync` | `github.issue.seen` | Auto-wired by the github-watcher child (not declared in `[[subscriptions]]`). Resolves the `<!-- lithos:<id> -->` marker, then creates / closes / no-ops as described in §2.2. Per-project exclude filters are deferred. |
+| `github-issue-sync` | `_github_issue_sync` | `github.issue.seen` | Auto-wired by the github-watcher child (not declared in `[[subscriptions]]`). Resolves the `<!-- lithos:<id> -->` marker, then creates / closes / no-ops + GH → Lithos drift (title / body / labels) per §2.2. Reopen on a terminal task posts `[ReopenRequested]` once (de-duped via `metadata.github_state_snapshot`). |
+| `github-issue-push` | `_github_issue_push` | `lithos.task.created` / `lithos.task.completed` / `lithos.task.cancelled` / `lithos.task.updated` | Auto-wired by the github-watcher child. Mirrors Lithos terminal status to a GH close with the matching `state_reason`; mirrors title renames from Lithos → GH on `task.updated` and (for bootstrap-replayed open tasks) `task.created`. Idempotent re-fetch dodges redundant PATCHes when the GH → Lithos path already converged. Consumer retries transient GH failures with exponential backoff capped at 60s, up to 8 attempts before dropping `[Friction]`. |
 
 Third-party handlers can be registered via Python entry points. Each handler receives an `Event` and a `SubscriptionContext` carrying a shared `LithosClient`, a scoped `logging.Logger`, and the orchestrator's `agent_id`.
 
@@ -712,7 +755,7 @@ Loom posts findings with stable prefixes so operators (and `lithos-lens`) can gr
 | Prefix | Posted by | Meaning |
 |---|---|---|
 | `[Friction]` | any subscription | Persistent failure of a side effect (retry exhausted) OR a notable operator-visible event (e.g. note-push conflict). |
-| `[ReopenRequested]` | `obsidian-status-transition` | An operator unticked a completed task; Lithos has no reopen primitive, so this signals the intent. |
+| `[ReopenRequested]` | `obsidian-status-transition` and `github-issue-sync` | An operator unticked a completed task (Obsidian) OR reopened a closed GH issue linked to a terminal Lithos task. Lithos has no reopen primitive, so this signals the intent. |
 | `[BlockerFailed]` | route-runner | Plugin failed, timed out, violated the contract, or returned an unknown status. The claim was released. |
 
 ---

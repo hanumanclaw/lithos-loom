@@ -25,14 +25,16 @@ State on the Lithos task:
       project: <slug>,
       github_issue_url: <url>,
       github_issue_number: N,
-      github_labels: [<labels>],  # snapshotted for future drift sync
+      github_labels: [<labels>],            # snapshotted for drift sync
+      github_state_snapshot: <issue.state>, # snapshotted for reopen dedup
     }
 
 The exclude-filter knobs (``github_issue_exclude_labels`` /
-``..._authors``) from the PRD are deferred to Slice 7.2 alongside the
-label-drift sync — their storage shape (tag-name escaping for labels
-containing colons / brackets) is non-trivial and isn't blocking the
-inbound-mirror MVP.
+``..._authors``) are sourced from per-project tag prefixes
+(``github-exclude-label:<name>`` / ``github-exclude-author:<login>``)
+and shipped on every event payload by the watcher. The handler applies
+them only at import time — already-linked tasks survive an after-the-
+fact filter add (PRD: "exclude is only at import time").
 """
 
 from __future__ import annotations
@@ -42,7 +44,12 @@ from typing import Any
 
 from lithos_loom.bus import Event
 from lithos_loom.errors import LithosClientError
-from lithos_loom.github_client import GitHubClient, GitHubError, apply_marker
+from lithos_loom.github_client import (
+    GitHubClient,
+    GitHubError,
+    apply_marker,
+    strip_marker,
+)
 from lithos_loom.lithos_client import Task
 from lithos_loom.subscriptions import Handler, SubscriptionContext
 
@@ -99,6 +106,8 @@ class _ParsedIssue:
     __slots__ = (
         "author",
         "body",
+        "exclude_authors",
+        "exclude_labels",
         "html_url",
         "labels",
         "number",
@@ -122,6 +131,8 @@ class _ParsedIssue:
         labels: list[str],
         author: str,
         html_url: str,
+        exclude_labels: list[str] | None = None,
+        exclude_authors: list[str] | None = None,
     ) -> None:
         self.slug = slug
         self.repo = repo
@@ -133,6 +144,8 @@ class _ParsedIssue:
         self.labels = labels
         self.author = author
         self.html_url = html_url
+        self.exclude_labels = exclude_labels or []
+        self.exclude_authors = exclude_authors or []
 
     @classmethod
     def from_payload(cls, payload: Any) -> _ParsedIssue | None:
@@ -148,6 +161,8 @@ class _ParsedIssue:
                 labels=list(payload.get("labels") or ()),
                 author=str(payload.get("author") or ""),
                 html_url=str(payload["html_url"]),
+                exclude_labels=list(payload.get("exclude_labels") or ()),
+                exclude_authors=list(payload.get("exclude_authors") or ()),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -213,22 +228,91 @@ async def _reconcile(
         )
         return
 
+    # Apply per-project exclude filters at import time only. Already-linked
+    # tasks (marker present, or matching URL above) bypass the filter — the
+    # PRD locks "exclude is only at import time".
+    excluded_reason = _matched_exclude_filter(issue)
+    if excluded_reason is not None:
+        ctx.logger.info(
+            "github-issue-sync: skipping %s/#%d on import (%s)",
+            issue.repo,
+            issue.number,
+            excluded_reason,
+        )
+        return
+
     await _create_task_and_mark(issue, ctx, github)
+
+
+def _matched_exclude_filter(issue: _ParsedIssue) -> str | None:
+    """Return a human-readable reason if ``issue`` matches a project filter.
+
+    Returns ``None`` when no filter matches (the create path proceeds).
+    Author check beats label check so the log line names the more
+    specific signal when both fire (e.g. dependabot AND label 'automated').
+    """
+    if issue.author and issue.author in issue.exclude_authors:
+        return f"excluded author {issue.author!r}"
+    matched_labels = [lbl for lbl in issue.labels if lbl in issue.exclude_labels]
+    if matched_labels:
+        return f"excluded label(s) {matched_labels!r}"
+    return None
 
 
 async def _reconcile_existing(
     issue: _ParsedIssue, task: Task, ctx: SubscriptionContext
 ) -> None:
-    """Apply GH state to a known Lithos task. Idempotent."""
-    if issue.state != "closed":
-        # Still open on GH; nothing to mirror in 7.1 (title / body drift
-        # sync is deferred to 7.2).
-        ctx.logger.debug(
-            "github-issue-sync: %s/#%d still open — no-op for task %s",
+    """Apply GH state to a known Lithos task. Idempotent.
+
+    Slice 7.2 layers three branches on top of the original close mirror:
+
+    1. **Drift sync** (always runs): title / body / labels / state-snapshot.
+       Builds a single merged ``task_update`` payload so a steady-state poll
+       costs zero round-trips and a poll that observes multiple drifts costs
+       exactly one.
+    2. **Reopen finding**: terminal Lithos task + GH-open + snapshot bump
+       fires ``[ReopenRequested]`` once. The snapshot transition (handled
+       in step 1) is what de-dupes subsequent polls.
+    3. **Close mirror** (Slice 7.1, preserved): GH-closed + Lithos-open
+       triggers ``task_complete`` / ``task_cancel`` based on ``state_reason``.
+
+    Reopen detection must compare the *current* snapshot value, so it
+    inspects ``task.metadata`` BEFORE drift sync rewrites it.
+    """
+    # Reopen detection reads the snapshot before drift sync mutates it.
+    # PR-review finding 1 (round 3, 2026-05-30): a failure in this
+    # branch (finding_post or downstream drift sync) propagates and
+    # freezes the watcher's cursor; the next poll re-enters the same
+    # reopen condition because the snapshot hasn't advanced yet. A
+    # rare interleaving — finding_post succeeds, drift sync's
+    # task_update raises — can produce a single duplicate finding on
+    # retry. Accepted: duplicate findings are visible noise but not
+    # data loss, and the alternative (a separate snapshot-only
+    # task_update between the two) costs every reopen an extra MCP
+    # round-trip.
+    prior_snapshot = task.metadata.get("github_state_snapshot")
+    if (
+        task.status in ("completed", "cancelled")
+        and issue.state == "open"
+        and prior_snapshot != "open"
+    ):
+        ctx.logger.info(
+            "github-issue-sync: reopen detected on %s/#%d (task %s)",
             issue.repo,
             issue.number,
             task.id,
         )
+        await ctx.lithos.finding_post(
+            task_id=task.id,
+            summary=(
+                f"[ReopenRequested] GH issue {issue.repo}#{issue.number} reopened"
+            ),
+            agent=ctx.agent_id,
+        )
+
+    await _sync_drift(issue, task, ctx)
+
+    if issue.state != "closed":
         return
 
     if task.status != "open":
@@ -282,6 +366,113 @@ async def _reconcile_existing(
         )
 
 
+# ── Slice 7.2: drift sync helpers ─────────────────────────────────────
+
+
+async def _sync_drift(
+    issue: _ParsedIssue,
+    task: Task,
+    ctx: SubscriptionContext,
+) -> None:
+    """Mirror GH-side drift (title / body / labels) into Lithos.
+
+    Build a single merged ``task_update`` payload to keep steady-state
+    polls cheap. The state-snapshot field rides on the same write so the
+    reopen-finding de-dupe stays consistent without an extra round-trip.
+
+    Skipped entirely for terminal tasks (status ``completed`` /
+    ``cancelled``). Pinned via soak 2026-05-30: Lithos ``task_update``
+    returns ``task_not_found`` for terminal tasks (upstream
+    `agent-lore/lithos#303`), so the per-poll boundary replay of a
+    just-closed issue would otherwise re-attempt and re-log
+    ``[Friction]`` every cycle. Until #303 lands, the metadata
+    snapshot (and thus reopen-finding dedup on terminal tasks) is
+    frozen at the value it had when the task went terminal — a known
+    limit documented in the lithos-schema-status memory note.
+    """
+    if task.status != "open":
+        ctx.logger.debug(
+            "github-issue-sync: drift sync skipped for terminal task %s "
+            "(Lithos #303: task_update rejects terminal tasks)",
+            task.id,
+        )
+        return
+
+    updates: dict[str, Any] = {}
+    metadata_updates: dict[str, Any] = {}
+
+    if issue.title != task.title:
+        updates["title"] = issue.title
+
+    body_sans_marker = strip_marker(issue.body)
+    current_desc = (task.description or "").strip()
+    if body_sans_marker != current_desc:
+        updates["description"] = body_sans_marker
+
+    raw_snapshot = task.metadata.get("github_labels") or ()
+    old_snapshot: list[str] = [str(label) for label in raw_snapshot]
+    new_labels = list(issue.labels)
+    if set(old_snapshot) != set(new_labels):
+        new_tags = _merge_tags_preserving_operator_adds(
+            list(task.tags), old_snapshot, new_labels
+        )
+        if set(new_tags) != set(task.tags):
+            updates["tags"] = new_tags
+        metadata_updates["github_labels"] = new_labels
+
+    if task.metadata.get("github_state_snapshot") != issue.state:
+        metadata_updates["github_state_snapshot"] = issue.state
+
+    if metadata_updates:
+        updates["metadata"] = metadata_updates
+
+    if not updates:
+        return
+
+    await _safe_call(
+        ctx,
+        ctx.lithos.task_update(
+            task_id=task.id,
+            agent=ctx.agent_id,
+            **updates,
+        ),
+        describe=f"drift-sync task {task.id}",
+    )
+
+
+def _merge_tags_preserving_operator_adds(
+    current: list[str],
+    old_snapshot: list[str],
+    new_labels: list[str],
+) -> list[str]:
+    """Reconcile Lithos task tags against a GH label diff.
+
+    - Remove tags that were in the *prior* GH snapshot but are no longer
+      in GH's current label list (GH-side removals propagate).
+    - Add tags that are in GH's current label list but not yet on the task
+      (GH-side additions propagate).
+    - Preserve everything else — operator-added Lithos tags survive
+      because they were never in any GH snapshot.
+
+    Order-stable: existing tags keep their relative position; new GH
+    labels append at the end.
+    """
+    removed = set(old_snapshot) - set(new_labels)
+    seen: set[str] = set()
+    result: list[str] = []
+    for tag in current:
+        if tag in removed or tag in seen:
+            continue
+        result.append(tag)
+        seen.add(tag)
+    for tag in new_labels:
+        if tag in seen:
+            continue
+        result.append(tag)
+        seen.add(tag)
+    return result
+
+
 async def _create_task_and_mark(
     issue: _ParsedIssue, ctx: SubscriptionContext, github: GitHubClient
 ) -> None:
@@ -297,8 +488,19 @@ async def _create_task_and_mark(
         "github_issue_url": issue.html_url,
         "github_issue_number": issue.number,
         "github_labels": list(issue.labels),
+        # Slice 7.2: bootstrap the snapshot so the reopen-finding de-dupe
+        # has a baseline. Without it, a legacy migration path treats a
+        # missing snapshot as "unknown" and could fire one spurious
+        # finding on the first poll after close→reopen.
+        "github_state_snapshot": issue.state,
     }
     tags = list(issue.labels) + [GITHUB_ISSUE_TAG]
+    # PR-review finding 1 (round 3, 2026-05-30): a failed task_create
+    # used to be swallowed as [Friction] and the handler returned
+    # normally — the watcher then advanced the cursor past the issue
+    # and that issue was permanently stranded. Propagate so the
+    # dispatcher freezes the cursor; the next poll retries from the
+    # same boundary.
     try:
         task_id = await ctx.lithos.task_create(
             title=issue.title,
@@ -314,7 +516,7 @@ async def _create_task_and_mark(
             issue.number,
             exc,
         )
-        return
+        raise
 
     ctx.logger.info(
         "github-issue-sync: created task %s for %s/#%d",
@@ -331,7 +533,7 @@ async def _apply_marker_safe(
     task_id: str,
     ctx: SubscriptionContext,
 ) -> None:
-    """Write the canonical marker to the issue body, swallowing GH errors.
+    """Write the canonical marker to the issue body; propagates GH errors.
 
     Re-fetches the issue body via ``github.get_issue`` immediately before
     the PATCH so an operator edit during the poll-to-PATCH window
@@ -346,10 +548,13 @@ async def _apply_marker_safe(
     next poll to walk the orphan-marker recovery path and produce a
     duplicate write attempt).
 
-    A marker-write failure is recoverable — the next poll's matching-URL
-    branch will retry. We don't propagate the error because that would
-    surface the issue to retry logic that would just re-do the
-    already-successful task_create.
+    A marker-write failure now propagates (PR-review finding 1, round 3,
+    2026-05-30). The watcher's inline dispatcher freezes the cursor at
+    the prior issue's ``updated_at`` and the next poll re-fetches this
+    issue — its URL-match recovery branch finds the existing task and
+    re-writes the marker without creating a duplicate. The earlier
+    swallow advanced the cursor past the unmarked issue and stranded
+    the link.
     """
     body_source = issue.body
     try:
@@ -367,6 +572,14 @@ async def _apply_marker_safe(
             body_source = fresh.body
 
     new_body = apply_marker(body_source, task_id)
+    # PR-review finding 1 (round 3, 2026-05-30): marker-write failures
+    # used to be swallowed as [Friction], which let the watcher's
+    # cursor advance past the unmarked issue. The next poll wouldn't
+    # see it again (its ``updated_at`` is below the new cursor) so the
+    # missing marker stayed orphaned indefinitely. Propagating freezes
+    # the cursor; the next poll's URL-match recovery branch re-writes
+    # the marker. We log the [Friction] line first so operators
+    # grepping for the prefix still see the event.
     try:
         await github.update_issue_body(issue.repo, issue.number, new_body)
     except GitHubError as exc:
@@ -378,40 +591,51 @@ async def _apply_marker_safe(
             task_id,
             exc,
         )
+        raise
 
 
 # ── Lithos lookup helpers ─────────────────────────────────────────────
 
 
 async def _fetch_task(ctx: SubscriptionContext, task_id: str) -> Task | None:
+    """Return the task for ``task_id`` or ``None`` if it is *confirmed* absent.
+
+    PR-review finding 2 (round 3, 2026-05-30): only
+    ``LithosClientError(code="task_not_found")`` counts as confirmed
+    absence. Transient transport / server errors must propagate so the
+    watcher's inline dispatcher freezes the cursor — swallowing them
+    here lets reconciliation fall through to the create branch and
+    duplicate the task.
+    """
     try:
         return await ctx.lithos.task_get(task_id=task_id)
     except LithosClientError as exc:
         if exc.code == "task_not_found":
             return None
-        ctx.logger.warning("github-issue-sync: task_get(%s) failed: %s", task_id, exc)
-        return None
+        raise
 
 
 async def _find_task_by_url(ctx: SubscriptionContext, url: str) -> Task | None:
     """Scan open + closed tasks for one whose metadata carries ``url``.
 
-    Used only on the operator-deleted-marker recovery path, so the
-    linear cost is bounded — open-task counts in the operator's
-    workspace are typically O(10–100), and closed-task scan is only
-    triggered when the open scan misses.
+    PR-review finding 2 (round 3, 2026-05-30): a failed ``task_list``
+    no longer falls through to ``None``. Propagation freezes the
+    watcher's cursor so the next poll re-runs the marker-recovery
+    lookup — a swallowed error here would let the create branch fire
+    and produce a duplicate task.
+
+    PR-review finding 1 (round 7, 2026-05-30): the scan is **unbounded**
+    on every status because the no-duplicate contract is locked
+    (SPEC §2.2: "Re-write the canonical marker on GitHub. No duplicate
+    task."). A round-6 self-review pass added a 30-day cutoff to bound
+    the cancelled/completed scan, but that turned a deleted-marker on
+    an old reopened issue into a fresh duplicate task — breaking the
+    contract for a speculative scaling concern. If MCP response size
+    becomes a real production problem we'll add server-side metadata
+    filtering (lithos-side) rather than client-side truncation here.
     """
     for status in ("open", "completed", "cancelled"):
-        try:
-            tasks = await ctx.lithos.task_list(status=status)
-        except (LithosClientError, OSError) as exc:
-            ctx.logger.warning(
-                "github-issue-sync: task_list(status=%s) failed during "
-                "marker-recovery: %s",
-                status,
-                exc,
-            )
-            continue
+        tasks = await ctx.lithos.task_list(status=status)
         for task in tasks:
             if task.metadata.get("github_issue_url") == url:
                 return task
@@ -419,14 +643,36 @@ async def _find_task_by_url(ctx: SubscriptionContext, url: str) -> Task | None:
 
 
 async def _safe_call(ctx: SubscriptionContext, coro: Any, *, describe: str) -> None:
-    """Await ``coro`` swallowing typed errors as [Friction] log lines.
+    """Await ``coro`` logging a [Friction] line then re-raising on failure.
 
-    The handler's retry-and-friction layer (in SubscriptionRunner)
-    only re-fires on uncaught exceptions; we want most Lithos errors
-    to log + drop rather than retry (a missing task isn't going to
-    appear if we re-run the same call).
+    Naming is now a slight misnomer — earlier rounds swallowed errors
+    here so the runner didn't retry. PR-review finding 1 (round 3,
+    2026-05-30) flipped that contract: load-bearing Lithos writes
+    (``task_update`` for drift, ``task_complete``, ``task_cancel``)
+    must surface to the watcher's inline dispatcher so the cursor
+    freezes and the next poll retries. The [Friction] log line stays
+    for the operator-grep convention.
+
+    Soak observation (2026-05-30): Lithos's ``task_update`` returns
+    ``task_not_found`` for tasks whose status is terminal
+    (``completed`` / ``cancelled``) — even though ``task_get`` happily
+    returns them. A poll that fetches a closed GH issue paired with a
+    just-completed Lithos task (the operator ticked it in Obsidian,
+    which closed both sides) then loops forever: drift-sync raises,
+    cursor freezes, stuck retry re-hits the same wall. Treat
+    ``task_not_found`` as **non-fatal**: log [Friction] but don't
+    raise, so the dispatcher advances the cursor and the stuck entry
+    drains. The spec's "drift sync always runs" contract holds at the
+    handler-call level; whether Lithos accepts the write is a server
+    concern we surface but don't loop on.
     """
     try:
         await coro
-    except (LithosClientError, OSError) as exc:
+    except LithosClientError as exc:
         ctx.logger.warning("[Friction] github-issue-sync: %s failed: %s", describe, exc)
+        if exc.code == "task_not_found":
+            return
+        raise
+    except OSError as exc:
+        ctx.logger.warning("[Friction] github-issue-sync: %s failed: %s", describe, exc)
+        raise

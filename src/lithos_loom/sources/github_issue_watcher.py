@@ -36,13 +36,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from lithos_loom.bus import Event, EventBus, Subscription
 from lithos_loom.cli._github_metadata import (
     GITHUB_WATCH_TAG,
+    extract_exclude_authors,
+    extract_exclude_labels,
     extract_github_repo,
 )
 from lithos_loom.errors import LithosClientError
@@ -58,10 +61,29 @@ from lithos_loom.lithos_client import Note, NoteSummary, WriteResult
 __all__ = [
     "GITHUB_ISSUE_EVENT_TYPE",
     "GitHubIssueWatcher",
+    "WatchedRepo",
     "WatcherLithosClient",
     "format_cursors",
     "parse_cursors",
 ]
+
+
+@dataclass(frozen=True)
+class WatchedRepo:
+    """Per-project watcher state derived from the project-context doc.
+
+    ``repo`` is the ``owner/name`` mapping; ``exclude_labels`` and
+    ``exclude_authors`` are the tag-derived import filters that the
+    sync handler uses to drop noise from automated issue creators
+    (dependabot, renovate) before ``task_create``. The filters are
+    immutable per refresh cycle so a concurrent watch-list rebuild
+    can't reshape them under a running poll.
+    """
+
+    repo: str
+    exclude_labels: tuple[str, ...] = ()
+    exclude_authors: tuple[str, ...] = ()
+
 
 logger = logging.getLogger(__name__)
 
@@ -82,18 +104,15 @@ _COORD_DOC_BODY_HEADER = (
 _BUS_QUEUE_SIZE = 256
 _MAX_COORD_DOC_CAS_ATTEMPTS = 3
 
-# GitHub's ``since=`` filter is inclusive (>=), so persisting the
-# observed-max ``updated_at`` verbatim means every subsequent poll
-# re-fetches that same boundary issue forever (the handler then no-ops
-# on the marker → open-task path, but it still costs API + Lithos
-# round-trips). One-second nudge moves the cursor past the boundary.
-# Race: an issue updated within the same wall-second AFTER our last
-# pagination completes but BEFORE we persist the cursor would be
-# missed. Acceptable for the inbound MVP — pagination drains the full
-# updated-at-asc page set per poll, so the window is small. A precise
-# fix would track the set of issue numbers seen at the boundary
-# timestamp; deferred unless soak surfaces drops.
-_CURSOR_ADVANCE = timedelta(seconds=1)
+# GitHub's ``since=`` filter is inclusive (>=). We persist the
+# observed-max ``updated_at`` verbatim and accept that the boundary
+# issue is re-fetched on the next poll: the sync handler is idempotent
+# (marker → open-task path no-ops, drift compare short-circuits) so a
+# bounded replay costs at most one extra task_list call per repo per
+# poll. The earlier ``+1 second`` nudge avoided that cost but
+# silently dropped any *other* issue updated within the same wall
+# second as the boundary — the wrong tradeoff for a correctness-
+# critical inbound mirror (PR-review finding 3).
 
 
 class WatcherLithosClient(Protocol):
@@ -133,12 +152,18 @@ class WatcherLithosClient(Protocol):
 # ── Cursor doc parser ──────────────────────────────────────────────────
 
 
+_STUCK_PREFIX = "stuck:"
+
+
 def parse_cursors(body: str) -> dict[str, datetime]:
     """Parse the coord doc body into a ``{repo: cursor}`` map.
 
     Tolerates blank lines, comment lines (anything not matching the
     ``owner/name <iso>`` shape is skipped with a debug log) and either
     UTC ``Z`` or explicit ``+00:00`` timezone suffixes.
+
+    Stuck-issue rows (``stuck:owner/name#42``) are recognised but
+    skipped here — parse them with :func:`parse_stuck`.
 
     Returns an empty dict for a fresh / unparseable doc — that's
     indistinguishable from "first poll" and the caller falls through
@@ -148,6 +173,8 @@ def parse_cursors(body: str) -> dict[str, datetime]:
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or line.startswith("Daemon"):
+            continue
+        if line.startswith(_STUCK_PREFIX):
             continue
         parts = line.split(maxsplit=1)
         if len(parts) != 2:
@@ -164,11 +191,50 @@ def parse_cursors(body: str) -> dict[str, datetime]:
     return out
 
 
-def format_cursors(cursors: dict[str, datetime]) -> str:
-    """Render a cursor map into the canonical coord doc body."""
+def parse_stuck(body: str) -> dict[str, set[int]]:
+    """Parse ``stuck:owner/name#<number>`` rows out of the coord doc.
+
+    PR-review finding 3 (round 5, 2026-05-30): the stuck-issue set is
+    persisted alongside cursors so a daemon restart between an
+    incomplete reconciliation (e.g. ``task_create`` succeeded, marker
+    PATCH failed) and the next retry doesn't lose the repair record.
+    """
+    out: dict[str, set[int]] = {}
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line.startswith(_STUCK_PREFIX):
+            continue
+        rest = line[len(_STUCK_PREFIX) :]
+        if "#" not in rest:
+            continue
+        repo, num_str = rest.rsplit("#", 1)
+        if "/" not in repo:
+            continue
+        try:
+            number = int(num_str)
+        except ValueError:
+            continue
+        out.setdefault(repo, set()).add(number)
+    return out
+
+
+def format_cursors(
+    cursors: dict[str, datetime],
+    stuck: dict[str, set[int]] | None = None,
+) -> str:
+    """Render the coord doc body.
+
+    Cursors render as ``owner/name <iso>`` rows; stuck-issue entries
+    (optional) render as ``stuck:owner/name#<number>`` rows beneath
+    them. Sorted output keeps diffs minimal across writes.
+    """
     lines = [_COORD_DOC_BODY_HEADER]
     for repo in sorted(cursors):
         lines.append(f"{repo} {_isoformat(cursors[repo])}")
+    if stuck:
+        for repo in sorted(stuck):
+            for number in sorted(stuck[repo]):
+                lines.append(f"{_STUCK_PREFIX}{repo}#{number}")
     lines.append("")  # trailing newline
     return "\n".join(lines)
 
@@ -188,6 +254,20 @@ def _isoformat(dt: datetime) -> str:
     return dt.astimezone(UTC).isoformat()
 
 
+def _copy_stuck(stuck: dict[str, set[int]]) -> dict[str, set[int]]:
+    """Deep-copy a stuck-issue map so the persisted snapshot doesn't
+    alias the live one.
+
+    PR-review finding 3 (round 5, 2026-05-30): the unchanged-content
+    short-circuit compares the current map against the persisted
+    snapshot. A shallow ``dict(stuck)`` would let live ``stuck[repo]``
+    mutations leak into the snapshot via shared ``set`` references —
+    next persist would then see "unchanged" and skip the write even
+    when an issue was added or drained.
+    """
+    return {repo: set(numbers) for repo, numbers in stuck.items()}
+
+
 # ── Source ─────────────────────────────────────────────────────────────
 
 
@@ -201,6 +281,16 @@ class GitHubIssueWatcher:
     poll_interval_seconds: int
     coord_doc_path: str
     agent_id: str
+    # Inline dispatcher for the GH→Lithos sync handler. When set, the
+    # watcher calls it per issue and ties cursor advancement to the
+    # dispatcher's success — see ``_poll_one_repo`` and PR-review
+    # finding 1 (2026-05-30). When ``None`` the watcher falls back to
+    # publishing on the bus only (legacy path, used by tests that assert
+    # on queue contents). Production wiring always injects a real
+    # dispatcher; without one, a cursor advance gets out ahead of any
+    # downstream reconciliation and dropped-queue events strand
+    # permanently.
+    dispatch: Callable[[Event], Awaitable[None]] | None = None
     # Backoff used after a polling-loop iteration that raised. Mirrors
     # :class:`LithosNoteStream` shape.
     reconnect_backoff_seconds: float = 1.0
@@ -209,8 +299,9 @@ class GitHubIssueWatcher:
     _sleep: Any = field(default=asyncio.sleep)
 
     # State derived at bootstrap.
-    _watch_list: dict[str, str] = field(default_factory=dict)
-    """``{slug: owner/name}`` — the repos the watcher polls.
+    _watch_list: dict[str, WatchedRepo] = field(default_factory=dict)
+    """``{slug: WatchedRepo}`` — the repos the watcher polls plus their
+    import-time exclude filters.
 
     Rebuilt at bootstrap and on every relevant bus event so an operator
     toggling ``github-watch`` on a project doc takes effect within a
@@ -226,6 +317,30 @@ class GitHubIssueWatcher:
     poll cycle re-wrote the coord doc even when no cursor had advanced —
     a Lithos write per minute, two SSE note.updated events per minute,
     and a steady version-counter creep that operators saw in soak."""
+    _stuck_issues: dict[str, set[int]] = field(default_factory=dict)
+    """``{repo: {issue_number, ...}}`` — per-repo set of issues whose
+    inline dispatch raised during a recent poll.
+
+    PR-review finding 2 (round 4, 2026-05-30): the bootstrap path uses
+    ``state="open"``. If the first issue in a bootstrap walk fails to
+    dispatch (e.g. marker PATCH 5xx after task_create succeeded) the
+    cursor stays ``None``; the GH issue can close before the retry,
+    after which the next bootstrap walk no longer surfaces it and the
+    linked Lithos task is permanently orphaned. Tracking the failure
+    by number lets the next poll retry via ``get_issue`` directly,
+    independent of the cursor / state-filter combination.
+
+    PR-review finding 3 (round 5, 2026-05-30): persisted in the coord
+    doc as ``stuck:<owner>/<name>#<number>`` rows so daemon restart
+    preserves the repair record. Drained on successful retry, on GH
+    404 (issue deleted), or never on permanent auth — credentials
+    might be rotated."""
+    _last_persisted_stuck: dict[str, set[int]] = field(default_factory=dict)
+    """Snapshot of :attr:`_stuck_issues` at the time of the last
+    successful coord-doc write. Paired with
+    :attr:`_last_persisted_cursors` for the unchanged-content
+    short-circuit so a steady-state poll cycle that observed no new
+    stuck entries doesn't keep re-writing the same body."""
     _coord_doc_id: str | None = None
     _coord_doc_version: int | None = None
     _coord_doc_subscription: Subscription | None = None
@@ -264,7 +379,7 @@ class GitHubIssueWatcher:
             logger.info(
                 "github-watcher: watching %d repo(s): %s",
                 len(self._watch_list),
-                sorted(self._watch_list.values()),
+                sorted(w.repo for w in self._watch_list.values()),
             )
         else:
             logger.info(
@@ -307,7 +422,7 @@ class GitHubIssueWatcher:
             )
             return
 
-        new_list: dict[str, str] = {}
+        new_list: dict[str, WatchedRepo] = {}
         for summary in summaries:
             slug = summary.slug
             if not slug:
@@ -321,15 +436,51 @@ class GitHubIssueWatcher:
                     GITHUB_WATCH_TAG,
                 )
                 continue
-            new_list[slug] = repo
+            new_list[slug] = WatchedRepo(
+                repo=repo,
+                exclude_labels=tuple(extract_exclude_labels(summary.tags)),
+                exclude_authors=tuple(extract_exclude_authors(summary.tags)),
+            )
         added = set(new_list) - set(self._watch_list)
         removed = set(self._watch_list) - set(new_list)
-        if added or removed:
+        # Filter drift on existing slugs (e.g. operator added a new
+        # `github-exclude-label:` tag) — surface that too so it's
+        # visible at INFO when the next poll starts honouring it.
+        retagged = {
+            slug
+            for slug in new_list.keys() & self._watch_list.keys()
+            if new_list[slug] != self._watch_list[slug]
+        }
+        if added or removed or retagged:
             logger.info(
-                "github-watcher: watch list refresh — added=%s removed=%s",
+                "github-watcher: watch list refresh — added=%s removed=%s retagged=%s",
                 sorted(added),
                 sorted(removed),
+                sorted(retagged),
             )
+        # PR-review finding 5 (round 3, 2026-05-30) + finding 1 (round 4,
+        # 2026-05-30): cursor must be reset whenever a slug's enrolment
+        # changes (retagged filter, slug removed, slug newly added).
+        # Without an add-side reset, a disable → restart → re-enable
+        # cycle leaves a stale cursor in the coord doc that re-loads as
+        # if no time had passed; issues created during the disabled
+        # window can be missed. With it, a freshly re-watched slug
+        # bootstraps cleanly.
+        cursor_reset_repos: set[str] = set()
+        for slug in retagged:
+            cursor_reset_repos.add(new_list[slug].repo)
+        for slug in removed:
+            cursor_reset_repos.add(self._watch_list[slug].repo)
+        for slug in added:
+            cursor_reset_repos.add(new_list[slug].repo)
+        for repo in cursor_reset_repos:
+            if repo in self._cursors:
+                logger.info(
+                    "github-watcher: resetting cursor for %s after watch-list "
+                    "change so re-included issues surface",
+                    repo,
+                )
+                self._cursors.pop(repo, None)
         self._watch_list = new_list
 
     # ── Coord doc cursors ─────────────────────────────────────────────
@@ -359,13 +510,23 @@ class GitHubIssueWatcher:
         self._coord_doc_id = note.id
         self._coord_doc_version = note.version
         self._cursors = parse_cursors(note.body)
+        # PR-review finding 3 (round 5, 2026-05-30): also reload the
+        # persisted stuck-issue set so a daemon restart between a partial
+        # task_create + marker_write and the next retry pass still
+        # surfaces the stuck issue by-number on the first poll after
+        # boot. Without this, restart loses the in-memory set and a
+        # closed-before-restart issue stays orphaned forever.
+        self._stuck_issues = parse_stuck(note.body)
         # The remote already holds what we just loaded — track it as
         # "already persisted" so the first poll-cycle's write is skipped
         # when no cursor advanced.
         self._last_persisted_cursors = dict(self._cursors)
+        self._last_persisted_stuck = _copy_stuck(self._stuck_issues)
         logger.info(
-            "github-watcher: loaded %d cursor(s) from coord doc v%d",
+            "github-watcher: loaded %d cursor(s) and %d stuck issue(s) from "
+            "coord doc v%d",
             len(self._cursors),
+            sum(len(s) for s in self._stuck_issues.values()),
             note.version,
         )
 
@@ -392,15 +553,41 @@ class GitHubIssueWatcher:
         guard and pointlessly bump the coord-doc version on the retry
         (PR-review finding round 2).
         """
+        # PR-review finding 1 (round 5, 2026-05-30): track which repos we
+        # *intend to delete* this persist call so the version_conflict
+        # reload-then-merge path can re-apply the deletions. Without
+        # tombstones, a refresh that popped a cursor would lose that
+        # intent on conflict because reload re-populates ``_cursors``
+        # from the remote (which still contains the row we wanted gone).
+        # Snapshot the intended deletions BEFORE the first write so
+        # subsequent reload+merge cycles can replay them deterministically.
+        deletions = set(self._last_persisted_cursors) - set(self._cursors)
+        # PR-review finding 3 (round 6, 2026-05-30): same pattern for
+        # stuck-issue rows. A stuck entry drained locally (issue's
+        # by-number retry succeeded, or GH returned 404) was getting
+        # resurrected when a CAS conflict reloaded the remote stuck set
+        # and merged pending entries — the remote row was preserved
+        # because we only union, never subtract. Capture per-repo
+        # number-level tombstones at entry and apply them after the
+        # reload+merge.
+        stuck_deletions: dict[str, set[int]] = {}
+        for repo, numbers in self._last_persisted_stuck.items():
+            current = self._stuck_issues.get(repo, set())
+            removed = numbers - current
+            if removed:
+                stuck_deletions[repo] = removed
         attempts = 0
         while True:
-            if self._cursors == self._last_persisted_cursors:
+            cursors_unchanged = self._cursors == self._last_persisted_cursors
+            stuck_unchanged = self._stuck_issues == self._last_persisted_stuck
+            if cursors_unchanged and stuck_unchanged:
                 logger.debug(
-                    "github-watcher: coord doc write skipped — cursors unchanged"
+                    "github-watcher: coord doc write skipped — cursors and "
+                    "stuck-set unchanged"
                 )
                 return
             attempts += 1
-            body = format_cursors(self._cursors)
+            body = format_cursors(self._cursors, self._stuck_issues)
             try:
                 result = await self.lithos.note_write(
                     agent=self.agent_id,
@@ -424,11 +611,14 @@ class GitHubIssueWatcher:
                 self._coord_doc_id = result.note.id
                 self._coord_doc_version = result.note.version
                 self._last_persisted_cursors = dict(self._cursors)
+                self._last_persisted_stuck = _copy_stuck(self._stuck_issues)
+                stuck_count = sum(len(s) for s in self._stuck_issues.values())
                 logger.info(
-                    "github-watcher: coord doc %s → v%d (%d cursor(s))",
+                    "github-watcher: coord doc %s → v%d (%d cursor(s), %d stuck)",
                     result.status,
                     result.note.version,
                     len(self._cursors),
+                    stuck_count,
                 )
                 return
             if result.status == "version_conflict":
@@ -446,15 +636,39 @@ class GitHubIssueWatcher:
                     attempts,
                     _MAX_COORD_DOC_CAS_ATTEMPTS,
                 )
-                # Hold our pending advances; the load step will replace
-                # ``_cursors`` with the remote view, then we re-merge so
-                # the just-observed advances aren't lost.
+                # Hold our pending advances + stuck-issue set; the load
+                # step will replace ``_cursors`` and ``_stuck_issues``
+                # with the remote view, then we re-merge so the just-
+                # observed advances aren't lost.
                 pending = dict(self._cursors)
+                pending_stuck = _copy_stuck(self._stuck_issues)
                 await self._load_cursors_from_coord_doc()
                 for repo, ts in pending.items():
                     remote_ts = self._cursors.get(repo)
                     if remote_ts is None or ts > remote_ts:
                         self._cursors[repo] = ts
+                # Merge pending stuck entries: union per repo. Remote may
+                # have stuck entries from another writer we want to keep,
+                # and we may have new ones from this poll.
+                for repo, numbers in pending_stuck.items():
+                    self._stuck_issues.setdefault(repo, set()).update(numbers)
+                # Re-apply intended deletions captured at function entry
+                # (PR-review finding 1, round 5, 2026-05-30). Without
+                # this, a cursor we explicitly popped is restored by
+                # reload and silently lives on in the next write.
+                for repo in deletions:
+                    self._cursors.pop(repo, None)
+                # Same tombstone re-application for stuck entries —
+                # PR-review finding 3, round 6, 2026-05-30. Without
+                # this, draining a row locally and then hitting a CAS
+                # conflict resurrects the row from the remote view.
+                for repo, numbers in stuck_deletions.items():
+                    remote_set = self._stuck_issues.get(repo)
+                    if remote_set is None:
+                        continue
+                    remote_set.difference_update(numbers)
+                    if not remote_set:
+                        self._stuck_issues.pop(repo, None)
                 continue
             logger.warning(
                 "github-watcher: unexpected coord doc write status %r: %s",
@@ -502,9 +716,17 @@ class GitHubIssueWatcher:
             try:
                 await self._poll_all_repos()
                 # Single coord doc write after the full pass — one round-
-                # trip per poll, not one per repo.
-                if self._cursors:
-                    await self._persist_cursors()
+                # trip per poll, not one per repo. PR-review finding 1
+                # (round 4, 2026-05-30): always call through, even with
+                # an empty cursor map. The previous `if self._cursors:`
+                # guard short-circuited persistence after every slug got
+                # removed, leaving stale rows in the coord doc; on
+                # restart the daemon then resumed from those stale
+                # cursors and could miss issues created during the
+                # disabled window. _persist_cursors itself short-circuits
+                # via the unchanged-cursors check, so an empty map that's
+                # already on disk stays a no-op.
+                await self._persist_cursors()
                 backoff = self.reconnect_backoff_seconds
                 await self._sleep(self.poll_interval_seconds)
             except asyncio.CancelledError:
@@ -525,8 +747,74 @@ class GitHubIssueWatcher:
             logger.debug("github-watcher: poll cycle skipped; watch list empty")
             return
         logger.info("github-watcher: poll cycle starting (%d repo(s))", len(items))
-        for slug, repo in items:
-            await self._poll_one_repo(slug=slug, repo=repo)
+        for slug, watched in items:
+            await self._poll_one_repo(slug=slug, repo=watched.repo)
+
+    async def _retry_stuck_issues(self, *, slug: str, repo: str) -> bool:
+        """Retry issues whose dispatch failed in a previous poll.
+
+        Returns ``True`` if every stuck issue dispatched cleanly (or was
+        deleted on GH), ``False`` if anything is still stuck. Callers
+        defer the normal cursor-based fetch on ``False`` so a persistent
+        failure doesn't accumulate fresh entries on top of the unresolved
+        ones.
+
+        Each issue is re-fetched via ``get_issue`` instead of relying on
+        the cursor + state filter — the bootstrap path (state="open")
+        wouldn't surface an issue that closed since the previous
+        attempt, but the per-issue PATCH-equivalent ``GET`` does.
+        """
+        stuck = self._stuck_issues.get(repo)
+        if not stuck:
+            return True
+        for number in list(stuck):
+            try:
+                issue = await self.github.get_issue(repo, number)
+            except GitHubError as exc:
+                # PR-review finding 2 (round 5, 2026-05-30): auth errors
+                # used to drop the entry here. They aren't actually
+                # permanent — the operator might rotate `gh auth` and
+                # come back. Keep the entry; only ``None`` (issue
+                # genuinely deleted on GH, returned by ``get_issue``
+                # short-circuit on 404) or a successful dispatch retires
+                # the entry. ``get_issue`` itself never raises
+                # ``GitHubRepoNotFoundError`` — the 404 short-circuits
+                # to ``None`` — so all subclasses here are effectively
+                # transient.
+                logger.warning(
+                    "github-watcher: re-fetch of stuck %s/#%d transient (%s: %s); "
+                    "leaving in stuck set",
+                    repo,
+                    number,
+                    type(exc).__name__,
+                    exc,
+                )
+                return False
+            if issue is None:
+                # GH issue deleted in the interim — nothing to reconcile.
+                logger.info(
+                    "github-watcher: stuck %s/#%d gone on GH; dropping from stuck set",
+                    repo,
+                    number,
+                )
+                stuck.discard(number)
+                continue
+            try:
+                await self._publish_issue(slug=slug, issue=issue)
+            except Exception as exc:
+                logger.warning(
+                    "[Friction] github-watcher: stuck %s/#%d dispatch still "
+                    "fails (%s: %s); will retry next poll",
+                    repo,
+                    number,
+                    type(exc).__name__,
+                    exc,
+                )
+                return False
+            stuck.discard(number)
+        if not stuck:
+            self._stuck_issues.pop(repo, None)
+        return True
 
     async def _poll_one_repo(self, *, slug: str, repo: str) -> None:
         """Fetch issues for one repo, emit events, advance the cursor.
@@ -548,7 +836,19 @@ class GitHubIssueWatcher:
         (the project doc still owns the mapping; next refresh will
         re-add it if the operator fixes the typo). Auth/rate-limit
         errors are logged but don't propagate — the next pass retries.
+
+        PR-review finding 2 (round 4, 2026-05-30): before the regular
+        fetch, retry any issues that failed dispatch in a previous poll
+        via ``get_issue`` directly. The bootstrap path uses
+        ``state="open"`` and would lose a closed-before-retry issue
+        otherwise; retrying by number is cursor-independent and survives
+        the close transition.
         """
+        if not await self._retry_stuck_issues(slug=slug, repo=repo):
+            # A stuck issue still failed; defer the new-fetch this poll
+            # so we don't keep racking up additional stuck entries while
+            # the underlying problem persists.
+            return
         since = self._cursors.get(repo)
         state = "open" if since is None else "all"
         try:
@@ -580,12 +880,36 @@ class GitHubIssueWatcher:
             return
 
         prior_cursor = since
+        # GitHub returns issues sorted by ``updated_at`` ascending
+        # (``sort=updated&direction=asc`` in list_issues_since). Walk in
+        # order so a mid-batch dispatch failure leaves the cursor at the
+        # latest *successfully reconciled* issue rather than skipping
+        # ahead — PR-review finding 1 (2026-05-30) was that the prior
+        # max-after-the-loop pattern allowed bus drops AND handler
+        # failures to permanently strand events.
+        max_committed: datetime | None = None
+        dispatch_failed_at: datetime | None = None
         for issue in issues:
-            await self._publish_issue(slug=slug, issue=issue)
+            try:
+                await self._publish_issue(slug=slug, issue=issue)
+            except Exception as exc:
+                dispatch_failed_at = issue.updated_at
+                self._stuck_issues.setdefault(repo, set()).add(issue.number)
+                logger.warning(
+                    "[Friction] github-watcher: dispatch for %s/#%d failed "
+                    "(%s: %s); holding cursor at %s and tagging issue for "
+                    "by-number retry next poll",
+                    repo,
+                    issue.number,
+                    type(exc).__name__,
+                    exc,
+                    _isoformat(max_committed) if max_committed else "<unchanged>",
+                )
+                break
+            max_committed = issue.updated_at
 
-        if issues:
-            new_cursor = max(iss.updated_at for iss in issues) + _CURSOR_ADVANCE
-            self._cursors[repo] = new_cursor
+        if max_committed is not None:
+            self._cursors[repo] = max_committed
             logger.info(
                 "github-watcher: %s — %d issue(s) %s (state=%s, cursor %s → %s)",
                 repo,
@@ -593,7 +917,16 @@ class GitHubIssueWatcher:
                 "bootstrapped" if prior_cursor is None else "delta",
                 state,
                 _isoformat(prior_cursor) if prior_cursor is not None else "<first-run>",
-                _isoformat(new_cursor),
+                _isoformat(max_committed),
+            )
+        elif issues and dispatch_failed_at is not None:
+            # First issue failed — cursor unchanged so the next poll
+            # re-fetches and retries.
+            logger.info(
+                "github-watcher: %s — first dispatch failed at %s; "
+                "cursor unchanged (will retry next poll)",
+                repo,
+                _isoformat(dispatch_failed_at),
             )
         else:
             logger.info(
@@ -604,22 +937,41 @@ class GitHubIssueWatcher:
             )
 
     async def _publish_issue(self, *, slug: str, issue: Issue) -> None:
-        await self.bus.publish(
-            Event(
-                type=GITHUB_ISSUE_EVENT_TYPE,
-                timestamp=issue.updated_at,
-                payload={
-                    "slug": slug,
-                    "repo": issue.repo,
-                    "number": issue.number,
-                    "title": issue.title,
-                    "body": issue.body,
-                    "state": issue.state,
-                    "state_reason": issue.state_reason,
-                    "labels": list(issue.labels),
-                    "author": issue.author,
-                    "html_url": issue.html_url,
-                    "updated_at": _isoformat(issue.updated_at),
-                },
-            )
+        """Build the event for ``issue`` and dispatch.
+
+        When :attr:`dispatch` is injected (production), call it inline
+        and propagate any exception so the caller can hold the cursor at
+        the prior successful issue. When ``None`` (legacy / tests that
+        assert on bus queue contents), publish onto the in-process bus
+        which silently drops on queue-full — *not* a path the production
+        wiring should rely on for correctness.
+        """
+        watched = self._watch_list.get(slug)
+        # The slug being absent here is a defensive guard — _poll_all_repos
+        # iterates the watch list, so a race with refresh is the only way
+        # to land here. Treat as "no filters" rather than crashing.
+        exclude_labels = list(watched.exclude_labels) if watched else []
+        exclude_authors = list(watched.exclude_authors) if watched else []
+        event = Event(
+            type=GITHUB_ISSUE_EVENT_TYPE,
+            timestamp=issue.updated_at,
+            payload={
+                "slug": slug,
+                "repo": issue.repo,
+                "number": issue.number,
+                "title": issue.title,
+                "body": issue.body,
+                "state": issue.state,
+                "state_reason": issue.state_reason,
+                "labels": list(issue.labels),
+                "author": issue.author,
+                "html_url": issue.html_url,
+                "updated_at": _isoformat(issue.updated_at),
+                "exclude_labels": exclude_labels,
+                "exclude_authors": exclude_authors,
+            },
         )
+        if self.dispatch is not None:
+            await self.dispatch(event)
+            return
+        await self.bus.publish(event)

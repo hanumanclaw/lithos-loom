@@ -1,26 +1,29 @@
-"""Helpers for the github-watcher CLI subcommands (Slice 7.1).
+"""Helpers for the github-watcher CLI subcommands.
 
-The watcher's per-project config (which repo, watching on/off) is
-persisted as **tags** on the canonical project-context doc. Tags are
-the only field on Lithos's note-write MCP surface that accepts free-
-form values today, so they're the storage layer:
+The watcher's per-project config (which repo, watching on/off, exclude
+filters) is persisted as **tags** on the canonical project-context
+doc. Tags are the only field on Lithos's note-write MCP surface that
+accepts free-form values today, so they're the storage layer:
 
 - ``github-repo:<owner>/<name>`` — exactly one per project; presence
   is what makes the watcher consider this project.
 - ``github-watch`` — presence means watching is enabled; absence
   means paused. Removing it lets the operator stop the watcher
   without losing the repo mapping.
+- ``github-exclude-label:<name>`` — at import time, issues carrying
+  this label are skipped before ``task_create``. Already-linked tasks
+  are unaffected (PRD: "exclude is only at import time").
+- ``github-exclude-author:<login>`` — same shape; filters by GH author.
 
 This module hosts the read-mutate-write CAS loop the three CLI
 subcommands share. ``project.py`` consumes it via thin Typer
 wrappers, mirroring the ``_project_import_bulk`` / ``_regenerate_done``
 extraction pattern.
 
-Exclude-filter storage (``github_issue_exclude_labels`` /
-``..._authors``) is deferred to Slice 7.2 alongside the bidirectional
-sync work; the storage decision for those is non-trivial (tag-name
-escaping for labels containing colons / brackets) and isn't blocking
-the inbound-mirror MVP.
+Exclude tag values are exact-match strings; GitHub label names that
+contain characters outside the tag-safe set (e.g. spaces) cannot be
+filtered today — operators with such labels rename them or rely on
+the broader author filter.
 """
 
 from __future__ import annotations
@@ -34,10 +37,14 @@ from lithos_loom.errors import LithosClientError
 from lithos_loom.lithos_client import LithosClient, Note
 
 __all__ = [
+    "GITHUB_EXCLUDE_AUTHOR_PREFIX",
+    "GITHUB_EXCLUDE_LABEL_PREFIX",
     "GITHUB_REPO_TAG_PREFIX",
     "GITHUB_WATCH_TAG",
     "GithubMetadataError",
     "NoteMutationResult",
+    "extract_exclude_authors",
+    "extract_exclude_labels",
     "extract_github_repo",
     "is_github_watching",
     "mutate_project_context_tags",
@@ -46,6 +53,8 @@ __all__ = [
 
 GITHUB_REPO_TAG_PREFIX = "github-repo:"
 GITHUB_WATCH_TAG = "github-watch"
+GITHUB_EXCLUDE_LABEL_PREFIX = "github-exclude-label:"
+GITHUB_EXCLUDE_AUTHOR_PREFIX = "github-exclude-author:"
 
 # GitHub's repo-name rules: owner is 1–39 alphanumerics with hyphens
 # allowed inside (no leading/trailing hyphen); name is 1–100 chars of
@@ -125,6 +134,37 @@ def extract_github_repo(tags: tuple[str, ...] | list[str]) -> str | None:
 
 def is_github_watching(tags: tuple[str, ...] | list[str]) -> bool:
     return GITHUB_WATCH_TAG in tags
+
+
+def extract_exclude_labels(tags: tuple[str, ...] | list[str]) -> list[str]:
+    """Return the GH-label names this project excludes at import time.
+
+    Order-preserving so the operator's tag order in the doc is the
+    order shown in logs. Duplicate tags collapse — re-adding the same
+    exclude in the doc is a no-op rather than counted twice.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for tag in tags:
+        if tag.startswith(GITHUB_EXCLUDE_LABEL_PREFIX):
+            value = tag[len(GITHUB_EXCLUDE_LABEL_PREFIX) :]
+            if value and value not in seen:
+                result.append(value)
+                seen.add(value)
+    return result
+
+
+def extract_exclude_authors(tags: tuple[str, ...] | list[str]) -> list[str]:
+    """Return the GH author logins this project excludes at import time."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for tag in tags:
+        if tag.startswith(GITHUB_EXCLUDE_AUTHOR_PREFIX):
+            value = tag[len(GITHUB_EXCLUDE_AUTHOR_PREFIX) :]
+            if value and value not in seen:
+                result.append(value)
+                seen.add(value)
+    return result
 
 
 # ── Mutation ──────────────────────────────────────────────────────────

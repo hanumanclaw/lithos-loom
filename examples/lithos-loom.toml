@@ -239,16 +239,26 @@ tags = ["trigger:story-review-human"]
 # max_delay_seconds = 30.0
 
 
-# ── Slice 7.1: GitHub issue watcher (GitHub → Lithos, polling) ─────────
+# ── GitHub issue watcher (bidirectional) ──────────────────────────────
 #
 # Polls every project-context doc tagged `github-watch` for new and
 # updated open issues on its mapped GitHub repo, materialises each
 # unseen issue as a Lithos task carrying metadata.github_issue_url
 # (so the operator's daily Lithos view includes externally-reported
-# work), and mirrors GH closure to lithos_task_complete /
-# lithos_task_cancel based on the issue's state_reason. Per-project
-# mapping is set via `lithos-loom project set-github-repo <slug>
-# <owner/name>` and toggled via `enable-github` / `disable-github`.
+# work), and keeps the two surfaces aligned in both directions:
+#
+#   GH → Lithos: title / body / labels mirror to the linked task on
+#   every poll; GH close mirrors to task_complete / task_cancel based
+#   on the issue's state_reason. Reopen of a closed issue against a
+#   terminal Lithos task posts a one-shot [ReopenRequested] finding.
+#
+#   Lithos → GH: task_complete / task_cancel close the linked GH
+#   issue with state_reason=completed / not_planned; title renames
+#   PATCH the GH issue title. Driven by lithos.task.* events on the
+#   in-process bus.
+#
+# Per-project mapping is set via `lithos-loom project set-github-repo
+# <slug> <owner/name>` and toggled via `enable-github` / `disable-github`.
 #
 # Per-host gate (D50): enable on at most one host. The watcher uses
 # `gh auth token` at startup, so the host must have `gh` on PATH
@@ -259,3 +269,16 @@ tags = ["trigger:story-review-human"]
 # enabled               = true
 # poll_interval_seconds = 60
 # coord_doc_path        = "projects/_lithos-loom-internal/github-watcher-state.md"
+# resolved_replay_days  = 7
+# # How far back the embedded LithosEventStream replays resolved task
+# # events at bootstrap. A task closed (or renamed) while the watcher
+# # was down still mirrors to GH on restart via the replay. The push
+# # handler is idempotent (refetches GH before PATCH) so a too-large
+# # window only costs harmless re-checks. Set to 0 to disable replay.
+# reconcile_interval_minutes = 60
+# # Cadence of the periodic Lithos→GH reconciliation sweep. The push
+# # consumer's in-memory retry budget tops out at ~4 minutes; outages
+# # longer than that drop events that only recover on next restart.
+# # The sweep closes that gap while the daemon keeps running — every
+# # interval it re-dispatches GH-linked Lithos tasks through the push
+# # handler. Set to 0 to disable.
