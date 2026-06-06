@@ -175,6 +175,11 @@ class Note:
     note_type: str | None
     path: str  # e.g. "projects/lithos-loom/context.md"
     slug: str  # derived: first path segment after "projects/"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    """Free-form key/value metadata (Lithos ``extra``). Persisted via
+    ``lithos_write(metadata=...)`` and returned by ``lithos_read`` /
+    ``lithos_list``. The github-watcher stores its per-project config
+    here (repo list, watch flag, exclude filters)."""
 
 
 @dataclass(frozen=True)
@@ -197,6 +202,10 @@ class NoteSummary:
     note_type: str | None
     path: str
     slug: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    """Free-form key/value metadata (Lithos ``extra``) — present on
+    ``lithos_list`` items, so the github-watcher reads its per-project
+    config straight from the enumeration without a follow-up read."""
 
 
 @dataclass(frozen=True)
@@ -1074,6 +1083,7 @@ class LithosClient:
         id: str | None = None,
         expected_version: int | None = None,
         status: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> WriteResult:
         """Create or update a Lithos KB doc; returns a :class:`WriteResult`.
 
@@ -1096,6 +1106,13 @@ class LithosClient:
         for project context docs (which use the ``concept`` enum value
         + a ``project-context`` tag, since the enum doesn't
         have a dedicated value).
+
+        ``metadata`` is free-form key/value data persisted into the
+        doc's Lithos ``extra``. On update it is an additive per-key
+        merge (a key whose value is ``None`` deletes it); ``None``
+        omits the field and preserves existing metadata. Do **not**
+        pass ``{}`` to update — Lithos treats an empty dict as
+        "clear all metadata".
         """
         agent_id = agent or self.agent_id
         if not agent_id:
@@ -1116,6 +1133,8 @@ class LithosClient:
             arguments["expected_version"] = expected_version
         if status is not None:
             arguments["status"] = status
+        if metadata is not None:
+            arguments["metadata"] = metadata
         payload = await self._call_for_write_result("lithos_write", arguments)
         result = _parse_write_result(payload)
         # Real Lithos's success envelope is top-level
@@ -1166,6 +1185,7 @@ class LithosClient:
         path_prefix: str | None = None,
         tags: list[str] | None = None,
         limit: int = 100,
+        metadata_match: dict[str, Any] | None = None,
     ) -> list[NoteSummary]:
         """Enumerate KB docs matching the filters. Returns a list of
         lightweight :class:`NoteSummary` (no body).
@@ -1173,6 +1193,12 @@ class LithosClient:
         ``path_prefix`` is the cheapest server-side filter for
         directory-scoped enumeration (e.g. ``"projects/"`` for project-context docs).
         ``tags`` narrows further (e.g. ``["project-context"]``).
+        ``metadata_match`` filters by free-form metadata (AND across
+        keys); each ``key: q`` matches a doc whose stored value equals
+        ``q`` or is a list containing ``q`` — so
+        ``{"github_watch_enabled": True}`` selects watched projects and
+        ``{"github_repos": "owner/name"}`` selects projects mapping that
+        repo. Query values must be scalars.
 
         ``limit`` is forwarded as-is; the projection bootstrap caps it
         at 100 by default, which comfortably exceeds the user's 20-ish
@@ -1188,6 +1214,8 @@ class LithosClient:
             arguments["path_prefix"] = path_prefix
         if tags is not None:
             arguments["tags"] = tags
+        if metadata_match is not None:
+            arguments["metadata_match"] = metadata_match
         result = await self._invoke("lithos_list", arguments)
         return _parse_note_list_response(result)
 
@@ -1441,6 +1469,14 @@ def _parse_note(raw: Any, *, body_required: bool) -> Note:
             metadata = {}
         tags_raw = metadata.get("tags") or raw.get("tags") or []
         version_raw = metadata.get("version") or raw.get("version") or 0
+        # Free-form metadata lives in two different shapes across the
+        # MCP surface: ``lithos_read`` nests it under
+        # ``metadata["extra"]`` (the envelope also carries tags/version);
+        # ``lithos_list`` items put the extra dict directly under the
+        # ``metadata`` key (tags sit top-level). ``body_required``
+        # distinguishes the two callers, so branch on it.
+        extra_raw = metadata.get("extra") if body_required else metadata
+        extra = dict(extra_raw) if isinstance(extra_raw, dict) else {}
         body_raw = raw.get("content")
         if body_required and body_raw is None:
             raise LithosClientError(
@@ -1452,13 +1488,18 @@ def _parse_note(raw: Any, *, body_required: bool) -> Note:
             body=str(body_raw or ""),
             version=int(version_raw),
             updated_at=_parse_iso_datetime(
-                metadata.get("updated_at") or raw.get("updated_at")
+                # ``lithos_read`` envelopes carry ``updated_at``;
+                # ``lithos_list`` items name the same field ``updated``.
+                metadata.get("updated_at")
+                or raw.get("updated_at")
+                or raw.get("updated")
             ),
             tags=tuple(str(t) for t in tags_raw),
             status=_optional_str(metadata.get("status") or raw.get("status")),
             note_type=_optional_str(metadata.get("note_type") or raw.get("note_type")),
             path=path,
             slug=_slug_from_path(path),
+            metadata=extra,
         )
     except KeyError as exc:
         raise LithosClientError(
@@ -1491,6 +1532,7 @@ def _parse_note_summary(raw: Any) -> NoteSummary:
         note_type=note.note_type,
         path=note.path,
         slug=note.slug,
+        metadata=note.metadata,
     )
 
 

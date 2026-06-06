@@ -30,9 +30,9 @@ State on the Lithos task:
     }
 
 The exclude-filter knobs (``github_issue_exclude_labels`` /
-``..._authors``) are sourced from per-project tag prefixes
-(``github-exclude-label:<name>`` / ``github-exclude-author:<login>``)
-and shipped on every event payload by the watcher. The handler applies
+``..._authors``) are sourced from the project-context doc's
+``github_exclude_labels`` / ``github_exclude_authors`` metadata and
+shipped on every event payload by the watcher. The handler applies
 them only at import time — already-linked tasks survive an after-the-
 fact filter add (PRD: "exclude is only at import time").
 """

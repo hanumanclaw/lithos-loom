@@ -1,29 +1,27 @@
 """Helpers for the github-watcher CLI subcommands.
 
-The watcher's per-project config (which repo, watching on/off, exclude
-filters) is persisted as **tags** on the canonical project-context
-doc. Tags are the only field on Lithos's note-write MCP surface that
-accepts free-form values today, so they're the storage layer:
+The watcher's per-project config is persisted in the canonical
+project-context doc's free-form Lithos metadata (the document ``extra``
+dict), under these keys:
 
-- ``github-repo:<owner>/<name>`` — exactly one per project; presence
-  is what makes the watcher consider this project.
-- ``github-watch`` — presence means watching is enabled; absence
-  means paused. Removing it lets the operator stop the watcher
-  without losing the repo mapping.
-- ``github-exclude-label:<name>`` — at import time, issues carrying
-  this label are skipped before ``task_create``. Already-linked tasks
-  are unaffected (PRD: "exclude is only at import time").
-- ``github-exclude-author:<login>`` — same shape; filters by GH author.
+- ``github_repos`` — list of ``owner/name`` strings. A project may map
+  to several repos; a non-empty list is what makes the watcher consider
+  this project.
+- ``github_watch_enabled`` — ``True`` while watching is on, ``False``
+  when paused. Toggling it off leaves the repo list intact.
+- ``github_exclude_labels`` — list of GH-label names. At import time,
+  issues carrying any of these are skipped before ``task_create``.
+  Already-linked tasks are unaffected (PRD: "exclude is only at import
+  time"). The filter applies to every repo the project maps.
+- ``github_exclude_authors`` — list of GH author logins; same shape.
 
-This module hosts the read-mutate-write CAS loop the three CLI
-subcommands share. ``project.py`` consumes it via thin Typer
-wrappers, mirroring the ``_project_import_bulk`` / ``_regenerate_done``
-extraction pattern.
+This module hosts the read-mutate-write CAS loop the CLI subcommands
+share. ``project.py`` consumes it via thin Typer wrappers, mirroring the
+``_project_import_bulk`` / ``_regenerate_done`` extraction pattern.
 
-Exclude tag values are exact-match strings; GitHub label names that
-contain characters outside the tag-safe set (e.g. spaces) cannot be
-filtered today — operators with such labels rename them or rely on
-the broader author filter.
+Metadata values are typed JSON (lists, bools, strings), so — unlike the
+earlier tag encoding — label names containing spaces are stored
+verbatim.
 """
 
 from __future__ import annotations
@@ -31,30 +29,31 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from lithos_loom.config import LoomConfig
 from lithos_loom.errors import LithosClientError
 from lithos_loom.lithos_client import LithosClient, Note
 
 __all__ = [
-    "GITHUB_EXCLUDE_AUTHOR_PREFIX",
-    "GITHUB_EXCLUDE_LABEL_PREFIX",
-    "GITHUB_REPO_TAG_PREFIX",
-    "GITHUB_WATCH_TAG",
+    "GITHUB_EXCLUDE_AUTHORS_KEY",
+    "GITHUB_EXCLUDE_LABELS_KEY",
+    "GITHUB_REPOS_KEY",
+    "GITHUB_WATCH_KEY",
     "GithubMetadataError",
     "NoteMutationResult",
     "extract_exclude_authors",
     "extract_exclude_labels",
-    "extract_github_repo",
+    "extract_github_repos",
     "is_github_watching",
-    "mutate_project_context_tags",
+    "mutate_project_context_metadata",
     "validate_github_repo",
 ]
 
-GITHUB_REPO_TAG_PREFIX = "github-repo:"
-GITHUB_WATCH_TAG = "github-watch"
-GITHUB_EXCLUDE_LABEL_PREFIX = "github-exclude-label:"
-GITHUB_EXCLUDE_AUTHOR_PREFIX = "github-exclude-author:"
+GITHUB_REPOS_KEY = "github_repos"
+GITHUB_WATCH_KEY = "github_watch_enabled"
+GITHUB_EXCLUDE_LABELS_KEY = "github_exclude_labels"
+GITHUB_EXCLUDE_AUTHORS_KEY = "github_exclude_authors"
 
 # GitHub's repo-name rules: owner is 1–39 alphanumerics with hyphens
 # allowed inside (no leading/trailing hyphen); name is 1–100 chars of
@@ -73,7 +72,7 @@ _MAX_CAS_ATTEMPTS = 3
 
 
 class GithubMetadataError(Exception):
-    """Raised when the CLI cannot complete a project-context tag mutation.
+    """Raised when the CLI cannot complete a project-context mutation.
 
     Wraps the user-actionable cases: doc not found for the slug,
     invalid ``owner/name`` form, exhausted CAS retries. The CLI
@@ -83,16 +82,16 @@ class GithubMetadataError(Exception):
 
 @dataclass(frozen=True)
 class NoteMutationResult:
-    """Outcome of a tag-mutation round-trip.
+    """Outcome of a metadata-mutation round-trip.
 
-    ``new_tags`` carries the post-write tag list so the CLI can print
+    ``new_metadata`` carries the post-write metadata so the CLI can print
     a confirmation that reflects the actual state in Lithos, not the
     diff the operator requested.
     """
 
     note_id: str
     path: str
-    new_tags: tuple[str, ...]
+    new_metadata: dict[str, Any]
     changed: bool
 
 
@@ -114,57 +113,56 @@ def validate_github_repo(value: str) -> str:
     return value
 
 
-# ── Tag inspection ────────────────────────────────────────────────────
+# ── Metadata inspection ───────────────────────────────────────────────
 
 
-def extract_github_repo(tags: tuple[str, ...] | list[str]) -> str | None:
-    """Return the ``owner/name`` carried by a ``github-repo:`` tag.
-
-    Returns ``None`` when no such tag is present. If multiple are
-    present (the CLI never writes more than one but operator drift
-    could), the first wins — the watcher loops on the same canonical
-    list every poll so an ambiguous repo set would be visible from
-    the doc anyway.
-    """
-    for tag in tags:
-        if tag.startswith(GITHUB_REPO_TAG_PREFIX):
-            return tag[len(GITHUB_REPO_TAG_PREFIX) :]
-    return None
-
-
-def is_github_watching(tags: tuple[str, ...] | list[str]) -> bool:
-    return GITHUB_WATCH_TAG in tags
-
-
-def extract_exclude_labels(tags: tuple[str, ...] | list[str]) -> list[str]:
-    """Return the GH-label names this project excludes at import time.
-
-    Order-preserving so the operator's tag order in the doc is the
-    order shown in logs. Duplicate tags collapse — re-adding the same
-    exclude in the doc is a no-op rather than counted twice.
-    """
+def _str_list(value: Any) -> list[str]:
+    """Coerce a stored metadata value into an order-preserving, de-duped
+    list of non-empty strings. Tolerates a bare string (treated as a
+    one-element list) and non-list junk (treated as empty). Non-string
+    list elements are ignored rather than coerced — a stray ``None`` or
+    ``int`` from a hand-edited doc must not become a phantom repo/label."""
+    if isinstance(value, str):
+        items: list[Any] = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        return []
     seen: set[str] = set()
     result: list[str] = []
-    for tag in tags:
-        if tag.startswith(GITHUB_EXCLUDE_LABEL_PREFIX):
-            value = tag[len(GITHUB_EXCLUDE_LABEL_PREFIX) :]
-            if value and value not in seen:
-                result.append(value)
-                seen.add(value)
+    for item in items:
+        if not isinstance(item, str) or not item or item in seen:
+            continue
+        result.append(item)
+        seen.add(item)
     return result
 
 
-def extract_exclude_authors(tags: tuple[str, ...] | list[str]) -> list[str]:
+def extract_github_repos(metadata: dict[str, Any]) -> list[str]:
+    """Return the ``owner/name`` repos this project maps.
+
+    Empty list when the project has no repo mapping. Order-preserving
+    and de-duped so the watcher logs a stable repo order.
+    """
+    return _str_list(metadata.get(GITHUB_REPOS_KEY))
+
+
+def is_github_watching(metadata: dict[str, Any]) -> bool:
+    # Strict identity, not truthiness: a hand-edited doc storing the
+    # string "false" (or any non-bool) must NOT read as enabled. The
+    # watcher's discovery filter (metadata_match) is likewise
+    # type-sensitive, so only a real ``True`` enrols a project.
+    return metadata.get(GITHUB_WATCH_KEY) is True
+
+
+def extract_exclude_labels(metadata: dict[str, Any]) -> list[str]:
+    """Return the GH-label names this project excludes at import time."""
+    return _str_list(metadata.get(GITHUB_EXCLUDE_LABELS_KEY))
+
+
+def extract_exclude_authors(metadata: dict[str, Any]) -> list[str]:
     """Return the GH author logins this project excludes at import time."""
-    seen: set[str] = set()
-    result: list[str] = []
-    for tag in tags:
-        if tag.startswith(GITHUB_EXCLUDE_AUTHOR_PREFIX):
-            value = tag[len(GITHUB_EXCLUDE_AUTHOR_PREFIX) :]
-            if value and value not in seen:
-                result.append(value)
-                seen.add(value)
-    return result
+    return _str_list(metadata.get(GITHUB_EXCLUDE_AUTHORS_KEY))
 
 
 # ── Mutation ──────────────────────────────────────────────────────────
@@ -174,25 +172,26 @@ def _canonical_project_context_path(slug: str) -> str:
     return f"projects/{slug}/{slug}-project-context.md"
 
 
-async def mutate_project_context_tags(
+async def mutate_project_context_metadata(
     *,
     cfg: LoomConfig,
     slug: str,
-    mutator: Callable[[list[str]], list[str]],
+    mutator: Callable[[dict[str, Any]], dict[str, Any]],
     action_summary: str,
 ) -> NoteMutationResult:
-    """Apply ``mutator`` to a project-context doc's tag list and CAS-write.
+    """Apply ``mutator`` to a project-context doc's metadata and CAS-write.
 
     Wraps the full read-mutate-write loop:
 
     1. Open a single ``LithosClient`` context.
     2. ``note_read`` the canonical ``projects/<slug>/<slug>-project-
        context.md``.
-    3. Apply ``mutator`` (which receives a copy of the current tags
-       and returns the new list).
-    4. ``note_write`` with ``expected_version`` for CAS protection.
-    5. On ``version_conflict``: re-read and re-apply the mutator. Up
-       to :data:`_MAX_CAS_ATTEMPTS` total attempts before giving up.
+    3. Apply ``mutator`` (which receives a copy of the current metadata
+       dict and returns the new one).
+    4. ``note_write`` with ``metadata=`` and ``expected_version`` for CAS
+       protection.
+    5. On ``version_conflict``: re-read and re-apply the mutator. Up to
+       :data:`_MAX_CAS_ATTEMPTS` total attempts before giving up.
 
     ``action_summary`` is interpolated into the version-exhaustion
     error so the caller doesn't have to reconstruct it.
@@ -231,27 +230,31 @@ async def _mutate_with_cas(
     client: LithosClient,
     doc_path: str,
     slug: str,
-    mutator: Callable[[list[str]], list[str]],
+    mutator: Callable[[dict[str, Any]], dict[str, Any]],
     action_summary: str,
 ) -> NoteMutationResult:
     for _attempt in range(_MAX_CAS_ATTEMPTS):
         note = await _read_canonical_doc(client, doc_path, slug)
-        current_tags = list(note.tags)
-        new_tags = mutator(list(current_tags))
-        if new_tags == current_tags:
+        current_meta = dict(note.metadata)
+        new_meta = mutator(dict(current_meta))
+        if new_meta == current_meta:
             # No-op: nothing to write. Skip the round-trip; the operator
             # gets idempotent semantics ("already set" is success).
             return NoteMutationResult(
                 note_id=note.id,
                 path=note.path,
-                new_tags=tuple(new_tags),
+                new_metadata=new_meta,
                 changed=False,
             )
+        # Pass the full desired metadata. Lithos applies a per-key merge,
+        # and none of the CLI mutators delete a key (they replace list /
+        # bool values), so a full-dict merge lands exactly the new state.
+        # Tags are left untouched (omitted → preserved).
         write_result = await client.note_write(
             id=note.id,
             title=note.title,
             content=note.body,
-            tags=new_tags,
+            metadata=new_meta,
             expected_version=note.version,
             note_type=note.note_type or "concept",
         )
@@ -259,12 +262,12 @@ async def _mutate_with_cas(
             return NoteMutationResult(
                 note_id=note.id,
                 path=note.path,
-                new_tags=tuple(new_tags),
+                new_metadata=new_meta,
                 changed=True,
             )
         if write_result.status == "version_conflict":
             # Another writer landed between our read and write; loop
-            # and re-apply the mutator to whatever tags now exist.
+            # and re-apply the mutator to whatever metadata now exists.
             continue
         # Any other status is an unrecoverable error.
         raise LithosClientError(

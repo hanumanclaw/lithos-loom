@@ -1980,3 +1980,135 @@ async def test_request_reconnect_fails_loudly_when_keeper_dead_in_production() -
         with pytest.raises(LithosClientError) as ei:
             await client._request_reconnect(expected_gen=client._session_generation)
         assert ei.value.code == "session_unavailable"
+
+
+# ── Free-form metadata (lithos#305/#306) ──────────────────────────────
+
+
+def test_parse_note_read_extracts_extra_metadata() -> None:
+    """``lithos_read`` nests free-form metadata under ``metadata.extra``;
+    the client surfaces it as ``Note.metadata``."""
+    result = _content(
+        {
+            "id": "doc-1",
+            "title": "x",
+            "content": "body",
+            "path": "projects/foo/context.md",
+            "metadata": {
+                "version": 3,
+                "tags": ["project-context"],
+                "extra": {
+                    "github_repos": ["agent-lore/lithos-loom"],
+                    "github_watch_enabled": True,
+                },
+            },
+        }
+    )
+    note = _parse_note_read_response(result)
+    assert note.metadata == {
+        "github_repos": ["agent-lore/lithos-loom"],
+        "github_watch_enabled": True,
+    }
+    assert note.tags == ("project-context",)
+
+
+def test_parse_note_read_metadata_empty_when_no_extra() -> None:
+    result = _content(
+        {
+            "id": "doc-1",
+            "title": "x",
+            "content": "body",
+            "path": "projects/foo/context.md",
+            "metadata": {"version": 1},
+        }
+    )
+    assert _parse_note_read_response(result).metadata == {}
+
+
+def test_parse_note_list_extracts_metadata_from_item_shape() -> None:
+    """``lithos_list`` items put the free-form extra dict directly under
+    the ``metadata`` key (tags sit top-level) — distinct from the read
+    envelope. The summary parser handles that shape."""
+    result = _content(
+        {
+            "items": [
+                {
+                    "id": "doc-1",
+                    "title": "x",
+                    "path": "projects/foo/context.md",
+                    "updated": "2026-05-24T14:30:00Z",
+                    "tags": ["project-context"],
+                    "metadata": {
+                        "github_repos": ["agent-lore/lithos-loom"],
+                        "github_watch_enabled": True,
+                    },
+                }
+            ]
+        }
+    )
+    summaries = _parse_note_list_response(result)
+    assert summaries[0].metadata == {
+        "github_repos": ["agent-lore/lithos-loom"],
+        "github_watch_enabled": True,
+    }
+    assert summaries[0].tags == ("project-context",)
+
+
+async def test_note_write_forwards_metadata() -> None:
+    client, session = _client_with_session(
+        _content(
+            {
+                "status": "updated",
+                "document": {
+                    "id": "doc-1",
+                    "title": "x",
+                    "path": "projects/foo/context.md",
+                    "metadata": {"version": 2},
+                },
+            }
+        )
+    )
+    await client.note_write(
+        id="doc-1",
+        title="x",
+        content="y",
+        metadata={"github_repos": ["o/r"]},
+        expected_version=1,
+    )
+    args = session.call_tool.await_args.kwargs["arguments"]
+    assert args["metadata"] == {"github_repos": ["o/r"]}
+
+
+async def test_note_write_omits_metadata_when_none() -> None:
+    client, session = _client_with_session(
+        _content(
+            {
+                "status": "updated",
+                "document": {
+                    "id": "doc-1",
+                    "title": "x",
+                    "path": "projects/foo/context.md",
+                    "metadata": {"version": 2},
+                },
+            }
+        )
+    )
+    await client.note_write(id="doc-1", title="x", content="y")
+    args = session.call_tool.await_args.kwargs["arguments"]
+    assert "metadata" not in args
+
+
+async def test_note_list_forwards_metadata_match() -> None:
+    client, session = _client_with_session(_content({"items": []}))
+    await client.note_list(
+        path_prefix="projects/", metadata_match={"github_watch_enabled": True}
+    )
+    args = session.call_tool.await_args.kwargs["arguments"]
+    assert args["metadata_match"] == {"github_watch_enabled": True}
+
+
+async def test_note_list_omits_metadata_match_when_none() -> None:
+    client, session = _client_with_session(_content({"items": []}))
+    await client.note_list()
+    args = session.call_tool.await_args.kwargs["arguments"]
+    assert "metadata_match" not in args

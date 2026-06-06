@@ -241,9 +241,10 @@ tags = ["trigger:story-review-human"]
 
 # ── GitHub issue watcher (bidirectional) ──────────────────────────────
 #
-# Polls every project-context doc tagged `github-watch` for new and
-# updated open issues on its mapped GitHub repo, materialises each
-# unseen issue as a Lithos task carrying metadata.github_issue_url
+# Polls every project-context doc with `github_watch_enabled` metadata
+# for new and updated open issues on each repo in its `github_repos`
+# list (a project may map several), materialises each unseen issue as a
+# Lithos task carrying metadata.github_issue_url
 # (so the operator's daily Lithos view includes externally-reported
 # work), and keeps the two surfaces aligned in both directions:
 #
@@ -257,8 +258,9 @@ tags = ["trigger:story-review-human"]
 #   PATCH the GH issue title. Driven by lithos.task.* events on the
 #   in-process bus.
 #
-# Per-project mapping is set via `lithos-loom project set-github-repo
-# <slug> <owner/name>` and toggled via `enable-github` / `disable-github`.
+# Per-project repos are managed via `lithos-loom project add-github-repo
+# <slug> <owner/name>` / `remove-github-repo` and toggled via
+# `enable-github` / `disable-github`.
 #
 # Per-host gate (D50): enable on at most one host. The watcher uses
 # `gh auth token` at startup, so the host must have `gh` on PATH

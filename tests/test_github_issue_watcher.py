@@ -16,7 +16,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from lithos_loom.bus import Event, EventBus
-from lithos_loom.cli._github_metadata import GITHUB_REPO_TAG_PREFIX, GITHUB_WATCH_TAG
+from lithos_loom.cli._github_metadata import (
+    GITHUB_EXCLUDE_AUTHORS_KEY,
+    GITHUB_EXCLUDE_LABELS_KEY,
+    GITHUB_REPOS_KEY,
+    GITHUB_WATCH_KEY,
+)
 from lithos_loom.github_client import (
     GitHubAuthError,
     GitHubClient,
@@ -85,30 +90,39 @@ def test_parse_cursors_accepts_z_suffix() -> None:
 def _summary(
     *,
     slug: str,
-    repo: str | None,
+    repo: str | None = None,
+    repos: tuple[str, ...] | None = None,
     watching: bool,
     exclude_labels: tuple[str, ...] = (),
     exclude_authors: tuple[str, ...] = (),
 ) -> NoteSummary:
-    tags: list[str] = ["project-context"]
-    if repo is not None:
-        tags.append(f"{GITHUB_REPO_TAG_PREFIX}{repo}")
-    if watching:
-        tags.append(GITHUB_WATCH_TAG)
-    for label in exclude_labels:
-        tags.append(f"github-exclude-label:{label}")
-    for author in exclude_authors:
-        tags.append(f"github-exclude-author:{author}")
+    """Build a project-context ``NoteSummary`` carrying github-watcher
+    config in metadata. Pass ``repo`` for the single-repo case or
+    ``repos`` for a project tracking several."""
+    if repos is not None:
+        repo_list = list(repos)
+    elif repo is not None:
+        repo_list = [repo]
+    else:
+        repo_list = []
+    metadata: dict[str, Any] = {GITHUB_WATCH_KEY: watching}
+    if repo_list:
+        metadata[GITHUB_REPOS_KEY] = repo_list
+    if exclude_labels:
+        metadata[GITHUB_EXCLUDE_LABELS_KEY] = list(exclude_labels)
+    if exclude_authors:
+        metadata[GITHUB_EXCLUDE_AUTHORS_KEY] = list(exclude_authors)
     return NoteSummary(
         id=f"doc-{slug}",
         title=slug.title(),
         version=1,
         updated_at=datetime(2026, 5, 29, 12, 0, 0, tzinfo=UTC),
-        tags=tuple(tags),
+        tags=("project-context",),
         status="active",
         note_type="concept",
         path=f"projects/{slug}/{slug}-project-context.md",
         slug=slug,
+        metadata=metadata,
     )
 
 
@@ -200,18 +214,18 @@ async def test_refresh_watch_list_picks_up_watched_projects() -> None:
     watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
     await watcher._refresh_watch_list()
     assert watcher._watch_list == {
-        "lithos-loom": WatchedRepo(repo="agent-lore/lithos-loom"),
-        "lithos": WatchedRepo(repo="agent-lore/lithos"),
+        "lithos-loom": WatchedRepo(repos=("agent-lore/lithos-loom",)),
+        "lithos": WatchedRepo(repos=("agent-lore/lithos",)),
     }
-    # Watch-tag filter actually flows into the query.
+    # The watch-enabled metadata filter flows into the query.
     call = lithos.note_list.await_args
     assert call.kwargs["path_prefix"] == "projects/"
-    assert GITHUB_WATCH_TAG in call.kwargs["tags"]
+    assert call.kwargs["metadata_match"] == {GITHUB_WATCH_KEY: True}
 
 
 @pytest.mark.asyncio
-async def test_refresh_watch_list_skips_projects_without_repo_tag() -> None:
-    """Operator drift: an enabled doc lacking a repo tag is logged + skipped."""
+async def test_refresh_watch_list_skips_projects_without_repos() -> None:
+    """Operator drift: an enabled doc with no github_repos is logged + skipped."""
     lithos = _fake_lithos_client(
         note_list_return=[
             _summary(slug="lithos-loom", repo=None, watching=True),
@@ -220,13 +234,42 @@ async def test_refresh_watch_list_skips_projects_without_repo_tag() -> None:
     )
     watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
     await watcher._refresh_watch_list()
-    assert watcher._watch_list == {"lithos": WatchedRepo(repo="agent-lore/lithos")}
+    assert watcher._watch_list == {"lithos": WatchedRepo(repos=("agent-lore/lithos",))}
+
+
+@pytest.mark.asyncio
+async def test_refresh_watch_list_maps_multiple_repos_per_project() -> None:
+    """A project may track several repos; all land in one WatchedRepo and
+    each is polled independently."""
+    lithos = _fake_lithos_client(
+        note_list_return=[
+            _summary(
+                slug="kindred-code",
+                repos=("kindred/web", "kindred/api", "kindred/infra"),
+                watching=True,
+            ),
+        ]
+    )
+    issue = _make_issue(number=7)
+    github = _fake_github_client()
+    github.list_issues_since = AsyncMock(return_value=[issue])
+    watcher = _make_watcher(github=github, lithos=lithos)
+    await watcher._refresh_watch_list()
+    assert watcher._watch_list == {
+        "kindred-code": WatchedRepo(
+            repos=("kindred/web", "kindred/api", "kindred/infra")
+        )
+    }
+    # The poll cycle fans out to one fetch per repo.
+    await watcher._poll_all_repos()
+    polled = {call.args[0] for call in github.list_issues_since.await_args_list}
+    assert polled == {"kindred/web", "kindred/api", "kindred/infra"}
 
 
 @pytest.mark.asyncio
 async def test_refresh_resets_cursor_when_exclude_filter_changes() -> None:
     """PR-review finding 5 (round 3, 2026-05-30): when the operator
-    relaxes a ``github-exclude-label:`` tag, the watcher must drop the
+    relaxes a ``github_exclude_labels`` entry, the watcher must drop the
     repo cursor so previously-skipped issues re-surface. Otherwise the
     cursor sits past their ``updated_at`` and the next poll won't see
     them until someone edits them on GitHub.
@@ -285,6 +328,36 @@ async def test_refresh_resets_cursor_when_repo_unwatched_and_rewatched() -> None
 
 
 @pytest.mark.asyncio
+async def test_refresh_adding_sibling_repo_keeps_existing_cursor() -> None:
+    """Adding a second repo to a project must NOT reset the cursor of the
+    repo it already tracks — only the newly-added repo bootstraps."""
+    lithos = _fake_lithos_client(
+        note_list_return=[
+            _summary(slug="kindred-code", repos=("kindred/web",), watching=True)
+        ]
+    )
+    watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
+    await watcher._refresh_watch_list()
+    watcher._cursors["kindred/web"] = datetime(2026, 5, 29, tzinfo=UTC)
+
+    # Operator adds a sibling repo to the same project.
+    lithos.note_list = AsyncMock(
+        return_value=[
+            _summary(
+                slug="kindred-code",
+                repos=("kindred/web", "kindred/api"),
+                watching=True,
+            )
+        ]
+    )
+    await watcher._refresh_watch_list()
+
+    # Existing repo's cursor is untouched; the new repo has none yet.
+    assert watcher._cursors["kindred/web"] == datetime(2026, 5, 29, tzinfo=UTC)
+    assert "kindred/api" not in watcher._cursors
+
+
+@pytest.mark.asyncio
 async def test_refresh_watch_list_preserves_state_on_transport_failure() -> None:
     """Refresh failure shouldn't blank the watch list operators rely on."""
     lithos = _fake_lithos_client(
@@ -295,14 +368,14 @@ async def test_refresh_watch_list_preserves_state_on_transport_failure() -> None
     watcher = _make_watcher(github=_fake_github_client(), lithos=lithos)
     await watcher._refresh_watch_list()
     assert watcher._watch_list == {
-        "lithos-loom": WatchedRepo(repo="agent-lore/lithos-loom")
+        "lithos-loom": WatchedRepo(repos=("agent-lore/lithos-loom",))
     }
     # Second call raises transport error.
     lithos.note_list.side_effect = OSError("connection refused")
     await watcher._refresh_watch_list()
     # State preserved.
     assert watcher._watch_list == {
-        "lithos-loom": WatchedRepo(repo="agent-lore/lithos-loom")
+        "lithos-loom": WatchedRepo(repos=("agent-lore/lithos-loom",))
     }
 
 
@@ -356,7 +429,9 @@ async def test_poll_one_repo_publishes_issue_events() -> None:
     github = _fake_github_client()
     github.list_issues_since = AsyncMock(return_value=[issue])
     watcher = _make_watcher(github=github, lithos=_fake_lithos_client(), bus=bus)
-    watcher._watch_list = {"lithos-loom": WatchedRepo(repo="agent-lore/lithos-loom")}
+    watcher._watch_list = {
+        "lithos-loom": WatchedRepo(repos=("agent-lore/lithos-loom",))
+    }
 
     await watcher._poll_one_repo(slug="lithos-loom", repo="agent-lore/lithos-loom")
 
@@ -537,6 +612,42 @@ async def test_poll_one_repo_does_not_advance_cursor_when_first_issue_fails() ->
     await watcher._poll_one_repo(slug="x", repo="agent-lore/lithos-loom")
 
     assert watcher._cursors["agent-lore/lithos-loom"] == prior
+
+
+@pytest.mark.asyncio
+async def test_poll_one_repo_404_drops_only_that_repo() -> None:
+    """A 404 on one repo of a multi-repo project must drop only that
+    repo (and its cursor) — the project's other repos keep being
+    polled."""
+    github = _fake_github_client()
+    github.list_issues_since = AsyncMock(side_effect=GitHubRepoNotFoundError("gone"))
+    watcher = _make_watcher(github=github, lithos=_fake_lithos_client())
+    watcher._watch_list = {
+        "kindred-code": WatchedRepo(repos=("kindred/web", "kindred/gone"))
+    }
+    watcher._cursors["kindred/gone"] = datetime(2026, 5, 29, tzinfo=UTC)
+    watcher._cursors["kindred/web"] = datetime(2026, 5, 28, tzinfo=UTC)
+
+    await watcher._poll_one_repo(slug="kindred-code", repo="kindred/gone")
+
+    # Only the 404 repo is dropped; the sibling and its cursor survive.
+    assert watcher._watch_list == {"kindred-code": WatchedRepo(repos=("kindred/web",))}
+    assert "kindred/gone" not in watcher._cursors
+    assert watcher._cursors["kindred/web"] == datetime(2026, 5, 28, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_poll_one_repo_404_on_last_repo_drops_slug() -> None:
+    """When the 404 repo was the project's only repo, the slug is
+    dropped entirely."""
+    github = _fake_github_client()
+    github.list_issues_since = AsyncMock(side_effect=GitHubRepoNotFoundError("gone"))
+    watcher = _make_watcher(github=github, lithos=_fake_lithos_client())
+    watcher._watch_list = {"solo": WatchedRepo(repos=("owner/only",))}
+
+    await watcher._poll_one_repo(slug="solo", repo="owner/only")
+
+    assert watcher._watch_list == {}
 
 
 @pytest.mark.asyncio
@@ -761,8 +872,8 @@ async def test_poll_one_repo_drops_repo_on_404() -> None:
     bus = EventBus()
     watcher = _make_watcher(github=github, lithos=_fake_lithos_client(), bus=bus)
     watcher._watch_list = {
-        "ghost": WatchedRepo(repo="missing/repo"),
-        "real": WatchedRepo(repo="agent-lore/lithos-loom"),
+        "ghost": WatchedRepo(repos=("missing/repo",)),
+        "real": WatchedRepo(repos=("agent-lore/lithos-loom",)),
     }
     watcher._cursors["missing/repo"] = datetime(2026, 5, 28, tzinfo=UTC)
 
@@ -1314,7 +1425,7 @@ async def test_bootstrap_loads_watch_list_and_subscribes_bus() -> None:
     )
     watcher = _make_watcher(github=_fake_github_client(), lithos=lithos, bus=bus)
     await watcher._bootstrap()
-    assert watcher._watch_list == {"x": WatchedRepo(repo="agent-lore/x")}
+    assert watcher._watch_list == {"x": WatchedRepo(repos=("agent-lore/x",))}
     assert watcher._coord_doc_subscription is not None
     # Subscribed to lithos.note.* events.
     assert watcher._coord_doc_subscription.event_types == frozenset(
@@ -1368,7 +1479,7 @@ async def test_bootstrap_logs_empty_watch_list_at_info(
         "no watched repos configured" in record.message for record in caplog.records
     ), caplog.text
     # And the message names the actionable CLI command.
-    assert any("set-github-repo" in record.message for record in caplog.records), (
+    assert any("add-github-repo" in record.message for record in caplog.records), (
         caplog.text
     )
 
@@ -1480,8 +1591,8 @@ async def test_poll_all_repos_iterates_watch_list() -> None:
     github.list_issues_since = AsyncMock(side_effect=fake_list)
     watcher = _make_watcher(github=github, lithos=_fake_lithos_client(), bus=bus)
     watcher._watch_list = {
-        "a": WatchedRepo(repo="owner/a"),
-        "b": WatchedRepo(repo="owner/b"),
+        "a": WatchedRepo(repos=("owner/a",)),
+        "b": WatchedRepo(repos=("owner/b",)),
     }
 
     await watcher._poll_all_repos()
@@ -1526,7 +1637,7 @@ async def test_poll_loop_persists_cursors_after_pass() -> None:
 
     watcher = _make_watcher(github=github, lithos=lithos, bus=bus)
     watcher._sleep = fake_sleep
-    watcher._watch_list = {"a": WatchedRepo(repo="owner/a")}
+    watcher._watch_list = {"a": WatchedRepo(repos=("owner/a",))}
 
     with pytest.raises(StopAsyncIteration):
         await watcher._poll_loop()
@@ -1566,7 +1677,7 @@ async def test_poll_loop_backs_off_on_exception() -> None:
     # Force a crash inside the poll pass.
     lithos.note_write.side_effect = RuntimeError("boom")
     watcher = _make_watcher(github=github, lithos=lithos, bus=bus)
-    watcher._watch_list = {"a": WatchedRepo(repo="owner/a")}
+    watcher._watch_list = {"a": WatchedRepo(repos=("owner/a",))}
     watcher._cursors = {"owner/a": datetime(2026, 5, 29, tzinfo=UTC)}
 
     sleep_calls: list[float] = []

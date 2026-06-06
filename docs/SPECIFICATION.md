@@ -117,7 +117,7 @@ Each child runs its own EventBus instance. There is no inter-child IPC; all thre
 Other `result.json` fields (`metadata_updates`, `artifacts`, `commits`, `spawned_tasks`, `exit_code`, `error.retriable`) are schema-validated but currently ignored. On plugin timeout, the runner sends SIGTERM with a grace period before SIGKILL.
 
 **GitHub issue mirror (GitHub → Lithos).**
-`GitHubIssueWatcher` (running in the github-watcher child) polls every repo flagged for watching on its `[github_watcher].poll_interval_seconds` cadence (default 60s). Watch eligibility is derived from project-context tags: a doc with both a `github-watch` tag and a `github-repo:<owner>/<name>` tag enrols its slug → repo mapping. The watcher subscribes to `lithos.note.{created,updated}` on the in-process bus so a `project enable-github <slug>` mid-run takes effect without a daemon restart. Per-repo `updated_at` cursors persist in a daemon-owned Lithos doc (default `projects/_lithos-loom-internal/github-watcher-state.md`, configurable) so cold restart doesn't re-walk every open issue. Coord-doc writes are CAS-protected: on `version_conflict` the watcher merges the just-observed cursor advances with the remote cursors (latest timestamp wins per repo) and retries, so concurrent writes don't lose progress. Per-repo polls split into two paths: **bootstrap** (no cursor yet for this repo) lists `state=open` with full `Link: rel="next"` pagination so every open issue surfaces in one cycle regardless of historical-closure volume; **incremental** (cursor present) lists `state=all` since the cursor with the same pagination so closes on previously-seen issues — their `updated_at` advances at close time — surface alongside fresh opens. Each issue surfaced this poll publishes one `github.issue.seen` event onto the in-process bus; the auto-wired `github-issue-sync` subscriber resolves an `<!-- lithos:<task_id> -->` linkage marker in the issue body, then takes one of these branches:
+`GitHubIssueWatcher` (running in the github-watcher child) polls every repo flagged for watching on its `[github_watcher].poll_interval_seconds` cadence (default 60s). Watch eligibility is derived from project-context metadata: a doc with `github_watch_enabled = true` and a non-empty `github_repos` list enrols its slug → repo mappings (a project may map several repos, each polled independently). Discovery is one filtered call — `note_list(path_prefix="projects/", metadata_match={"github_watch_enabled": true})` — and each returned item carries its metadata, so the repo list and exclude filters are read without a follow-up per-doc fetch. The watcher subscribes to `lithos.note.{created,updated}` on the in-process bus so a `project enable-github <slug>` mid-run takes effect without a daemon restart. Per-repo `updated_at` cursors persist in a daemon-owned Lithos doc (default `projects/_lithos-loom-internal/github-watcher-state.md`, configurable) so cold restart doesn't re-walk every open issue. Coord-doc writes are CAS-protected: on `version_conflict` the watcher merges the just-observed cursor advances with the remote cursors (latest timestamp wins per repo) and retries, so concurrent writes don't lose progress. Per-repo polls split into two paths: **bootstrap** (no cursor yet for this repo) lists `state=open` with full `Link: rel="next"` pagination so every open issue surfaces in one cycle regardless of historical-closure volume; **incremental** (cursor present) lists `state=all` since the cursor with the same pagination so closes on previously-seen issues — their `updated_at` advances at close time — surface alongside fresh opens. Each issue surfaced this poll publishes one `github.issue.seen` event onto the in-process bus; the auto-wired `github-issue-sync` subscriber resolves an `<!-- lithos:<task_id> -->` linkage marker in the issue body, then takes one of these branches:
 
 - Marker → open Lithos task: drift-sync only (title / body / labels — see below).
 - Marker → open Lithos task, GH closed-completed: drift-sync + `lithos_task_complete`.
@@ -128,10 +128,10 @@ Other `result.json` fields (`metadata_updates`, `artifacts`, `commits`, `spawned
 - No marker, no matching task, GH open: `lithos_task_create` with `title=issue.title`, `description=issue.body`, `tags=issue.labels + ["github-issue"]`, `metadata={project, github_issue_url, github_issue_number, github_labels, github_state_snapshot=issue.state}`. Then write the canonical `<!-- lithos:<task_id> -->` marker into the issue body via `PATCH /repos/{owner}/{repo}/issues/{n}` — fetched fresh via `get_issue` immediately before the PATCH so an operator edit during the poll-to-PATCH window survives.
 - No marker, no matching task, GH closed: skip (historic closures are not backfilled).
 
-**Per-project exclude filters.** The watcher ships each event with the project's import-time filters, sourced from these tag conventions on the project-context doc:
+**Per-project exclude filters.** The watcher ships each event with the project's import-time filters, sourced from these metadata keys on the project-context doc (applied to every repo the project maps):
 
-- `github-exclude-label:<name>` — drop the issue at import time if it carries this label.
-- `github-exclude-author:<login>` — drop if the GH author login matches (e.g. `dependabot[bot]`).
+- `github_exclude_labels` (list) — drop the issue at import time if it carries any of these labels.
+- `github_exclude_authors` (list) — drop if the GH author login matches (e.g. `dependabot[bot]`).
 
 Filters apply only on the create branch (no marker + no matching URL + GH open). Already-linked tasks are unaffected if an exclude tag is added after import — the PRD explicitly locks "exclude is only at import time" so the operator never has a once-imported task quietly stranded.
 
@@ -284,8 +284,8 @@ exclude_tags      = ["debug:trace"]              # suppress projection for these
 # uses `gh auth token` at startup to resolve a bearer token, so the host
 # must have `gh` on PATH with the operator already logged in.
 #
-# Per-project enablement lives as tags on the project-context doc; manage
-# via `lithos-loom project set-github-repo <slug> <owner/name>` and
+# Per-project enablement lives in metadata on the project-context doc;
+# manage via `lithos-loom project add-github-repo <slug> <owner/name>` and
 # `lithos-loom project enable-github <slug>` (§4).
 
 [github_watcher]
@@ -447,15 +447,16 @@ Differs from the live `task-archive` subscription: the archive subscription only
 
 Full reference: `docs/cli/project-regenerate-done.md`.
 
-### 4.10 `lithos-loom project set-github-repo`
+### 4.10 `lithos-loom project add-github-repo` / `remove-github-repo`
 
 ```
-lithos-loom project set-github-repo <slug> <owner/name> [-c config.toml]
+lithos-loom project add-github-repo    <slug> <owner/name> [-c config.toml]
+lithos-loom project remove-github-repo <slug> <owner/name> [-c config.toml]
 ```
 
-Binds a GitHub repo to a Lithos project for the issue watcher. Replaces any existing `github-repo:*` tag on the canonical project-context doc so re-running with a different repo fixes typos without losing other tags. Input is validated against GitHub's `owner/name` rules at CLI time — a malformed value exits 2 before any Lithos write.
+Map / unmap a GitHub repo for the issue watcher by editing the `github_repos` metadata list on the canonical project-context doc. A project may map several repos (call `add-github-repo` once per repo); each is polled independently. `add` validates `owner/name` against GitHub's rules at CLI time — a malformed value exits 2 before any Lithos write — and is idempotent if the repo is already present. `remove` is idempotent if the repo is absent; removing the last repo is allowed (the project is unmapped) and warns if watching is still enabled.
 
-The watcher does not begin polling until `enable-github <slug>` flips on the `github-watch` tag.
+The watcher does not begin polling until `enable-github <slug>` sets `github_watch_enabled = true`.
 
 ### 4.11 `lithos-loom project enable-github`
 
@@ -463,7 +464,7 @@ The watcher does not begin polling until `enable-github <slug>` flips on the `gi
 lithos-loom project enable-github <slug> [-c config.toml]
 ```
 
-Adds the `github-watch` tag to the project-context doc, enabling polling for the project. Requires a `github-repo:*` tag to already be present (exit 2 if not, with the actionable error pointing at `set-github-repo`).
+Sets `github_watch_enabled = true` on the project-context doc, enabling polling. Requires a non-empty `github_repos` list (exit 2 if empty, with the actionable error pointing at `add-github-repo`).
 
 ### 4.12 `lithos-loom project disable-github`
 
@@ -471,7 +472,15 @@ Adds the `github-watch` tag to the project-context doc, enabling polling for the
 lithos-loom project disable-github <slug> [-c config.toml]
 ```
 
-Removes the `github-watch` tag. The `github-repo:*` tag is preserved so re-enabling later doesn't need `set-github-repo`. Disabling stops new polls for the project at most one poll interval later (in-flight events for that slug still drain).
+Sets `github_watch_enabled = false`. The `github_repos` list is preserved so re-enabling later doesn't need `add-github-repo`. Disabling stops new polls for the project at most one poll interval later (in-flight events for that slug still drain).
+
+### 4.13 `lithos-loom project migrate-github-tags`
+
+```
+lithos-loom project migrate-github-tags [--dry-run] [-c config.toml]
+```
+
+One-shot migration from the legacy tag-based scheme (`github-repo:` / `github-watch` / `github-exclude-*` tags) to the metadata keys above. Scans every project-context doc and, for any still carrying github tags, writes the derived metadata and strips the tags in one CAS write per doc (multiple legacy `github-repo:*` tags collapse into the `github_repos` list). Idempotent; `--dry-run` previews without writing. Exit 1 if any doc fails its CAS retries.
 
 ### 4.13 `lithos-loom obsidian-sync show`
 
@@ -602,7 +611,7 @@ Sources are async coroutines spawned by their owning child. They consume externa
 | `LithosNoteStream` | obsidian-sync (when `project-context-projection` is configured) + github-watcher | `lithos_list(path_prefix='projects/', tags=['project-context'])` → re-emit `lithos.note.created` per match. | Exponential backoff with `Last-Event-ID` resume. |
 | `ObsidianFSWatcher` | obsidian-sync | Polls `<vault>/<tasks_file>` on a 250ms cadence; emits when a line diverges from the last-known state. | n/a (polling). |
 | `ObsidianDirWatcher` | obsidian-sync (when `note-push` is configured) | Walks `<vault>/<projects_dir>/**/*.md` on the same cadence; computes body-only hashes. | n/a. Excludes files ending in `-done.md` (the per-project archive). |
-| `GitHubIssueWatcher` | github-watcher | Reads `note_list(tags=['github-watch'])` to build the slug → repo watch list; loads per-repo `updated_at` cursors from `coord_doc_path`. | n/a (polling). Per-repo 404 drops the slug with a `[Friction]` log; 403 + `X-RateLimit-Remaining: 0` sleeps until `X-RateLimit-Reset`. |
+| `GitHubIssueWatcher` | github-watcher | Reads `note_list(path_prefix='projects/', metadata_match={'github_watch_enabled': true})` to build the slug → repos watch list (a project may map several repos); loads per-repo `updated_at` cursors from `coord_doc_path`. | n/a (polling). Per-repo 404 drops the repo with a `[Friction]` log; 403 + `X-RateLimit-Remaining: 0` sleeps until `X-RateLimit-Reset`. |
 
 ### 6.6 Subscription Action Registry
 

@@ -11,12 +11,14 @@ there's no GitHub server-push surface that doesn't require a public
 ingress (the PRD risk notes call this out — webhooks are deferred).
 
 The watcher's watch list (which Lithos slugs map to which repos) is
-derived from project-context tags:
+derived from project-context metadata:
 
-- ``github-watch`` on a project-context doc enables watching for that
-  project.
-- ``github-repo:<owner>/<name>`` on the same doc carries the repo
-  mapping. The CLI subcommands in Phase A3 manage these tags.
+- ``github_watch_enabled = true`` on a project-context doc enables
+  watching for that project.
+- ``github_repos`` (a list of ``owner/name`` strings) carries the repo
+  mappings — a project may track several repos. The CLI subcommands
+  (``add-github-repo`` / ``remove-github-repo`` / ``enable-github`` /
+  ``disable-github``) manage this metadata.
 
 Mid-run, the watcher subscribes to ``lithos.note.{created,updated}``
 on the in-process bus so an operator who runs ``project enable-github
@@ -37,16 +39,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from lithos_loom.bus import Event, EventBus, Subscription
 from lithos_loom.cli._github_metadata import (
-    GITHUB_WATCH_TAG,
+    GITHUB_WATCH_KEY,
     extract_exclude_authors,
     extract_exclude_labels,
-    extract_github_repo,
+    extract_github_repos,
 )
 from lithos_loom.errors import LithosClientError
 from lithos_loom.github_client import (
@@ -72,15 +74,17 @@ __all__ = [
 class WatchedRepo:
     """Per-project watcher state derived from the project-context doc.
 
-    ``repo`` is the ``owner/name`` mapping; ``exclude_labels`` and
-    ``exclude_authors`` are the tag-derived import filters that the
+    ``repos`` is the project's ``owner/name`` mappings (one or more — a
+    project may track several repos). ``exclude_labels`` and
+    ``exclude_authors`` are the metadata-derived import filters that the
     sync handler uses to drop noise from automated issue creators
-    (dependabot, renovate) before ``task_create``. The filters are
-    immutable per refresh cycle so a concurrent watch-list rebuild
-    can't reshape them under a running poll.
+    (dependabot, renovate) before ``task_create``; they apply to every
+    repo the project tracks. The filters are immutable per refresh cycle
+    so a concurrent watch-list rebuild can't reshape them under a
+    running poll.
     """
 
-    repo: str
+    repos: tuple[str, ...]
     exclude_labels: tuple[str, ...] = ()
     exclude_authors: tuple[str, ...] = ()
 
@@ -128,6 +132,7 @@ class WatcherLithosClient(Protocol):
         path_prefix: str | None = None,
         tags: list[str] | None = None,
         limit: int = 100,
+        metadata_match: dict[str, Any] | None = None,
     ) -> list[NoteSummary]: ...
 
     async def note_read(
@@ -304,8 +309,8 @@ class GitHubIssueWatcher:
     import-time exclude filters.
 
     Rebuilt at bootstrap and on every relevant bus event so an operator
-    toggling ``github-watch`` on a project doc takes effect within a
-    poll interval at worst.
+    toggling ``github_watch_enabled`` on a project doc takes effect
+    within a poll interval at worst.
     """
     _cursors: dict[str, datetime] = field(default_factory=dict)
     """``{owner/name: updated_at}`` — most-recent issue updated-at seen
@@ -378,15 +383,14 @@ class GitHubIssueWatcher:
         if self._watch_list:
             logger.info(
                 "github-watcher: watching %d repo(s): %s",
-                len(self._watch_list),
-                sorted(w.repo for w in self._watch_list.values()),
+                sum(len(w.repos) for w in self._watch_list.values()),
+                sorted(repo for w in self._watch_list.values() for repo in w.repos),
             )
         else:
             logger.info(
-                "github-watcher: no watched repos configured — tag a "
-                "project-context doc with `github-watch` + "
-                "`github-repo:owner/name` to enable (see `lithos-loom "
-                "project set-github-repo` / `enable-github`)"
+                "github-watcher: no watched repos configured — map a repo with "
+                "`lithos-loom project add-github-repo <slug> owner/name` and turn "
+                "it on with `enable-github <slug>`"
             )
         await self._load_cursors_from_coord_doc()
         # Subscribe BEFORE the first poll so any project-doc changes
@@ -400,17 +404,19 @@ class GitHubIssueWatcher:
     # ── Watch-list management ─────────────────────────────────────────
 
     async def _refresh_watch_list(self) -> None:
-        """Query Lithos for project docs tagged ``github-watch``.
+        """Query Lithos for project docs with watching enabled.
 
-        Each match's tags carry a ``github-repo:<owner>/<name>`` entry
-        — extract it and stash in :attr:`_watch_list`. Docs that have
-        the watch tag but no repo tag are skipped (the CLI prevents
-        this, but operator drift could).
+        Selects project-context docs whose ``github_watch_enabled``
+        metadata is ``True``; each carries a ``github_repos`` list (one
+        or more ``owner/name`` strings) plus optional exclude filters,
+        stashed in :attr:`_watch_list`. Docs with the flag on but an
+        empty repo list are skipped (the CLI prevents this, but operator
+        drift could).
         """
         try:
             summaries = await self.lithos.note_list(
                 path_prefix="projects/",
-                tags=[GITHUB_WATCH_TAG],
+                metadata_match={GITHUB_WATCH_KEY: True},
             )
         except (OSError, LithosClientError) as exc:
             logger.warning(
@@ -427,52 +433,63 @@ class GitHubIssueWatcher:
             slug = summary.slug
             if not slug:
                 continue
-            repo = extract_github_repo(summary.tags)
-            if repo is None:
+            meta = dict(summary.metadata)
+            repos = extract_github_repos(meta)
+            if not repos:
                 logger.info(
-                    "github-watcher: project %s has %s but no github-repo tag "
-                    "— skipping until set",
+                    "github-watcher: project %s has %s but no github_repos "
+                    "— skipping until a repo is added",
                     slug,
-                    GITHUB_WATCH_TAG,
+                    GITHUB_WATCH_KEY,
                 )
                 continue
             new_list[slug] = WatchedRepo(
-                repo=repo,
-                exclude_labels=tuple(extract_exclude_labels(summary.tags)),
-                exclude_authors=tuple(extract_exclude_authors(summary.tags)),
+                repos=tuple(repos),
+                exclude_labels=tuple(extract_exclude_labels(meta)),
+                exclude_authors=tuple(extract_exclude_authors(meta)),
             )
         added = set(new_list) - set(self._watch_list)
         removed = set(self._watch_list) - set(new_list)
-        # Filter drift on existing slugs (e.g. operator added a new
-        # `github-exclude-label:` tag) — surface that too so it's
-        # visible at INFO when the next poll starts honouring it.
-        retagged = {
+        # Config drift on existing slugs (operator added a repo or an
+        # exclude filter) — surface it at INFO so it's visible when the
+        # next poll starts honouring it.
+        changed = {
             slug
             for slug in new_list.keys() & self._watch_list.keys()
             if new_list[slug] != self._watch_list[slug]
         }
-        if added or removed or retagged:
+        if added or removed or changed:
             logger.info(
-                "github-watcher: watch list refresh — added=%s removed=%s retagged=%s",
+                "github-watcher: watch list refresh — added=%s removed=%s changed=%s",
                 sorted(added),
                 sorted(removed),
-                sorted(retagged),
+                sorted(changed),
             )
-        # PR-review finding 5 (round 3, 2026-05-30) + finding 1 (round 4,
-        # 2026-05-30): cursor must be reset whenever a slug's enrolment
-        # changes (retagged filter, slug removed, slug newly added).
-        # Without an add-side reset, a disable → restart → re-enable
-        # cycle leaves a stale cursor in the coord doc that re-loads as
-        # if no time had passed; issues created during the disabled
-        # window can be missed. With it, a freshly re-watched slug
-        # bootstraps cleanly.
+        # Cursors are keyed by repo (owner/name), so reset is computed
+        # per repo, not per slug — adding a sibling repo to a project
+        # must NOT reset the cursors of the repos it already tracks.
+        # A repo's cursor is dropped when it is newly watched (so a
+        # disable → re-enable cycle re-surfaces issues created while
+        # paused, rather than re-loading a stale cursor), when its
+        # project's exclude filters change (so re-included issues
+        # surface), or when it leaves the watch set (cleanup).
         cursor_reset_repos: set[str] = set()
-        for slug in retagged:
-            cursor_reset_repos.add(new_list[slug].repo)
-        for slug in removed:
-            cursor_reset_repos.add(self._watch_list[slug].repo)
-        for slug in added:
-            cursor_reset_repos.add(new_list[slug].repo)
+        for slug in added | removed | changed:
+            old_entry = self._watch_list.get(slug)
+            new_entry = new_list.get(slug)
+            old_repos = set(old_entry.repos) if old_entry else set()
+            new_repos = set(new_entry.repos) if new_entry else set()
+            filters_changed = bool(
+                old_entry
+                and new_entry
+                and (old_entry.exclude_labels, old_entry.exclude_authors)
+                != (new_entry.exclude_labels, new_entry.exclude_authors)
+            )
+            if filters_changed:
+                cursor_reset_repos |= new_repos
+            else:
+                cursor_reset_repos |= new_repos - old_repos
+            cursor_reset_repos |= old_repos - new_repos
         for repo in cursor_reset_repos:
             if repo in self._cursors:
                 logger.info(
@@ -686,8 +703,9 @@ class GitHubIssueWatcher:
         ``path`` starts with ``projects/``. The lookup is path-prefix
         based because the event payload (per
         :class:`LithosNoteStream._publish`) carries ``{id, title, path}``
-        — no tags — so we can't filter by ``github-watch`` directly and
-        have to refresh on any project-doc change. Refreshes are cheap.
+        — no metadata — so we can't filter by ``github_watch_enabled``
+        directly and have to refresh on any project-doc change.
+        Refreshes are cheap.
         """
         assert self._coord_doc_subscription is not None
         sub = self._coord_doc_subscription
@@ -746,9 +764,38 @@ class GitHubIssueWatcher:
         if not items:
             logger.debug("github-watcher: poll cycle skipped; watch list empty")
             return
-        logger.info("github-watcher: poll cycle starting (%d repo(s))", len(items))
-        for slug, watched in items:
-            await self._poll_one_repo(slug=slug, repo=watched.repo)
+        # A project may map several repos; flatten to (slug, repo) pairs.
+        pairs = [(slug, repo) for slug, watched in items for repo in watched.repos]
+        logger.info(
+            "github-watcher: poll cycle starting (%d project(s), %d repo(s))",
+            len(items),
+            len(pairs),
+        )
+        for slug, repo in pairs:
+            await self._poll_one_repo(slug=slug, repo=repo)
+
+    def _drop_repo(self, *, slug: str, repo: str) -> None:
+        """Remove a single repo from a project's watch entry (e.g. on a
+        404) without disturbing the project's other repos.
+
+        A project may map several repos; a 404 on one must not stop
+        polling the siblings. Drops the repo from the entry's ``repos``
+        tuple (removing the slug entirely only when it was the last
+        repo) and clears that repo's cursor + stuck state. The next
+        ``_refresh_watch_list`` re-reads the canonical metadata, so a
+        repo that 404s but is still mapped will be re-added and
+        re-attempted — same transient-drop behaviour as before, now
+        scoped to the offending repo.
+        """
+        watched = self._watch_list.get(slug)
+        if watched is not None:
+            remaining = tuple(r for r in watched.repos if r != repo)
+            if remaining:
+                self._watch_list[slug] = replace(watched, repos=remaining)
+            else:
+                self._watch_list.pop(slug, None)
+        self._cursors.pop(repo, None)
+        self._stuck_issues.pop(repo, None)
 
     async def _retry_stuck_issues(self, *, slug: str, repo: str) -> bool:
         """Retry issues whose dispatch failed in a previous poll.
@@ -860,8 +907,7 @@ class GitHubIssueWatcher:
                 repo,
                 slug,
             )
-            self._watch_list.pop(slug, None)
-            self._cursors.pop(repo, None)
+            self._drop_repo(slug=slug, repo=repo)
             return
         except GitHubAuthError as exc:
             logger.warning(
