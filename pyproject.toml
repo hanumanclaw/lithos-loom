@@ -32,6 +32,7 @@ packages = ["src/lithos_loom"]
 [tool.hatch.build]
 include = [
     "src/lithos_loom/plugins/*/prompt.md",
+    "src/lithos_loom/plugins/*/prompts/*.md",
     "docs/result-schema.json",
 ]
 

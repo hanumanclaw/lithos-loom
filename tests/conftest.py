@@ -2,10 +2,29 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from textwrap import dedent
 
 import pytest
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+@pytest.fixture
+def tmp_git_repo(tmp_path: Path) -> Path:
+    """A throwaway git repo on branch ``main`` with one commit. Returns its path."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "spike@example.com")
+    _git(repo, "config", "user.name", "Spike")
+    (repo / "README.md").write_text("# fixture\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "init")
+    return repo
 
 
 @pytest.fixture(autouse=True)
