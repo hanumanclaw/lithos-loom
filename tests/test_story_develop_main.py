@@ -21,3 +21,18 @@ def test_main_rejects_non_git_repo(tmp_path: Path, capsys) -> None:
     rc = main(["--repo", str(tmp_path), "--description", "do a thing"])
     assert rc == 2
     assert "not a git repository" in capsys.readouterr().err
+
+
+def test_main_rejects_invalid_reviewer_name(tmp_git_repo: Path, capsys) -> None:
+    rc = main(
+        [
+            "--repo",
+            str(tmp_git_repo),
+            "--description",
+            "x",
+            "--reviewer",
+            "code quality",
+        ]
+    )
+    assert rc == 2
+    assert "invalid --reviewer" in capsys.readouterr().err

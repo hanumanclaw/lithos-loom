@@ -1,9 +1,10 @@
-"""Run a single coder turn and parse its structured result.
+"""Run a single agent turn (coder or reviewer) and parse its structured result.
 
 A turn is ``docker exec ... claude --session-id <id> -p --output-format json``.
 Completion, error, and cost all come from the parsed JSON + the process exit
-code — no terminal scraping (ADR 0002). Usage-limit *classification* lands in T5;
-T1 only needs success/failure + the session id + cost.
+code — no terminal scraping (ADR 0002). The machinery is identical for the coder
+and the reviewer; only the prompt + container differ. Usage-limit *classification*
+lands in T5.
 """
 
 from __future__ import annotations
@@ -16,8 +17,8 @@ from . import containers
 
 
 @dataclass(frozen=True)
-class CoderTurnResult:
-    """Outcome of one coder turn."""
+class TurnResult:
+    """Outcome of one agent turn."""
 
     exit_code: int
     succeeded: bool
@@ -35,8 +36,8 @@ class CoderTurnResult:
 _TIMEOUT_EXIT = 124  # conventional timeout exit; we set it ourselves on timeout
 
 
-def parse_claude_result(stdout: str, *, exit_code: int, stderr: str) -> CoderTurnResult:
-    """Parse ``claude --output-format json`` stdout into a CoderTurnResult.
+def parse_claude_result(stdout: str, *, exit_code: int, stderr: str) -> TurnResult:
+    """Parse ``claude --output-format json`` stdout into a TurnResult.
 
     The payload is a single JSON object (``type: "result"``) carrying
     ``is_error``, ``result``, ``session_id`` and ``total_cost_usd``. A
@@ -59,7 +60,7 @@ def parse_claude_result(stdout: str, *, exit_code: int, stderr: str) -> CoderTur
     # always have a handle to resume.
     succeeded = exit_code == 0 and raw is not None and not is_error and bool(session_id)
 
-    return CoderTurnResult(
+    return TurnResult(
         exit_code=exit_code,
         succeeded=succeeded,
         session_id=session_id,
@@ -70,15 +71,15 @@ def parse_claude_result(stdout: str, *, exit_code: int, stderr: str) -> CoderTur
     )
 
 
-def run_coder_turn(
+def run_turn(
     *,
     container: str,
     prompt: str,
     session_id: str,
     resume: bool = False,
     timeout: int = 3600,
-) -> CoderTurnResult:
-    """Execute one coder turn in *container* and return its parsed result."""
+) -> TurnResult:
+    """Execute one agent turn in *container* and return its parsed result."""
     exec_cmd = containers.build_exec_command(
         name=container,
         tool="claude",
@@ -89,14 +90,14 @@ def run_coder_turn(
     try:
         proc = containers.exec_turn(exec_cmd, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return CoderTurnResult(
+        return TurnResult(
             exit_code=_TIMEOUT_EXIT,
             succeeded=False,
             session_id=session_id,
             result_text="",
             cost_usd=0.0,
             raw=None,
-            stderr=f"coder turn timed out after {timeout}s",
+            stderr=f"agent turn timed out after {timeout}s",
         )
     return parse_claude_result(
         proc.stdout, exit_code=proc.returncode, stderr=proc.stderr
