@@ -20,7 +20,7 @@ Loom replaces [Ralph++](https://github.com/snarktank/ralph) as the user's coding
 - **Lithos `task.metadata` is a hard prerequisite.** `lithos-loom doctor` probes for it on first run. Loom also requires `lithos_write(id=..., expected_version=...)` (optimistic locking for note-push), `note.*` SSE events, and `lithos_task_create(metadata=...)` (single-shot create with metadata).
 - **Task dependencies live in `task.metadata.depends_on` (not Lithos edges).** Lithos's `edges.db` is doc-only; tasks are SQLite rows with no edge surface. Strict-sequential is the default; `metadata.parallelizable: true` allows concurrent execution among siblings.
 - **`obsidian-projection` writes `tasks_file` from scratch on every flush.** Idempotent re-runs are no-ops thanks to atomic-write + content-hash dedup. Frontmatter-only edits to projected project-context docs are silently absorbed; `note-push` hashes the body only.
-- **Stable finding prefixes** for machine-parseable breadcrumbs: `[Friction]`, `[ReopenRequested]`, `[BlockerFailed]`. Pick a fresh prefix when introducing a new one rather than overloading these — operator queries grep by prefix.
+- **Stable finding prefixes** for machine-parseable breadcrumbs: `[Friction]`, `[ReopenRequested]`, `[BlockerFailed]`, `[DevelopResult]` (story-develop run outcome posted to the task), `[ReviewDispute]` (story-develop dispute deadlock needing human arbitration). Pick a fresh prefix when introducing a new one rather than overloading these — operator queries grep by prefix.
 - **Project files stay clean.** Loom config is machine-local TOML; project repo `AGENTS.md` / `CLAUDE.md` files contain no Lithos / Loom references (except for projects in the Lithos ecosystem itself).
 
 ## Specifications

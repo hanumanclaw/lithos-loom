@@ -849,9 +849,18 @@ def develop(
             rounds_completed = round_no
             # --- coder turn ------------------------------------------------
             if round_no == 1:
+                # T8: an EXPLICIT acceptance criteria (flag / task metadata)
+                # gets its own section; when it merely falls back to the
+                # description, repeating it would be noise.
+                ac_section = (
+                    f"\n## Acceptance criteria\n\n{config.acceptance_criteria}\n"
+                    if config.acceptance_criteria
+                    else ""
+                )
                 coder_prompt = _render(
                     handoff.load_prompt("coder_init.md"),
                     description=config.description,
+                    acceptance_criteria_section=ac_section,
                     handoff_file=handoff.coder_handoff_name(1),
                 )
                 coder_resume = False

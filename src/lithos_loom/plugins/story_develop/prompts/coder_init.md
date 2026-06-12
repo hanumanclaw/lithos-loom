@@ -5,7 +5,7 @@ worktree on a dedicated branch). Implement the task below.
 ## Task
 
 {description}
-
+{acceptance_criteria_section}
 ## When you are done
 
 1. Make sure your changes are saved in the files under `/workspace`.
