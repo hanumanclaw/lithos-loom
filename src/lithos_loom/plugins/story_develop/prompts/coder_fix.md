@@ -11,7 +11,7 @@ and raised findings. This is round {round_no}.
 {findings}
 
 The reviewer's full write-up is at `/workspace/.handoff/{review_file}`.
-
+{test_gate_note}
 ## Your job
 
 1. Address each finding in the code under `/workspace`. If you genuinely

@@ -27,6 +27,7 @@ from .config import (
     DEFAULT_IMAGE,
     DEFAULT_MAX_ROUNDS,
     DEFAULT_REVIEWER_NAME,
+    DEFAULT_TEST_TIMEOUT,
     DevelopConfig,
     is_valid_reviewer_name,
 )
@@ -63,6 +64,27 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_ROUNDS,
         help="Max implement→review→fix rounds before stopping unapproved",
+    )
+    p.add_argument(
+        "--no-test-gate",
+        action="store_true",
+        help="Skip the per-round objective test gate (throwaway container)",
+    )
+    p.add_argument(
+        "--test-command",
+        default=None,
+        help="Test command for the gate (overrides auto-detection)",
+    )
+    p.add_argument(
+        "--block-on-red",
+        action="store_true",
+        help="A red test gate prevents approval (default: recorded, non-blocking)",
+    )
+    p.add_argument(
+        "--test-timeout",
+        type=int,
+        default=DEFAULT_TEST_TIMEOUT,
+        help="Max seconds for one test-gate run",
     )
     p.add_argument("--image", default=DEFAULT_IMAGE, help="Agent container image")
     p.add_argument("--branch", default="main", help="Base branch for the worktree")
@@ -125,6 +147,10 @@ def main(argv: list[str] | None = None) -> int:
         reviewer=args.reviewer,
         block_threshold=args.block_threshold,
         max_rounds=args.max_rounds,
+        test_gate=not args.no_test_gate,
+        test_command=args.test_command,
+        block_on_red=args.block_on_red,
+        test_timeout=args.test_timeout,
         image=args.image,
         base_branch=args.branch,
     )
@@ -147,6 +173,10 @@ def main(argv: list[str] | None = None) -> int:
         gate = "passes threshold" if r.passed else "BLOCKS"
         print(f"  review:   [{r.reviewer}] {r.status} — {gate}{sev}")
         print(f"            {r.findings_count} finding(s)")
+    if result.test_gate is not None:
+        g = result.test_gate
+        blocking = " — BLOCKS approval" if (not g.passed and args.block_on_red) else ""
+        print(f"  gate:     {g.verdict} (`{g.command}`, exit {g.exit_code}){blocking}")
     if result.conversation_log is not None:
         print(f"  log:      {result.conversation_log}")
     print(f"  cost:     ${result.total_cost_usd:.4f}")

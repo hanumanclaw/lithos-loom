@@ -30,6 +30,7 @@ DEFAULT_REVIEWER_TOOL = "claude"
 DEFAULT_REVIEWER_NAME = "code-quality"
 DEFAULT_BLOCK_THRESHOLD = "major"  # findings below this don't block (see handoff.py)
 DEFAULT_MAX_ROUNDS = 5  # T3 loop bound; stall/dispute/cost guards arrive with T7
+DEFAULT_TEST_TIMEOUT = 900  # seconds for one test-gate container run (T4)
 DEFAULT_IMAGE = "ralph-sandbox:latest"
 WORKSPACE_MOUNT = "/workspace"
 CLAUDE_CONFIG_MOUNT = "/claude_config"
@@ -67,6 +68,11 @@ class DevelopConfig:
     block_threshold: str = DEFAULT_BLOCK_THRESHOLD
     # T3: how many implement→review→fix rounds before we stop unapproved.
     max_rounds: int = DEFAULT_MAX_ROUNDS
+    # T4: objective test gate per round commit (throwaway container).
+    test_gate: bool = True  # auto-skips when no test command is detected
+    test_command: str | None = None  # explicit override beats detection
+    block_on_red: bool = False  # red gate prevents approval + feeds the coder
+    test_timeout: int = DEFAULT_TEST_TIMEOUT
     acceptance_criteria: str | None = None
     run_id: str = field(default_factory=_short_run_id)
     # Host path to the operator's claude config dir (source of the auth file).
@@ -108,6 +114,11 @@ class DevelopConfig:
         handoff is a separate artifact, not part of the deliverable branch).
         """
         return self.run_dir / "handoff"
+
+    @property
+    def gate_dir(self) -> Path:
+        """Per-run root for test-gate state (exported trees, output, cache)."""
+        return self.run_dir / "test_gate"
 
     @property
     def operator_skills_dir(self) -> Path | None:

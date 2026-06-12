@@ -1,11 +1,16 @@
-"""``develop()`` core — T3: the full implement → review → fix → approve loop.
+"""``develop()`` core — the full implement → review → fix → approve loop.
 
     worktree
       -> start coder (RW) + reviewer (RO) containers, both long-lived
-      -> round 1: coder implements, commit, reviewer reviews
-      -> round N: coder fixes (resume), commit, reviewer re-reviews (resume)
+      -> round 1: coder implements, commit, test gate, reviewer reviews
+      -> round N: coder fixes (resume), commit, gate, reviewer re-reviews (resume)
       -> stop when the reviewer passes (approved) or max_rounds is hit
       -> tear both containers down; leave the branch + a conversation log.
+
+The test gate (T4) runs each round commit's tree in a fresh throwaway container
+— an agent-free check on the coder's self-reported test results. By default it
+is recorded but non-blocking; with ``block_on_red`` a red gate prevents
+approval and its output is fed to the coder next round.
 
 The two agents keep their sessions **across rounds** (ADR 0002): each round is a
 fresh ``docker exec`` that resumes the on-disk session, so the coder remembers
@@ -21,12 +26,13 @@ T3's only loop bound is ``max_rounds``.
 from __future__ import annotations
 
 import logging
+import subprocess
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ...runner import git, worktree
-from . import containers, handoff
+from ...runner import detection, git, worktree
+from . import containers, handoff, test_gate
 from .config import (
     CLAUDE_AUTH_FILES,
     HANDOFF_DIRNAME,
@@ -34,6 +40,7 @@ from .config import (
     is_valid_reviewer_name,
 )
 from .handoff import Finding, HandoffError, ReviewHandoff
+from .test_gate import GateResult
 from .turns import run_turn
 
 logger = logging.getLogger(__name__)
@@ -71,6 +78,7 @@ class DevelopResult:
     review_cost_usd: float
     message: str
     review: ReviewOutcome | None = None  # the final round's review
+    test_gate: GateResult | None = None  # the latest round's gate (T4)
     conversation_log: Path | None = None
 
     @property
@@ -150,6 +158,104 @@ def _coder_summary(config: DevelopConfig, round_no: int) -> str:
         ).summary or ("(the coder wrote no summary)")
     except (HandoffError, OSError):
         return "(coder summary unavailable)"
+
+
+# --- test gate (T4) ---------------------------------------------------------
+
+
+def _resolve_gate_command(config: DevelopConfig, wt: Path) -> str | None:
+    """Pick the test command the gate will run, or ``None`` to skip the gate.
+
+    An explicit ``test_command`` is trusted as-is; otherwise candidates are
+    auto-detected from the worktree and the first one whose tool exists in the
+    container image wins (the image may lack e.g. ``make`` — see
+    :mod:`...runner.detection`).
+    """
+    if not config.test_gate:
+        return None
+    if config.test_command:
+        return config.test_command
+    candidates = detection.detect_test_commands(wt)
+    if not candidates:
+        logger.info(
+            "story-develop %s: test gate skipped (no test command detected)",
+            config.run_id,
+        )
+        return None
+    tools = list(dict.fromkeys(c.split()[0] for c in candidates))
+    chosen = test_gate.select_command(
+        candidates, test_gate.probe_tools(config.image, tools)
+    )
+    if chosen is None:
+        logger.warning(
+            "story-develop %s: test gate skipped — none of %s runnable in %s; "
+            "set --test-command explicitly",
+            config.run_id,
+            candidates,
+            config.image,
+        )
+    return chosen
+
+
+def _run_gate(
+    config: DevelopConfig, wt: Path, sha: str, round_no: int, command: str
+) -> GateResult | None:
+    """Run the gate for one round commit. Infra errors skip the gate (with a
+    warning) rather than failing the run — the gate is an independent check,
+    not a dependency."""
+    round_dir = config.gate_dir / f"round_{round_no:02d}"
+    name = containers.container_name(config.run_id, f"gate-r{round_no}")
+    try:
+        test_gate.export_tree(wt, sha, round_dir / "tree")
+        cache = config.gate_dir / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        gate_cmd = test_gate.build_gate_command(
+            name=name,
+            image=config.image,
+            tree=round_dir / "tree",
+            cache_dir=cache,
+            command=command,
+        )
+        result = test_gate.run_gate_container(
+            gate_cmd, name=name, command=command, timeout=config.test_timeout
+        )
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning(
+            "story-develop %s: round %d test gate errored (skipping): %s",
+            config.run_id,
+            round_no,
+            exc,
+        )
+        return None
+    (round_dir / "output.txt").write_text(
+        f"$ {result.command}\nexit: {result.exit_code} ({result.verdict})\n\n"
+        f"{result.output_tail}\n",
+        encoding="utf-8",
+    )
+    logger.info(
+        "story-develop %s: round %d test gate %s (`%s`, exit %d)",
+        config.run_id,
+        round_no,
+        result.verdict,
+        result.command,
+        result.exit_code,
+    )
+    return result
+
+
+def _gate_note(gate: GateResult | None) -> str:
+    """A prompt section describing a red gate (empty when green/absent)."""
+    if gate is None or gate.passed:
+        return ""
+    how = "timed out" if gate.timed_out else f"exit {gate.exit_code}"
+    return (
+        "\n## Independent test gate (FAILED)\n\n"
+        f"The orchestrator independently ran `{gate.command}` against your last "
+        f"commit in a clean container and it failed ({how}). This result is "
+        "authoritative — fix the failures regardless of how the tests behaved "
+        "in your own environment. Output tail:\n\n"
+        "```\n" + gate.output_tail + "\n```\n"
+    )
 
 
 # --- per-turn drivers -------------------------------------------------------
@@ -295,6 +401,8 @@ def develop(
     status = "failed"
     failure_reason = "no rounds ran"
     final_review: ReviewOutcome | None = None
+    gate: GateResult | None = None
+    gate_command = _resolve_gate_command(config, wt)
     rounds_completed = 0
     coder_cost = 0.0
     review_cost = 0.0
@@ -327,6 +435,7 @@ def develop(
                     reviewer=config.reviewer,
                     acceptance_criteria=config.effective_acceptance_criteria,
                     findings=_render_findings(final_review.findings),
+                    test_gate_note=_gate_note(gate),
                     review_file=handoff.reviewer_handoff_name(
                         round_no - 1, config.reviewer
                     ),
@@ -364,6 +473,15 @@ def develop(
                 failure_reason = "round 1: coder produced no commit"
                 status = "failed"
                 break
+
+            # --- test gate (only when there is a new commit to gate) --------
+            if gate_command is not None and new_commit is not None:
+                # Overwrite unconditionally: on a gate infra error this clears
+                # to None rather than letting a PRIOR commit's result (e.g. a
+                # stale RED under block_on_red) stand in for this commit. A
+                # round with no new commit keeps the prior result — the tree is
+                # unchanged, so it still describes HEAD.
+                gate = _run_gate(config, wt, new_commit, round_no, gate_command)
 
             # --- reviewer turn --------------------------------------------
             if round_no == 1:
@@ -406,8 +524,16 @@ def develop(
                 status = "failed"
                 break
             if review.passed:
-                status = "approved"
-                break
+                if gate is not None and not gate.passed and config.block_on_red:
+                    logger.info(
+                        "story-develop %s: round %d review passed but test gate "
+                        "is RED and --block-on-red is set; continuing",
+                        config.run_id,
+                        round_no,
+                    )
+                else:
+                    status = "approved"
+                    break
             # otherwise: loop to the next round (if any remain)
         else:
             # loop exhausted without an approval / failure break
@@ -426,23 +552,25 @@ def develop(
     )
 
     total = coder_cost + review_cost
+    gate_part = f"; test gate {gate.verdict} (`{gate.command}`)" if gate else ""
     if status == "approved":
         assert final_review is not None
         sev = f" (max {final_review.max_severity})" if final_review.max_severity else ""
         message = (
             f"approved by [{final_review.reviewer}] in {rounds_completed} "
-            f"round(s){sev}; {len(commits)} commit(s) on {branch}; cost ${total:.4f}"
+            f"round(s){sev}{gate_part}; {len(commits)} commit(s) on {branch}; "
+            f"cost ${total:.4f}"
         )
     elif status == "max_rounds":
         assert final_review is not None
         sev = f" (max {final_review.max_severity})" if final_review.max_severity else ""
         message = (
             f"NOT approved after {rounds_completed} round(s) (max_rounds); "
-            f"last review[{final_review.reviewer}]={final_review.status}{sev}; "
-            f"{len(commits)} commit(s) on {branch}; cost ${total:.4f}"
+            f"last review[{final_review.reviewer}]={final_review.status}{sev}"
+            f"{gate_part}; {len(commits)} commit(s) on {branch}; cost ${total:.4f}"
         )
     else:  # failed
-        message = f"{failure_reason}; {len(commits)} commit(s) on {branch}"
+        message = f"{failure_reason}{gate_part}; {len(commits)} commit(s) on {branch}"
 
     return DevelopResult(
         status=status,
@@ -457,5 +585,6 @@ def develop(
         review_cost_usd=review_cost,
         message=message,
         review=final_review,
+        test_gate=gate,
         conversation_log=log_path,
     )

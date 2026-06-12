@@ -17,7 +17,9 @@ import pytest
 
 from lithos_loom.plugins.story_develop import containers, handoff
 from lithos_loom.plugins.story_develop import develop as develop_mod
+from lithos_loom.plugins.story_develop import test_gate as test_gate_mod
 from lithos_loom.plugins.story_develop.config import DevelopConfig
+from lithos_loom.plugins.story_develop.test_gate import GateResult
 from lithos_loom.plugins.story_develop.turns import TurnResult
 
 _LGTM = "## Status: LGTM\n## Summary\nLooks correct and complete.\n"
@@ -55,16 +57,28 @@ def _install_fakes(
     write_source: bool = True,
     write_coder_handoff: bool = True,
     reviews: list[dict] | None = None,
+    source_rounds: set[int] | None = None,
+    gates: list[bool | str] | None = None,
 ) -> dict:
-    """Install fake container + turn machinery.
+    """Install fake container + turn + gate machinery.
 
     ``reviews`` scripts the reviewer per round (0-based; the last entry repeats
     for any further rounds). Each entry: ``{text, ok, retry_text, retry_ok}``.
     ``text`` is what the first review turn writes (None = write nothing);
     ``retry_text`` is what the malformed-handoff re-prompt writes.
+    ``source_rounds`` limits which rounds the coder writes source in (None =
+    every round). ``gates`` scripts the gate result per gate run (last repeats;
+    ``True``/``False`` = green/red, ``"error"`` = simulated infra failure); the
+    gate only actually runs when the config carries a ``test_command``.
     """
     reviews = reviews if reviews is not None else [{"text": _LGTM}]
-    state: dict = {"stopped": [], "coder_calls": [], "review_calls": []}
+    state: dict = {
+        "stopped": [],
+        "coder_calls": [],
+        "coder_prompts": [],
+        "review_calls": [],
+        "gate_calls": [],
+    }
 
     def fake_start(run_cmd) -> str:
         state["worktree"] = _worktree_from_run_cmd(run_cmd)
@@ -78,7 +92,8 @@ def _install_fakes(
         if "-coder" in container:
             rnd = _round_from(prompt, "coder_done")
             state["coder_calls"].append((rnd, resume))
-            if write_source:
+            state["coder_prompts"].append(prompt)
+            if write_source and (source_rounds is None or rnd in source_rounds):
                 (wt / "greeting.txt").write_text(f"hello round {rnd}\n")
             if write_coder_handoff:
                 (config.handoff_dir / handoff.coder_handoff_name(rnd)).write_text(
@@ -117,11 +132,26 @@ def _install_fakes(
             stderr="",
         )
 
+    def fake_gate_container(gate_cmd, *, name, command, timeout):
+        seq = gates if gates is not None else [True]
+        val = seq[min(len(state["gate_calls"]), len(seq) - 1)]
+        state["gate_calls"].append(name)
+        if isinstance(val, str):  # "error" -> simulated infra failure
+            raise RuntimeError("simulated gate infra failure")
+        ok = val
+        return GateResult(
+            command=command,
+            exit_code=0 if ok else 1,
+            passed=ok,
+            output_tail="2 failed, 10 passed" if not ok else "12 passed",
+        )
+
     monkeypatch.setattr(containers, "start_container", fake_start)
     monkeypatch.setattr(
         containers, "stop_container", lambda name: state["stopped"].append(name)
     )
     monkeypatch.setattr(develop_mod, "run_turn", fake_run_turn)
+    monkeypatch.setattr(test_gate_mod, "run_gate_container", fake_gate_container)
     return state
 
 
@@ -330,6 +360,130 @@ def test_conversation_log_written_per_round(
     # become siblings of the log's "## Round N" structure
     assert "> ## Status:" in log
     assert "\n## Status:" not in log
+
+
+# --- test gate (T4) ---------------------------------------------------------
+
+
+def _gated_config(config: DevelopConfig, **overrides) -> DevelopConfig:
+    from dataclasses import replace
+
+    return replace(config, test_command="fake-tests", **overrides)
+
+
+def test_gate_skipped_when_no_command_detected(
+    monkeypatch: pytest.MonkeyPatch, config: DevelopConfig
+) -> None:
+    # fixture repo has no Makefile/pytest markers -> detection finds nothing
+    state = _install_fakes(monkeypatch, config)
+    result = develop_mod.develop(config)
+    assert result.status == "approved"
+    assert result.test_gate is None
+    assert state["gate_calls"] == []
+
+
+def test_gate_green_recorded_on_approval(
+    monkeypatch: pytest.MonkeyPatch, config: DevelopConfig
+) -> None:
+    cfg = _gated_config(config)
+    state = _install_fakes(monkeypatch, cfg, gates=[True])
+    result = develop_mod.develop(cfg)
+    assert result.status == "approved"
+    assert result.test_gate is not None and result.test_gate.passed
+    assert result.test_gate.command == "fake-tests"
+    assert "test gate GREEN" in result.message
+    assert len(state["gate_calls"]) == 1
+    # the gate output artifact is preserved per round
+    assert (cfg.gate_dir / "round_01" / "output.txt").is_file()
+
+
+def test_gate_red_nonblocking_records_but_approves(
+    monkeypatch: pytest.MonkeyPatch, config: DevelopConfig
+) -> None:
+    cfg = _gated_config(config)  # block_on_red defaults False
+    _install_fakes(monkeypatch, cfg, gates=[False])
+    result = develop_mod.develop(cfg)
+    assert result.status == "approved"  # recorded, not gating
+    assert result.test_gate is not None and not result.test_gate.passed
+    assert "test gate RED" in result.message
+
+
+def test_gate_red_blocking_loops_and_feeds_coder(
+    monkeypatch: pytest.MonkeyPatch, config: DevelopConfig
+) -> None:
+    cfg = _gated_config(config, block_on_red=True)
+    state = _install_fakes(monkeypatch, cfg, gates=[False, True])
+    result = develop_mod.develop(cfg)
+
+    # round 1: review LGTM but gate RED -> blocked; round 2: gate GREEN -> approved
+    assert result.status == "approved"
+    assert result.rounds == 2
+    assert len(state["gate_calls"]) == 2
+    # the round-2 coder prompt carried the gate failure + its output tail
+    r2_prompt = state["coder_prompts"][1]
+    assert "Independent test gate (FAILED)" in r2_prompt
+    assert "2 failed, 10 passed" in r2_prompt
+    assert result.test_gate is not None and result.test_gate.passed
+
+
+def test_gate_red_blocking_exhausts_rounds(
+    monkeypatch: pytest.MonkeyPatch, config: DevelopConfig
+) -> None:
+    cfg = _gated_config(config, block_on_red=True, max_rounds=2)
+    _install_fakes(monkeypatch, cfg, gates=[False])
+    result = develop_mod.develop(cfg)
+    assert result.status == "max_rounds"
+    assert result.succeeded is False
+    assert "test gate RED" in result.message
+
+
+def test_gate_not_rerun_without_new_commit(
+    monkeypatch: pytest.MonkeyPatch, config: DevelopConfig
+) -> None:
+    # round 1 commits (gate runs); round 2 the coder only disputes (no commit,
+    # no new tree) -> the gate must not re-run.
+    cfg = _gated_config(config)
+    state = _install_fakes(
+        monkeypatch,
+        cfg,
+        reviews=[{"text": _FINDINGS_MAJOR}, {"text": _LGTM}],
+        source_rounds={1},
+        gates=[True],
+    )
+    result = develop_mod.develop(cfg)
+    assert result.status == "approved"
+    assert result.rounds == 2
+    assert len(state["gate_calls"]) == 1  # only the round-1 commit was gated
+
+
+def test_gate_infra_error_clears_stale_red_under_block_on_red(
+    monkeypatch: pytest.MonkeyPatch, config: DevelopConfig
+) -> None:
+    # Round 1: gate RED + block_on_red -> blocked despite LGTM review.
+    # Round 2: NEW commit but the gate errors (infra) -> the stale round-1 RED
+    # must NOT stand in for this commit; with no gate result the review's pass
+    # approves the run (the gate is an independent check, not a dependency).
+    cfg = _gated_config(config, block_on_red=True)
+    state = _install_fakes(monkeypatch, cfg, gates=[False, "error"])
+    result = develop_mod.develop(cfg)
+
+    assert result.status == "approved"
+    assert result.rounds == 2
+    assert len(state["gate_calls"]) == 2  # round 2 did attempt its own gate
+    assert result.test_gate is None  # no result for the approved commit
+    assert "test gate" not in result.message  # no stale verdict reported
+
+
+def test_gate_disabled_by_config(
+    monkeypatch: pytest.MonkeyPatch, config: DevelopConfig
+) -> None:
+    from dataclasses import replace
+
+    cfg = replace(config, test_command="fake-tests", test_gate=False)
+    state = _install_fakes(monkeypatch, cfg, gates=[True])
+    result = develop_mod.develop(cfg)
+    assert result.test_gate is None
+    assert state["gate_calls"] == []
 
 
 # --- validation -------------------------------------------------------------
