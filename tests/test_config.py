@@ -603,6 +603,25 @@ def test_github_watcher_minimal_parses_with_defaults(
     poll = cfg.github_watcher.poll_interval_seconds
     assert poll == DEFAULT_GITHUB_WATCHER_POLL_INTERVAL
     assert cfg.github_watcher.coord_doc_path == DEFAULT_GITHUB_WATCHER_COORD_DOC
+    assert cfg.github_watcher.pr_merge_poll_enabled is True  # #87: default on
+
+
+def test_github_watcher_pr_merge_poll_can_be_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        dedent(
+            """
+            [github_watcher]
+            pr_merge_poll_enabled = false
+            """
+        ),
+    )
+    cfg = load_config()
+    assert cfg.github_watcher is not None
+    assert cfg.github_watcher.pr_merge_poll_enabled is False
 
 
 def test_github_watcher_full_parses(

@@ -268,6 +268,16 @@ class GitHubWatcherConfig:
     so the sweep is harmless when everything is already in sync. Set
     to 0 to disable the sweep entirely.
     """
+    pr_merge_poll_enabled: bool = True
+    """Whether the reconcile sweep also polls delivered PRs for merge (#87).
+
+    When on (default), the sweep checks every open task carrying
+    ``metadata.develop_pr_url`` (and NOT ``github_issue_url`` — those close via
+    the issue mirror): a merged PR completes the task, a closed-unmerged or
+    deleted PR leaves it open with a one-shot ``[DeliveredPRClosed]`` finding.
+    Piggybacks the ``reconcile_interval_minutes`` cadence. Set ``false`` to run
+    the watcher for issue sync only without the PR-merge sweep.
+    """
 
 
 @dataclass(frozen=True)
@@ -660,6 +670,7 @@ _GITHUB_WATCHER_KEYS: frozenset[str] = frozenset(
         "coord_doc_path",
         "resolved_replay_days",
         "reconcile_interval_minutes",
+        "pr_merge_poll_enabled",
     }
 )
 
@@ -740,12 +751,17 @@ def _parse_github_watcher(data: Any, config_path: Path) -> GitHubWatcherConfig |
             f">= 0 (got {reconcile_interval})"
         )
 
+    pr_merge_poll_enabled = _optional_bool(
+        data, "pr_merge_poll_enabled", True, config_path, "github_watcher"
+    )
+
     return GitHubWatcherConfig(
         enabled=enabled,
         poll_interval_seconds=poll_interval,
         coord_doc_path=coord_doc_raw,
         resolved_replay_days=resolved_replay_days,
         reconcile_interval_minutes=reconcile_interval,
+        pr_merge_poll_enabled=pr_merge_poll_enabled,
     )
 
 

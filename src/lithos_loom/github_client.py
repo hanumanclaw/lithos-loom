@@ -82,6 +82,24 @@ class Issue:
     html_url: str
 
 
+@dataclass(frozen=True)
+class PullRequest:
+    """The slice of GitHub's pull-request payload the PR-merge watcher cares about.
+
+    ``merged`` is a top-level boolean on the single-PR endpoint
+    (``GET /pulls/{n}``) — reliable there, unlike the list endpoint where it
+    is absent. ``merged_at`` / ``merge_commit_sha`` are populated only once the
+    PR has actually merged.
+    """
+
+    repo: str
+    number: int
+    state: str  # "open" | "closed"
+    merged: bool
+    merged_at: datetime | None
+    merge_commit_sha: str | None
+
+
 # ── Pure helpers ──────────────────────────────────────────────────────
 
 
@@ -118,6 +136,20 @@ def _parse_issues_response(payload: list[dict[str, Any]], *, repo: str) -> list[
             )
         )
     return issues
+
+
+def _parse_pull_request(row: dict[str, Any], *, repo: str) -> PullRequest:
+    """Convert a GitHub ``GET /pulls/{n}`` response row into a typed PullRequest."""
+    merged_at_raw = row.get("merged_at")
+    sha = row.get("merge_commit_sha")
+    return PullRequest(
+        repo=repo,
+        number=int(row["number"]),
+        state=str(row["state"]),
+        merged=bool(row.get("merged", False)),
+        merged_at=_parse_iso(str(merged_at_raw)) if merged_at_raw else None,
+        merge_commit_sha=str(sha) if sha else None,
+    )
 
 
 def parse_marker(body: str | None) -> str | None:
@@ -352,6 +384,19 @@ class GitHubClient:
         _raise_for_status(response, repo=repo)
         parsed = _parse_issues_response([response.json()], repo=repo)
         return parsed[0] if parsed else None
+
+    async def get_pull_request(self, repo: str, number: int) -> PullRequest | None:
+        """Fetch a single pull request. Returns ``None`` if it was deleted (404).
+
+        Used by the PR-merge watcher (#87) to detect when a story-develop-
+        delivered PR has merged (so the non-issue-linked Lithos task can close)
+        or closed-without-merging. Mirrors :meth:`get_issue`.
+        """
+        response = await self._get(f"/repos/{repo}/pulls/{number}")
+        if response.status_code == 404:
+            return None
+        _raise_for_status(response, repo=repo)
+        return _parse_pull_request(response.json(), repo=repo)
 
     async def update_issue_body(self, repo: str, number: int, body: str) -> None:
         """Replace the issue body. Used to write/refresh the linkage marker.

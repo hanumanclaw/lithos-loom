@@ -29,7 +29,9 @@ from lithos_loom.github_client import (
     GitHubError,
     GitHubRepoNotFoundError,
     Issue,
+    PullRequest,
     _parse_issues_response,
+    _parse_pull_request,
     _resolve_gh_token,
     apply_marker,
     parse_marker,
@@ -522,6 +524,97 @@ async def test_get_issue_404_returns_none() -> None:
     async with httpx.AsyncClient() as http:
         client = GitHubClient(http=http, token="fake")
         assert await client.get_issue("x/y", 999) is None
+
+
+# ── get_pull_request (#87 PR-merge watcher) ───────────────────────────
+
+
+def test_parse_pull_request_merged() -> None:
+    pr = _parse_pull_request(
+        {
+            "number": 7,
+            "state": "closed",
+            "merged": True,
+            "merged_at": "2026-06-13T12:00:00Z",
+            "merge_commit_sha": "deadbeef",
+        },
+        repo="x/y",
+    )
+    assert pr == PullRequest(
+        repo="x/y",
+        number=7,
+        state="closed",
+        merged=True,
+        merged_at=datetime(2026, 6, 13, 12, 0, 0, tzinfo=UTC),
+        merge_commit_sha="deadbeef",
+    )
+
+
+def test_parse_pull_request_open_has_no_merge_fields() -> None:
+    pr = _parse_pull_request(
+        {"number": 7, "state": "open", "merged": False, "merged_at": None}, repo="x/y"
+    )
+    assert pr.merged is False and pr.merged_at is None and pr.merge_commit_sha is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_pull_request_merged() -> None:
+    respx.get("https://api.github.com/repos/x/y/pulls/7").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "number": 7,
+                "state": "closed",
+                "merged": True,
+                "merged_at": "2026-06-13T12:00:00Z",
+                "merge_commit_sha": "abc123",
+            },
+        )
+    )
+    async with httpx.AsyncClient() as http:
+        pr = await GitHubClient(http=http, token="fake").get_pull_request("x/y", 7)
+    assert pr is not None and pr.merged is True and pr.merge_commit_sha == "abc123"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_pull_request_open() -> None:
+    respx.get("https://api.github.com/repos/x/y/pulls/7").mock(
+        return_value=httpx.Response(
+            200, json={"number": 7, "state": "open", "merged": False, "merged_at": None}
+        )
+    )
+    async with httpx.AsyncClient() as http:
+        pr = await GitHubClient(http=http, token="fake").get_pull_request("x/y", 7)
+    assert pr is not None and pr.state == "open" and pr.merged is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_pull_request_closed_unmerged() -> None:
+    respx.get("https://api.github.com/repos/x/y/pulls/7").mock(
+        return_value=httpx.Response(
+            200,
+            json={"number": 7, "state": "closed", "merged": False, "merged_at": None},
+        )
+    )
+    async with httpx.AsyncClient() as http:
+        pr = await GitHubClient(http=http, token="fake").get_pull_request("x/y", 7)
+    assert pr is not None and pr.state == "closed" and pr.merged is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_pull_request_404_returns_none() -> None:
+    respx.get("https://api.github.com/repos/x/y/pulls/999").mock(
+        return_value=httpx.Response(404, json={"message": "Not Found"})
+    )
+    async with httpx.AsyncClient() as http:
+        assert (
+            await GitHubClient(http=http, token="fake").get_pull_request("x/y", 999)
+            is None
+        )
 
 
 # ── update_issue_fields (Slice 7.2) ───────────────────────────────────

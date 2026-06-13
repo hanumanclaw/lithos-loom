@@ -170,6 +170,8 @@ async def test_reconcile_pass_redispatches_gh_linked_tasks() -> None:
         push_handler=push_handler,
         ctx=ctx,
         resolved_window=timedelta(days=7),
+        github=AsyncMock(),
+        pr_merge_enabled=False,
     )
     # Open task → one updated event (title sync).
     # Terminal task → updated + close so title drift is reconciled too.
@@ -221,12 +223,95 @@ async def test_reconcile_pass_skips_terminal_scan_when_window_disabled() -> None
         push_handler=push_handler,
         ctx=ctx,
         resolved_window=None,
+        github=AsyncMock(),
+        pr_merge_enabled=False,
     )
     # Only the open-task scan ran; no completed / cancelled queries.
     assert lithos.task_list.await_count == 1
     assert lithos.task_list.await_args.kwargs["status"] == "open"
     # And only the open task's title sync fired.
     assert handler_calls == ["lithos.task.updated"]
+
+
+async def test_reconcile_pass_polls_develop_pr_tasks_when_enabled() -> None:
+    """#87: the sweep checks open non-issue tasks carrying develop_pr_url and
+    completes them when the PR has merged."""
+    import logging
+    from unittest.mock import AsyncMock
+
+    from lithos_loom.children.github_watcher import _run_reconcile_pass
+    from lithos_loom.github_client import PullRequest
+    from lithos_loom.lithos_client import Task
+    from lithos_loom.subscriptions import SubscriptionContext
+
+    develop_task = Task(
+        id="task-pr",
+        title="PR task",
+        status="open",
+        tags=("trigger:story-develop",),
+        metadata={"develop_pr_url": "https://github.com/o/r/pull/9"},
+        claims=(),
+    )
+    lithos = AsyncMock()
+    lithos.task_list = AsyncMock(return_value=[develop_task])
+    github = AsyncMock()
+    github.get_pull_request = AsyncMock(
+        return_value=PullRequest(
+            repo="o/r",
+            number=9,
+            state="closed",
+            merged=True,
+            merged_at=None,
+            merge_commit_sha="sha9",
+        )
+    )
+    ctx = SubscriptionContext(
+        lithos=lithos, logger=logging.getLogger("test-pr"), agent_id="a"
+    )
+    await _run_reconcile_pass(
+        lithos=lithos,
+        push_handler=AsyncMock(),
+        ctx=ctx,
+        resolved_window=None,
+        github=github,
+        pr_merge_enabled=True,
+    )
+    github.get_pull_request.assert_awaited_once_with("o/r", 9)
+    lithos.task_complete.assert_awaited_once_with(task_id="task-pr")
+
+
+async def test_reconcile_pass_skips_pr_poll_when_disabled() -> None:
+    """pr_merge_poll_enabled=false runs the watcher for issue sync only."""
+    import logging
+    from unittest.mock import AsyncMock
+
+    from lithos_loom.children.github_watcher import _run_reconcile_pass
+    from lithos_loom.lithos_client import Task
+    from lithos_loom.subscriptions import SubscriptionContext
+
+    develop_task = Task(
+        id="task-pr",
+        title="PR task",
+        status="open",
+        tags=(),
+        metadata={"develop_pr_url": "https://github.com/o/r/pull/9"},
+        claims=(),
+    )
+    lithos = AsyncMock()
+    lithos.task_list = AsyncMock(return_value=[develop_task])
+    github = AsyncMock()
+    ctx = SubscriptionContext(
+        lithos=lithos, logger=logging.getLogger("test-pr"), agent_id="a"
+    )
+    await _run_reconcile_pass(
+        lithos=lithos,
+        push_handler=AsyncMock(),
+        ctx=ctx,
+        resolved_window=None,
+        github=github,
+        pr_merge_enabled=False,
+    )
+    github.get_pull_request.assert_not_awaited()
 
 
 def test_configure_logging_silences_mcp_sse_at_critical() -> None:

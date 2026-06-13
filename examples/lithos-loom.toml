@@ -313,3 +313,10 @@ tags = ["trigger:story-review-human"]
 # # The sweep closes that gap while the daemon keeps running — every
 # # interval it re-dispatches GH-linked Lithos tasks through the push
 # # handler. Set to 0 to disable.
+# pr_merge_poll_enabled = true
+# # #87: the same reconcile sweep also completes non-issue-linked tasks
+# # on PR merge. For each open task carrying metadata.develop_pr_url (and
+# # NOT github_issue_url — those close via the issue mirror), it polls the
+# # PR: merged -> task_complete; closed-unmerged or deleted -> left open
+# # with a one-shot [DeliveredPRClosed] finding. Set false to run the
+# # watcher for issue sync only.
