@@ -45,6 +45,7 @@ from pathlib import Path
 
 from lithos_loom.bus import EventBus
 from lithos_loom.config import LogLevel, LoomConfig, SubscriptionConfig, load_config
+from lithos_loom.cursor_store import CursorStore
 from lithos_loom.lithos_client import LithosClient
 from lithos_loom.sources.lithos_event_stream import LithosEventStream
 from lithos_loom.sources.lithos_note_stream import LithosNoteStream
@@ -317,6 +318,9 @@ async def _amain(cfg: LoomConfig) -> int:
         # but the source itself is independently spawnable so the
         # spawn gate doesn't have to be re-plumbed as more actions land.
         sync_state = ProjectionSyncState()
+        cursor_store = CursorStore(
+            cfg.orchestrator.work_dir / "obsidian-sync" / "sse_cursors.json"
+        )
         bus = EventBus()
         fs_watcher = ObsidianFsWatcher(
             bus=bus,
@@ -452,6 +456,8 @@ async def _amain(cfg: LoomConfig) -> int:
                     bus=bus,
                     events_url=events_url,
                     bootstrap_resolved_window=timedelta(days=obs.resolved_ttl_days),
+                    cursor_store=cursor_store,
+                    cursor_name="task-events",
                 )
                 tasks.append(
                     asyncio.create_task(source.run(), name="lithos-event-stream")
@@ -467,6 +473,8 @@ async def _amain(cfg: LoomConfig) -> int:
                     client=lithos,
                     bus=bus,
                     events_url=events_url,
+                    cursor_store=cursor_store,
+                    cursor_name="note-events",
                 )
                 tasks.append(
                     asyncio.create_task(note_source.run(), name="lithos-note-stream")

@@ -678,3 +678,79 @@ async def test_publish_uses_now_provider_for_event_timestamp() -> None:
 
     [ev] = list(listener.queue._queue)  # type: ignore[attr-defined]
     assert ev.timestamp == pinned
+
+
+# ── Cursor persistence (Last-Event-ID across restarts) ─────────────────
+
+
+async def test_cursor_store_persists_last_event_id(tmp_path: Any) -> None:
+    """When a CursorStore is wired, the note stream saves the cursor after
+    each SSE event drain and a fresh instance on the same store recovers it."""
+    from lithos_loom.cursor_store import CursorStore
+
+    store_path = tmp_path / "sse_cursors.json"
+    store = CursorStore(store_path)
+
+    bus = EventBus()
+    bus.subscribe(event_types=["lithos.note.created"])
+    client = _FakeClient(responses=[[]])
+    aconnect = _FakeAconnect(
+        connections=[
+            [
+                _FakeSse(
+                    event="note.created",
+                    data={"id": "n1", "title": "Note 1", "path": "projects/n1/ctx.md"},
+                    id="evt-77",
+                ),
+            ],
+        ]
+    )
+    source = LithosNoteStream(
+        client=client,
+        bus=bus,
+        events_url="http://lithos.test/events",
+        reconnect_backoff_seconds=0.001,
+        max_reconnect_backoff_seconds=0.01,
+        _aconnect_sse=aconnect,
+        cursor_store=store,
+        cursor_name="note-events",
+    )
+
+    await _run_once(source)
+
+    # Persisted.
+    assert store.get("note-events") == "evt-77"
+
+    # Survives reload.
+    store2 = CursorStore(store_path)
+    assert store2.get("note-events") == "evt-77"
+
+
+async def test_cursor_store_loaded_at_construction(tmp_path: Any) -> None:
+    """A note stream constructed with a pre-populated CursorStore sends
+    Last-Event-ID on its first connect."""
+    from lithos_loom.cursor_store import CursorStore
+
+    store_path = tmp_path / "sse_cursors.json"
+    store = CursorStore(store_path)
+    store.save("note-events", "evt-55")
+
+    bus = EventBus()
+    client = _FakeClient(responses=[[]])
+    aconnect = _FakeAconnect(connections=[[]])
+
+    source = LithosNoteStream(
+        client=client,
+        bus=bus,
+        events_url="http://lithos.test/events",
+        reconnect_backoff_seconds=0.001,
+        max_reconnect_backoff_seconds=0.01,
+        _aconnect_sse=aconnect,
+        cursor_store=store,
+        cursor_name="note-events",
+    )
+
+    await _run_once(source)
+
+    # First connect should carry the persisted Last-Event-ID.
+    assert aconnect.calls[0]["headers"].get("Last-Event-ID") == "evt-55"

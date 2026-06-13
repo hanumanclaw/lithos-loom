@@ -59,6 +59,7 @@ import httpx
 from httpx_sse import aconnect_sse
 
 from lithos_loom.bus import Event, EventBus
+from lithos_loom.cursor_store import CursorStore
 from lithos_loom.lithos_client import NoteSummary
 
 __all__ = ["LithosNoteStream", "NoteStreamClient"]
@@ -120,6 +121,12 @@ class LithosNoteStream:
     bootstrap_limit: int = 100
     """Cap on bootstrap enumeration. Lithos's default page size is
     50; 100 comfortably covers the user's ~20-project working set."""
+    cursor_store: CursorStore | None = None
+    """Optional :class:`~lithos_loom.cursor_store.CursorStore` for
+    persisting ``Last-Event-ID`` across daemon restarts. Same contract
+    as :attr:`LithosEventStream.cursor_store`."""
+    cursor_name: str = "note-events"
+    """Key under which this stream's cursor is stored."""
     # Injection points for tests — same shape as LithosEventStream.
     _aconnect_sse: Any = field(default=aconnect_sse)
     _httpx_client_factory: Any = field(default=httpx.AsyncClient)
@@ -127,7 +134,11 @@ class LithosNoteStream:
     _now_provider: Any = field(default=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
-        self._last_event_id: str | None = None
+        self._last_event_id: str | None = (
+            self.cursor_store.get(self.cursor_name)
+            if self.cursor_store is not None
+            else None
+        )
         self._bootstrapped: bool = False
         # Same role as LithosEventStream's counter — drives the
         # backoff-reset decision when an attempt produces events.
@@ -252,6 +263,8 @@ class LithosNoteStream:
                 published = await self._handle_sse_event(sse)
                 if sse.id:
                     self._last_event_id = sse.id
+                    if self.cursor_store is not None:
+                        self.cursor_store.save(self.cursor_name, sse.id)
                 if published:
                     self._events_this_attempt += 1
         return self._events_this_attempt

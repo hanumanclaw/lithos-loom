@@ -56,6 +56,7 @@ import httpx
 from httpx_sse import aconnect_sse
 
 from lithos_loom.bus import Event, EventBus
+from lithos_loom.cursor_store import CursorStore
 from lithos_loom.lithos_client import Task
 
 __all__ = ["LithosEventStream", "EventStreamClient"]
@@ -144,6 +145,18 @@ class LithosEventStream:
     ``None`` (default) means open-only bootstrap. Other source consumers
     (e.g. route-runner) don't need this and leave it ``None``.
     """
+    cursor_store: CursorStore | None = None
+    """Optional :class:`~lithos_loom.cursor_store.CursorStore` for
+    persisting ``Last-Event-ID`` across daemon restarts. When set, the
+    cursor is loaded on construction and saved after each SSE event
+    drain. ``None`` (default) retains the original in-memory-only
+    behaviour — tests and short-lived CLI invocations don't need
+    persistence."""
+    cursor_name: str = "task-events"
+    """Key under which this stream's cursor is stored in the
+    :class:`CursorStore`. Callers that run multiple streams in the same
+    process (e.g. github-watcher running both task and note streams)
+    must use distinct names so their cursors don't collide."""
     # Injection points for tests. Default to the real httpx surfaces.
     _aconnect_sse: Any = field(default=aconnect_sse)
     _httpx_client_factory: Any = field(default=httpx.AsyncClient)
@@ -158,7 +171,12 @@ class LithosEventStream:
     """
 
     def __post_init__(self) -> None:
-        self._last_event_id: str | None = None
+        # Restore persisted cursor when a store is configured.
+        self._last_event_id: str | None = (
+            self.cursor_store.get(self.cursor_name)
+            if self.cursor_store is not None
+            else None
+        )
         # Cache of the most recent Task object seen per id. Populated
         # during bootstrap and refreshed via ``task_list`` whenever an
         # SSE event arrives for an unknown task id. The cache carries
@@ -391,6 +409,8 @@ class LithosEventStream:
                 published = await self._handle_sse_event(sse)
                 if sse.id:
                     self._last_event_id = sse.id
+                    if self.cursor_store is not None:
+                        self.cursor_store.save(self.cursor_name, sse.id)
                 if published:
                     self._events_this_attempt += 1
         return self._events_this_attempt

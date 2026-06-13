@@ -25,6 +25,7 @@ from pathlib import Path
 
 from lithos_loom.bus import EventBus
 from lithos_loom.config import LogLevel, LoomConfig, load_config
+from lithos_loom.cursor_store import CursorStore
 from lithos_loom.lithos_client import LithosClient
 from lithos_loom.sources.lithos_event_stream import LithosEventStream
 from lithos_loom.subscriptions.route_runner import RouteRunner
@@ -94,6 +95,10 @@ async def _amain(cfg: LoomConfig) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)
 
+    cursor_store = CursorStore(
+        cfg.orchestrator.work_dir / "route-runner" / "sse_cursors.json"
+    )
+
     async with LithosClient(
         cfg.orchestrator.lithos_url, agent_id=cfg.orchestrator.agent_id
     ) as lithos:
@@ -102,6 +107,8 @@ async def _amain(cfg: LoomConfig) -> int:
             client=lithos,
             bus=bus,
             events_url=events_url,
+            cursor_store=cursor_store,
+            cursor_name="task-events",
         )
         project_repos = {slug: pc.repo for slug, pc in cfg.projects.items()}
         runners = [

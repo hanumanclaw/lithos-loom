@@ -32,6 +32,7 @@ import httpx
 
 from lithos_loom.bus import Event, EventBus
 from lithos_loom.config import LogLevel, LoomConfig, load_config
+from lithos_loom.cursor_store import CursorStore
 from lithos_loom.github_client import GitHubClient
 from lithos_loom.lithos_client import LithosClient
 from lithos_loom.sources.github_issue_watcher import GitHubIssueWatcher
@@ -218,6 +219,9 @@ async def _amain(cfg: LoomConfig) -> int:
 
     try:
         bus = EventBus()
+        cursor_store = CursorStore(
+            cfg.orchestrator.work_dir / "github-watcher" / "sse_cursors.json"
+        )
         events_url = cfg.orchestrator.lithos_url.rstrip("/") + "/events"
         async with (
             httpx.AsyncClient(timeout=30.0) as http,
@@ -267,6 +271,8 @@ async def _amain(cfg: LoomConfig) -> int:
                 client=lithos,
                 bus=bus,
                 events_url=events_url,
+                cursor_store=cursor_store,
+                cursor_name="note-events",
             )
 
             # LithosEventStream is the push half: it surfaces
@@ -290,6 +296,8 @@ async def _amain(cfg: LoomConfig) -> int:
                 bus=bus,
                 events_url=events_url,
                 bootstrap_resolved_window=replay_window,
+                cursor_store=cursor_store,
+                cursor_name="task-events",
             )
 
             push_handler = make_github_issue_push_handler(github)

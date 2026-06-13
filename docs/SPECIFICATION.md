@@ -656,8 +656,8 @@ Sources are async coroutines spawned by their owning child. They consume externa
 
 | Source | Spawned by | Bootstrap | Reconnect |
 |---|---|---|---|
-| `LithosEventStream` | route-runner + obsidian-sync + github-watcher (independently) | `lithos_task_list(status='open', with_claims=true)` → re-emit `lithos.task.created` per task. | Exponential backoff with `Last-Event-ID` resume. |
-| `LithosNoteStream` | obsidian-sync (when `project-context-projection` is configured) + github-watcher | `lithos_list(path_prefix='projects/', tags=['project-context'])` → re-emit `lithos.note.created` per match. | Exponential backoff with `Last-Event-ID` resume. |
+| `LithosEventStream` | route-runner + obsidian-sync + github-watcher (independently) | `lithos_task_list(status='open', with_claims=true)` → re-emit `lithos.task.created` per task. | Exponential backoff with `Last-Event-ID` resume. Cursor persisted to `<work_dir>/<child>/sse_cursors.json` so restarts resume from the last drained event. |
+| `LithosNoteStream` | obsidian-sync (when `project-context-projection` is configured) + github-watcher | `lithos_list(path_prefix='projects/', tags=['project-context'])` → re-emit `lithos.note.created` per match. | Exponential backoff with `Last-Event-ID` resume. Cursor persisted alongside `LithosEventStream` in the same `sse_cursors.json`. |
 | `ObsidianFSWatcher` | obsidian-sync | Polls `<vault>/<tasks_file>` on a 250ms cadence; emits when a line diverges from the last-known state. | n/a (polling). |
 | `ObsidianDirWatcher` | obsidian-sync (when `note-push` is configured) | Walks `<vault>/<projects_dir>/**/*.md` on the same cadence; computes body-only hashes. | n/a. Excludes files ending in `-done.md` (the per-project archive). |
 | `GitHubIssueWatcher` | github-watcher | Reads `note_list(path_prefix='projects/', metadata_match={'github_watch_enabled': true})` to build the slug → repos watch list (a project may map several repos); loads per-repo `updated_at` cursors from `coord_doc_path`. | n/a (polling). Per-repo 404 drops the repo with a `[Friction]` log; 403 + `X-RateLimit-Remaining: 0` sleeps until `X-RateLimit-Reset`. |
