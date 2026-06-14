@@ -402,6 +402,78 @@ async def test_runner_dedupes_repeat_events_for_same_task(tmp_path: Path) -> Non
     assert lithos.task_complete.await_count == 1
 
 
+# ── Issue #86: dispatch on task.updated (tag added without restart) ────
+
+
+async def test_runner_dispatches_on_updated_for_existing_task(
+    tmp_path: Path,
+) -> None:
+    """The core #86 capability: a route's trigger tag added to an already-open
+    task arrives as ``lithos.task.updated`` and dispatches — no `created`, no
+    daemon restart. The enriched envelope already carries the new tags, so the
+    bus matcher passes it through and the standard claim → run path fires.
+    """
+    bus = EventBus()
+    runner, lithos = _make_runner(bus=bus, work_dir=tmp_path)
+
+    await bus.publish(_evt(type_="lithos.task.updated", payload=_payload("task-1")))
+    await _run_for(runner)
+
+    assert lithos.task_claim.await_count == 1
+    assert lithos.task_complete.await_count == 1
+
+
+async def test_runner_ignores_own_metadata_update_within_process(
+    tmp_path: Path,
+) -> None:
+    """No self-trigger loop: a plugin's own end-of-run ``task_update`` (e.g.
+    story-develop writing ``develop_*`` metadata) fires ``lithos.task.updated``
+    for a task this process already claimed. ``_processed_tasks`` drops it, so
+    the plugin does not re-run itself. This is the load-bearing safety property
+    for subscribing to ``updated``.
+    """
+    bus = EventBus()
+    runner, lithos = _make_runner(bus=bus, work_dir=tmp_path)
+
+    payload = _payload("task-1")
+    await bus.publish(_evt(type_="lithos.task.created", payload=payload))
+    # Same id arrives again as `updated` — as if the plugin wrote metadata.
+    await bus.publish(
+        _evt(
+            type_="lithos.task.updated",
+            payload=_payload("task-1", metadata={"develop_pr_url": "http://x/pull/1"}),
+        )
+    )
+    await _run_for(runner, seconds=0.2)
+
+    # One claim, one run — the second event was deduped.
+    assert lithos.task_claim.await_count == 1
+    assert lithos.task_complete.await_count == 1
+
+
+async def test_runner_ignores_unrelated_update_on_processed_task(
+    tmp_path: Path,
+) -> None:
+    """An unrelated edit (priority / due-date) on a task this process already
+    ran does not re-run it — the same ``_processed_tasks`` guard, framed as the
+    operator-edit case from issue #86's test (c).
+    """
+    bus = EventBus()
+    runner, lithos = _make_runner(bus=bus, work_dir=tmp_path)
+
+    await bus.publish(_evt(type_="lithos.task.created", payload=_payload("task-1")))
+    await bus.publish(
+        _evt(
+            type_="lithos.task.updated",
+            payload=_payload("task-1", metadata={"priority": "high"}),
+        )
+    )
+    await _run_for(runner, seconds=0.2)
+
+    assert lithos.task_claim.await_count == 1
+    assert lithos.task_complete.await_count == 1
+
+
 async def test_runner_does_not_re_attempt_after_own_release_with_finding(
     tmp_path: Path,
 ) -> None:
@@ -530,18 +602,21 @@ async def test_runner_keeps_work_dir_on_failure_when_retaining(
     assert (tmp_path / "task-1").exists()
 
 
-async def test_runner_subscribes_only_to_created_and_released(
+async def test_runner_subscribes_to_created_released_and_updated(
     tmp_path: Path,
 ) -> None:
-    """Issue #8: react to created + released; ignore claimed/completed/cancelled.
+    """React to created + released + updated; ignore claimed/completed/cancelled.
 
-    ``released`` is the re-claim trigger now that the source is the
-    event stream — Lithos doesn't emit ``updated``, and a released task
-    is the natural moment to attempt a fresh claim.
+    ``released`` is the re-claim trigger now that the source is the event
+    stream. ``updated`` joined the set in issue #86 so that adding a route's
+    trigger tag to an already-open task dispatches without a daemon restart
+    (the bus matcher's tag filter still gates which updates actually run).
+    Lifecycle observations (claimed/completed/cancelled) remain ignored.
     """
     bus = EventBus()
-    runner, lithos = _make_runner(bus=bus, work_dir=tmp_path)
 
+    # Ignored lifecycle event types never reach a claim.
+    runner, lithos = _make_runner(bus=bus, work_dir=tmp_path)
     for type_ in (
         "lithos.task.claimed",
         "lithos.task.completed",
@@ -550,6 +625,14 @@ async def test_runner_subscribes_only_to_created_and_released(
         await bus.publish(_evt(type_=type_))
     await _run_for(runner)
     lithos.task_claim.assert_not_called()
+
+    # A matching `updated` event *does* dispatch (fresh runner so the dedup
+    # set is empty).
+    bus2 = EventBus()
+    runner2, lithos2 = _make_runner(bus=bus2, work_dir=tmp_path)
+    await bus2.publish(_evt(type_="lithos.task.updated", payload=_payload("task-u")))
+    await _run_for(runner2)
+    assert lithos2.task_claim.await_count == 1
 
 
 # ── Usage-limit re-dispatch (T10) ──────────────────────────────────────

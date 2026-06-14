@@ -1,10 +1,10 @@
 """RouteRunner — claim-bound bus subscriber that runs plugins.
 
 A special subscriber type sitting on the in-process :class:`EventBus`.
-It listens for ``lithos.task.created`` / ``lithos.task.released`` events
-whose tags match the route's ``RouteMatch.tags``, claims the task via
-Lithos, runs the configured plugin subprocess, and applies the resulting
-status:
+It listens for ``lithos.task.created`` / ``lithos.task.updated`` /
+``lithos.task.released`` events whose tags match the route's
+``RouteMatch.tags``, claims the task via Lithos, runs the configured plugin
+subprocess, and applies the resulting status:
 
 * ``status="succeeded"`` → ``task_complete`` (releases all claims)
 * ``status="failed"`` → ``task_release`` + ``[BlockerFailed]`` finding
@@ -55,8 +55,17 @@ PluginRunFn = Callable[..., Awaitable[Mapping[str, Any]]]
 
 _HANDLED_EVENT_TYPES = (
     "lithos.task.created",
+    "lithos.task.updated",
     "lithos.task.released",
 )
+# `updated` is treated as "re-evaluate match," not "always run" (issue #86):
+# adding a route's trigger tag to an already-open task arrives as
+# `lithos.task.updated` and should dispatch without a daemon restart. The
+# `_handle` guards below make this safe against self-triggering — a plugin's
+# own end-of-run `task_update` (e.g. story-develop writing `develop_*`
+# metadata) fires `updated`, but the task is already in `_processed_tasks`
+# (claimed this process) so it's skipped. Before lithos#283 Lithos emitted no
+# `updated` event at all, which is why the original two-tuple was complete.
 
 # Re-dispatch budget for `interrupted` results carrying a `resume` block.
 # Each resume re-runs the full plugin (container spin-up + agent spend), so
@@ -146,7 +155,11 @@ class RouteRunner:
         # the same id are skipped — without this, multiple stale events
         # queued for the same open task would each run the plugin,
         # relying on Lithos's claim_failed envelope for safety. Real
-        # Lithos enforces it, but the runner should too.
+        # Lithos enforces it, but the runner should too. This is also what
+        # makes subscribing to `lithos.task.updated` (issue #86) safe: a
+        # plugin's own end-of-run `task_update` fires `updated` for a task
+        # we've already claimed this process, and that event is dropped here
+        # rather than re-running the plugin.
         #
         # Important: this set is also what suppresses re-attempts after a
         # plugin failure. When the plugin fails we release the claim and

@@ -107,7 +107,7 @@ Each child runs its own EventBus instance. There is no inter-child IPC; all thre
 `ObsidianDirWatcher` polls `<vault>/<projects_dir>/**/*.md` (default 250ms), computes body-only hash, and emits `obsidian.note.modified` when divergent. `note-push` calls `lithos_write(id=..., expected_version=...)`. On `version_conflict`, the conflict resolver moves the operator's body to `<vault>/_lithos/conflicts/<slug>.<file>.<ts>.md`, pulls canonical to the original path, and logs a `[Friction]` WARNING.
 
 **Task lifecycle (route-runner).**
-`LithosEventStream` (running in the route-runner child) emits `lithos.task.*` events. Each `[[routes]]` stanza registers a claim-bound subscriber against `lithos.task.created` and `lithos.task.released` (only) that requires every tag in `match.tags` to be present on the task (same semantic as the bus matcher and `is_human_actionable`). `lithos.task.updated` is **not** subscribed to today — editing a task's tags after creation does not re-trigger route pickup. On match, the runner claims via `lithos_task_claim`, spawns the plugin subprocess, periodically renews the claim, and waits for `result.json`. It then reads only the `status` field:
+`LithosEventStream` (running in the route-runner child) emits `lithos.task.*` events. Each `[[routes]]` stanza registers a claim-bound subscriber against `lithos.task.created`, `lithos.task.updated`, and `lithos.task.released` that requires every tag in `match.tags` to be present on the task (same semantic as the bus matcher and `is_human_actionable`). Since #86, editing a task's tags after creation re-triggers route pickup **without a daemon restart**: the tag edit arrives as `lithos.task.updated` (force-refreshed by the source into the full task envelope) and matches exactly as `created` would. `updated` is treated as "re-evaluate match," not "always run" — a plugin's own end-of-run `task_update` (e.g. `story-develop` writing `develop_*` metadata) fires `updated` but cannot self-trigger a re-run, because the task is already in the runner's in-process claim-dedup set; for `completes_task = false` routes the `loom_delivered` marker additionally suppresses re-development across a restart. On match, the runner claims via `lithos_task_claim`, spawns the plugin subprocess, periodically renews the claim, and waits for `result.json`. It then reads only the `status` field:
 
 - `succeeded` → `lithos_task_complete` — **unless** the route sets `completes_task = false` (§3.1), in which case the runner instead marks `metadata.loom_delivered = true` and `lithos_task_release`s, leaving the task **open**. This is for PR-producing routes (e.g. `story-develop`) where success = "a reviewed branch + PR exist, awaiting human merge", not "done": completing on approval would close a github-linked issue for un-merged work. Completion then happens on PR merge — github-issue-linked tasks via the issue close-mirror, and (since #87) non-issue tasks via the github-watcher's PR-merge sweep keyed off `metadata.develop_pr_url` (see §2.2; otherwise the operator). The `loom_delivered` marker makes a delivered task a no-op for **`completes_task = false` routes only** (the guard is gated on `not completes_task`), so a daemon restart's bootstrap (which re-emits every open task as `created`) does not re-develop it — while a normal `completes_task = true` route re-tagged onto the still-open task is *not* suppressed by the marker and runs as usual.
 - `failed` → `lithos_task_release` + `[BlockerFailed]` finding (the error message is pulled from `error.message` if present).
@@ -215,13 +215,14 @@ codex_config  = "/home/you/.codex-lithos"      # optional, parsed but unused tod
 # ── Routes (claim-bound subscribers) ──────────────────────────────────
 #
 # Each [[routes]] stanza is a claim-bound subscriber that listens to
-# lithos.task.created and lithos.task.released (only). A task matches
-# when every tag in match.tags is present on the task. The runner claims
-# matching tasks, invokes `command` as a subprocess, and reads only
-# `status` from the resulting result.json to decide whether to complete
-# or release (see §5). Other result.json fields are schema-validated
-# but not yet applied. Tag edits on an existing task arrive as
-# task.updated, which the runner does NOT subscribe to.
+# lithos.task.created, lithos.task.updated, and lithos.task.released. A
+# task matches when every tag in match.tags is present on the task. The
+# runner claims matching tasks, invokes `command` as a subprocess, and
+# reads only `status` from the resulting result.json to decide whether to
+# complete or release (see §5). Other result.json fields are schema-
+# validated but not yet applied. Adding a route's trigger tag to an
+# existing open task arrives as task.updated and dispatches without a
+# daemon restart (#86).
 #
 # Substitution tokens in `command`:
 #   {{task_json}}    — path to the task envelope JSON (read-only)
