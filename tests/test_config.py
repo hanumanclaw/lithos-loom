@@ -762,3 +762,108 @@ def test_lithos_url_env_override_preserves_github_watcher(
     assert cfg.orchestrator.lithos_url == "http://override:9999"
     assert cfg.github_watcher is not None
     assert cfg.github_watcher.enabled is True
+
+
+# ── [story_develop] section (per-tool default models) ──────────────────
+
+
+def test_story_develop_absent_yields_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No [story_develop] section → cfg.story_develop is None (agents use the
+    tool's own default model)."""
+    _write_config(tmp_path, monkeypatch, "")
+    cfg = load_config()
+    assert cfg.story_develop is None
+
+
+def test_story_develop_default_models_parses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        dedent(
+            """
+            [story_develop.default_models]
+            claude = "opus"
+            codex  = " gpt-5-codex "
+            """
+        ),
+    )
+    cfg = load_config()
+    assert cfg.story_develop is not None
+    # values are stripped, like the plugin's parse_model
+    assert cfg.story_develop.default_models == {
+        "claude": "opus",
+        "codex": "gpt-5-codex",
+    }
+
+
+def test_story_develop_empty_section_yields_empty_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A present-but-empty section is a no-op default map, not None."""
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        dedent(
+            """
+            [story_develop]
+            """
+        ),
+    )
+    cfg = load_config()
+    assert cfg.story_develop is not None
+    assert cfg.story_develop.default_models == {}
+
+
+def test_story_develop_rejects_unknown_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        dedent(
+            """
+            [story_develop]
+            default_model = "opus"
+            """
+        ),
+    )
+    with pytest.raises(ConfigError, match=r"story_develop.*default_model"):
+        load_config()
+
+
+def test_story_develop_default_models_must_be_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        dedent(
+            """
+            [story_develop]
+            default_models = "opus"
+            """
+        ),
+    )
+    with pytest.raises(ConfigError, match="default_models must be a table"):
+        load_config()
+
+
+def test_story_develop_default_model_value_must_be_nonempty_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        dedent(
+            """
+            [story_develop.default_models]
+            claude = "   "
+            """
+        ),
+    )
+    with pytest.raises(ConfigError, match="default_models.claude must be a non-empty"):
+        load_config()

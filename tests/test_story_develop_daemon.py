@@ -26,7 +26,9 @@ from lithos_loom.plugins.story_develop.daemon_io import (
     EXIT_SUCCEEDED,
     ProjectDevelopSettings,
     apply_cli_fallbacks,
+    apply_tool_default_models,
     build_result_payload,
+    load_tool_default_models,
     read_task_payload,
     resolve_project_settings,
 )
@@ -484,6 +486,118 @@ def test_apply_cli_fallbacks_bad_values_friction_and_dropped() -> None:
         assert flag in joined
 
 
+# ── apply_tool_default_models ──────────────────────────────────────────
+
+
+def test_tool_defaults_fill_unset_coder_and_reviewers() -> None:
+    settings = ProjectDevelopSettings(
+        coder="claude",
+        reviewers=(ReviewerSpec(name="cq", tool="claude"),),  # no model
+    )
+    out = apply_tool_default_models(settings, {"claude": "opus"})
+    assert out.coder_model == "opus"
+    (cq,) = out.reviewers
+    assert cq.model == "opus"
+
+
+def test_tool_defaults_do_not_override_set_models() -> None:
+    settings = ProjectDevelopSettings(
+        coder="claude",
+        coder_model="haiku",
+        reviewers=(ReviewerSpec(name="sec", tool="claude", model="sonnet"),),
+    )
+    out = apply_tool_default_models(settings, {"claude": "opus"})
+    assert out.coder_model == "haiku"  # explicit value wins
+    (sec,) = out.reviewers
+    assert sec.model == "sonnet"
+
+
+def test_tool_defaults_are_keyed_by_each_agents_tool() -> None:
+    """A heterogeneous panel (#94): the coder and a reviewer on different tools
+    each pick up the default for THEIR tool."""
+    settings = ProjectDevelopSettings(
+        coder="claude",
+        reviewers=(
+            ReviewerSpec(name="cq", tool="claude"),
+            ReviewerSpec(name="review", tool="codex"),
+        ),
+    )
+    out = apply_tool_default_models(
+        settings, {"claude": "opus", "codex": "gpt-5-codex"}
+    )
+    assert out.coder_model == "opus"
+    cq, review = out.reviewers
+    assert cq.model == "opus"
+    assert review.model == "gpt-5-codex"
+
+
+def test_tool_defaults_tool_without_default_left_unset() -> None:
+    settings = ProjectDevelopSettings(
+        coder="codex",
+        reviewers=(ReviewerSpec(name="review", tool="codex"),),
+    )
+    out = apply_tool_default_models(settings, {"claude": "opus"})  # no codex key
+    assert out.coder_model is None
+    (review,) = out.reviewers
+    assert review.model is None
+
+
+def test_tool_defaults_empty_mapping_is_noop() -> None:
+    settings = ProjectDevelopSettings(reviewers=(ReviewerSpec(name="cq"),))
+    out = apply_tool_default_models(settings, {})
+    assert out is settings
+
+
+# ── load_tool_default_models ───────────────────────────────────────────
+
+
+def _write_loom_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        "[orchestrator]\n"
+        'agent_id = "lithos-orchestrator-test"\n'
+        'lithos_url = "http://localhost:8765"\n' + body
+    )
+    monkeypatch.setenv("LITHOS_LOOM_CONFIG", str(cfg_path))
+
+
+def test_load_tool_default_models_reads_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_loom_config(
+        tmp_path,
+        monkeypatch,
+        '\n[story_develop.default_models]\nclaude = "opus"\ncodex = "gpt-5-codex"\n',
+    )
+    models, frictions = load_tool_default_models()
+    assert models == {"claude": "opus", "codex": "gpt-5-codex"}
+    assert frictions == ()
+
+
+def test_load_tool_default_models_no_section_no_friction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_loom_config(tmp_path, monkeypatch, "")
+    models, frictions = load_tool_default_models()
+    assert models == {}
+    assert frictions == ()
+
+
+def test_load_tool_default_models_missing_config_degrades_with_friction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Point at a path with no file: load_config raises, and the loader must
+    # degrade to ({}, friction) rather than propagate — daemon config
+    # resolution never fails the run.
+    monkeypatch.setenv("LITHOS_LOOM_CONFIG", str(tmp_path / "nope.toml"))
+    models, frictions = load_tool_default_models()
+    assert models == {}
+    assert len(frictions) == 1
+    assert "default models" in frictions[0]
+
+
 # ── build_result_payload ───────────────────────────────────────────────
 
 
@@ -663,6 +777,10 @@ def test_daemon_mode_happy_path_writes_result(
     monkeypatch.setattr(
         main_mod, "resolve_project_settings", lambda url, meta: settings
     )
+    # No host loom config is set in the test env; stub the per-tool-default
+    # loader so this test stays focused on friction *posting* (its real daemon
+    # run always has a loadable config — that path is covered separately).
+    monkeypatch.setattr(main_mod, "load_tool_default_models", lambda: ({}, ()))
     monkeypatch.setattr(
         main_mod,
         "post_frictions",

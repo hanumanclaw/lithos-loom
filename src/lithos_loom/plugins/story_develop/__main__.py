@@ -40,6 +40,7 @@ import logging
 import shutil
 import sys
 import tempfile
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -64,7 +65,9 @@ from .config import (
 from .daemon_io import (
     EXIT_BAD_INPUT,
     apply_cli_fallbacks,
+    apply_tool_default_models,
     build_result_payload,
+    load_tool_default_models,
     post_frictions,
     read_task_payload,
     resolve_project_settings,
@@ -347,6 +350,13 @@ def _daemon_main(args: argparse.Namespace) -> int:
         reviewer_model=args.reviewer_model,
         reviewer_effort=args.reviewer_effort,
     )
+    # Per-tool global default models from the loom TOML's [story_develop]
+    # section: the lowest-priority layer, filling any agent the metadata /
+    # per-task / route-fallback layers left unset, keyed by that agent's tool.
+    default_models, dm_frictions = load_tool_default_models()
+    settings = apply_tool_default_models(settings, default_models)
+    if dm_frictions:
+        settings = replace(settings, frictions=settings.frictions + dm_frictions)
     for friction in settings.frictions:
         print(f"[Friction] {friction}", file=sys.stderr)
     post_frictions(args.lithos_url, ctx.task_id, settings.frictions)

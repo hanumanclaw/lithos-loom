@@ -320,3 +320,26 @@ tags = ["trigger:story-review-human"]
 # # PR: merged -> task_complete; closed-unmerged or deleted -> left open
 # # with a one-shot [DeliveredPRClosed] finding. Set false to run the
 # # watcher for issue sync only.
+
+# ── story-develop host-wide defaults ──────────────────────────────────
+#
+# Per-tool DEFAULT model for every story-develop agent of that tool, used
+# when nothing more specific pins one. This is the lowest-priority layer
+# of the model-resolution precedence (see docs/SPECIFICATION.md §5.5):
+#
+#   per-agent metadata (develop_coder.model / develop_reviewers[].model)
+#     > per-task metadata.develop_model (coder only)
+#     > route-level --coder-model / --reviewer-model fallback
+#     > [story_develop].default_models[<tool>]   ← this section
+#     > the agent CLI's own default model
+#
+# Keyed by TOOL (claude / codex), not by role, so a heterogeneous panel
+# (#94) — say a claude coder with a codex reviewer — picks the right
+# default for each agent. Only consulted by daemon-mode (route-runner)
+# runs; standalone CLI runs pin models with their own flags. Model names
+# are NOT validated against a catalogue (they drift), so a typo silently
+# falls through to the agent default — set this once and verify a run.
+# Uncomment to set host-wide defaults.
+# [story_develop.default_models]
+# claude = "opus"
+# codex  = "gpt-5.4"

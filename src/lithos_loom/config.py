@@ -66,6 +66,7 @@ __all__ = [
     "RetryPolicy",
     "RouteConfig",
     "RouteMatch",
+    "StoryDevelopConfig",
     "SubscriptionConfig",
     "find_config_path",
     "load_config",
@@ -281,6 +282,28 @@ class GitHubWatcherConfig:
 
 
 @dataclass(frozen=True)
+class StoryDevelopConfig:
+    """Host-wide ``story-develop`` defaults (the ``[story_develop]`` section).
+
+    ``default_models`` maps an agent *tool* (``"claude"`` / ``"codex"``) to the
+    model used by every story-develop agent running that tool when nothing more
+    specific pins one. It is the lowest-priority layer of the model-resolution
+    precedence (below project-context metadata, per-task overrides, and the
+    route-level ``--coder-model`` / ``--reviewer-model`` fallbacks), just above
+    the agent CLI's own default — see SPECIFICATION.md §5.5.
+
+    Per-*tool* (not per-role) because a heterogeneous panel (#94) mixes claude
+    and codex agents in one run, so a single tool-blind default can't serve
+    both: a codex reviewer and a claude coder each pick up the default for
+    their own tool. Only consulted by daemon-mode runs (the route-runner path
+    this config file drives); standalone CLI runs pin models with their own
+    flags.
+    """
+
+    default_models: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class LoomConfig:
     orchestrator: OrchestratorConfig
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
@@ -288,6 +311,7 @@ class LoomConfig:
     subscriptions: tuple[SubscriptionConfig, ...] = ()
     obsidian_sync: ObsidianSyncConfig | None = None
     github_watcher: GitHubWatcherConfig | None = None
+    story_develop: StoryDevelopConfig | None = None
     source_path: Path | None = None
     environment: str | None = None
 
@@ -384,6 +408,7 @@ def load_config(path: Path | None = None) -> LoomConfig:
     subscriptions = _parse_subscriptions(raw.get("subscriptions", []), config_path)
     obsidian_sync = _parse_obsidian_sync(raw.get("obsidian_sync"), config_path)
     github_watcher = _parse_github_watcher(raw.get("github_watcher"), config_path)
+    story_develop = _parse_story_develop(raw.get("story_develop"), config_path)
 
     cfg = LoomConfig(
         orchestrator=orchestrator,
@@ -392,6 +417,7 @@ def load_config(path: Path | None = None) -> LoomConfig:
         subscriptions=subscriptions,
         obsidian_sync=obsidian_sync,
         github_watcher=github_watcher,
+        story_develop=story_develop,
         source_path=config_path,
         environment=environment,
     )
@@ -763,6 +789,49 @@ def _parse_github_watcher(data: Any, config_path: Path) -> GitHubWatcherConfig |
         reconcile_interval_minutes=reconcile_interval,
         pr_merge_poll_enabled=pr_merge_poll_enabled,
     )
+
+
+_STORY_DEVELOP_KEYS: frozenset[str] = frozenset({"default_models"})
+
+
+def _parse_story_develop(data: Any, config_path: Path) -> StoryDevelopConfig | None:
+    """Parse the optional ``[story_develop]`` section (host-wide plugin defaults).
+
+    Absence → ``None`` (no host-wide defaults; agents fall through to their own
+    CLI default model). Model strings are NOT validated against a catalogue —
+    model names drift and the plugin deliberately never hard-pins one — so this
+    enforces shape only: a table of tool-name → non-empty model string. Unknown
+    tool keys are accepted (forward-compatible with tools beyond claude/codex);
+    a key that names no wired tool simply never matches an agent and is inert.
+    """
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise ConfigError(f"{config_path}: [story_develop] must be a table")
+
+    unknown = set(data.keys()) - _STORY_DEVELOP_KEYS
+    if unknown:
+        raise ConfigError(
+            f"{config_path}: [story_develop] has unknown key(s) "
+            f"{sorted(unknown)}; valid keys: {sorted(_STORY_DEVELOP_KEYS)}"
+        )
+
+    raw_models = data.get("default_models", {})
+    if not isinstance(raw_models, dict):
+        raise ConfigError(
+            f"{config_path}: story_develop.default_models must be a table of "
+            f"tool-name → model string"
+        )
+    default_models: dict[str, str] = {}
+    for tool, model in raw_models.items():
+        if not isinstance(model, str) or not model.strip():
+            raise ConfigError(
+                f"{config_path}: story_develop.default_models.{tool} must be a "
+                f"non-empty model string (got {model!r})"
+            )
+        default_models[tool] = model.strip()
+
+    return StoryDevelopConfig(default_models=default_models)
 
 
 def _parse_retry_policy(data: Any, config_path: Path, scope: str) -> RetryPolicy:

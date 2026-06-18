@@ -383,6 +383,60 @@ def apply_cli_fallbacks(
     )
 
 
+def load_tool_default_models() -> tuple[dict[str, str], tuple[str, ...]]:
+    """The host loom config's ``[story_develop].default_models`` (best-effort).
+
+    Re-reads the same loom config the daemon runs under — the plugin subprocess
+    inherits the daemon's env + CWD, so :func:`~lithos_loom.config.find_config_path`
+    resolves the identical file. Never raises: an unreadable / missing config
+    degrades to an empty mapping with a friction breadcrumb so the run proceeds
+    on agent defaults. A config that simply has no ``[story_develop]`` section
+    is the normal case and yields no friction.
+    """
+    from ...config import load_config
+
+    try:
+        cfg = load_config()
+    except Exception as exc:
+        return {}, (
+            f"cannot load loom config for per-tool default models ({exc}); "
+            "using agent defaults",
+        )
+    if cfg.story_develop is None:
+        return {}, ()
+    return dict(cfg.story_develop.default_models), ()
+
+
+def apply_tool_default_models(
+    settings: ProjectDevelopSettings, default_models: Mapping[str, str]
+) -> ProjectDevelopSettings:
+    """Fill each agent's model from the per-tool global default where still unset.
+
+    The lowest-priority model layer (the loom TOML ``[story_develop]`` section):
+    applied AFTER project metadata, per-task overrides, and the route-level
+    ``--coder-model`` / ``--reviewer-model`` fallbacks, and keyed by each
+    agent's RESOLVED tool — so a heterogeneous panel (#94) has the coder and
+    every reviewer pick up the default for *their* own tool, and a tool with no
+    configured default leaves that agent on its CLI default. A no-op when
+    *default_models* is empty.
+    """
+    if not default_models:
+        return settings
+    coder_model = settings.coder_model
+    if coder_model is None:
+        coder_model = default_models.get(settings.coder)
+    reviewers = tuple(
+        replace(
+            spec,
+            model=(
+                spec.model if spec.model is not None else default_models.get(spec.tool)
+            ),
+        )
+        for spec in settings.reviewers
+    )
+    return replace(settings, coder_model=coder_model, reviewers=reviewers)
+
+
 def post_frictions(url: str, task_id: str, frictions: tuple[str, ...]) -> None:
     """Post config-resolution breadcrumbs as one ``[Friction]`` finding.
 
