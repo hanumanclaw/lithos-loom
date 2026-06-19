@@ -27,6 +27,7 @@ from lithos_loom.github_client import (
     GitHubAuthError,
     GitHubClient,
     GitHubError,
+    GitHubIssueNotFoundError,
     GitHubRepoNotFoundError,
     Issue,
     PullRequest,
@@ -810,15 +811,21 @@ async def test_patch_rate_limited_sleeps_then_retries() -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_update_issue_fields_404_raises_repo_not_found() -> None:
-    """Issue deleted by operator → typed RepoNotFoundError so the handler skips."""
+async def test_update_issue_fields_404_raises_issue_not_found() -> None:
+    """Issue deleted by operator → issue-specific 404 (#69), NOT a repo-404. The
+    push handler self-heals the orphaned link on this; mislabelling it
+    GitHubRepoNotFoundError would conflate it with a deleted repo."""
     respx.patch("https://api.github.com/repos/x/y/issues/42").mock(
         return_value=httpx.Response(404, json={"message": "Not Found"})
     )
     async with httpx.AsyncClient() as http:
         client = GitHubClient(http=http, token="fake")
-        with pytest.raises(GitHubRepoNotFoundError):
+        with pytest.raises(GitHubIssueNotFoundError) as excinfo:
             await client.update_issue_fields("x/y", 42, state="closed")
+    assert excinfo.value.repo == "x/y"
+    assert excinfo.value.number == 42
+    # the issue error must NOT be a repo error (repo-drop path must never catch it)
+    assert not isinstance(excinfo.value, GitHubRepoNotFoundError)
 
 
 # ── Test plumbing ─────────────────────────────────────────────────────

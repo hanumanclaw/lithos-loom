@@ -157,7 +157,9 @@ The `github-issue-push` subscription (auto-wired in the github-watcher child) co
 - `lithos.task.cancelled` → same, with `state_reason=not_planned`.
 - `lithos.task.updated` → if `task.title` differs from the current GH issue title, `PATCH title`.
 
-Tasks without `metadata.github_issue_url` are filtered at the handler entry (the by-far-common case) and stay silent at INFO. GH errors (404 / auth) during the push surface as `[Friction]` log lines, not retries — a permanent failure shouldn't loop.
+Tasks without `metadata.github_issue_url` are filtered at the handler entry (the by-far-common case) and stay silent at INFO. Permanent GH errors (auth / repo-404) during the push surface as `[Friction]` log lines, not retries — a permanent failure shouldn't loop.
+
+**Deleted linked issue self-heals (#69).** When the linked issue is gone — the GET returns `None` (404), or the PATCH raises the issue-specific `GitHubIssueNotFoundError` (a deletion racing the GET; distinct from a repo-404 so a deleted issue is never mistaken for a deleted repo and never drops the repo from the watch list) — the handler posts a one-shot `[LinkedIssueGone]` finding and writes a `metadata.github_issue_gone_url` marker scoped to the gone url. The handler entry skips a task whose marker matches its current `github_issue_url`, so subsequent `task.*` events stop re-probing the dead link (vs. a `[Friction]`/skip per event forever). The marker write's own `task.updated` event carries the marker (the event stream re-enriches with current metadata), so it lands on the skip and the heal does not loop. Re-linking the task to a new issue changes `github_issue_url`, the stale marker no longer matches, and the new link is re-evaluated.
 
 Pull requests are filtered at parse time (presence of GitHub's `pull_request` field on the row). A 404 on a watched repo drops it from the in-memory watch list with a `[Friction]` log line; the next bus-driven refresh re-adds the slug if the operator fixes the typo. GitHub rate-limit responses (403 with `X-RateLimit-Remaining: 0`) trigger a sleep until `X-RateLimit-Reset`; a 403 with non-zero remaining surfaces as auth/permission error rather than retried indefinitely.
 
@@ -915,6 +917,7 @@ Loom posts findings with stable prefixes so operators (and `lithos-lens`) can gr
 | `[ReopenRequested]` | `obsidian-status-transition` and `github-issue-sync` | An operator unticked a completed task (Obsidian) OR reopened a closed GH issue linked to a terminal Lithos task. Lithos has no reopen primitive, so this signals the intent. |
 | `[BlockerFailed]` | route-runner | Plugin failed, timed out, violated the contract, or returned an unknown status. The claim was released. |
 | `[DeliveredPRClosed]` | github-watcher (PR-merge sweep, #87) | A delivered PR (`metadata.develop_pr_url`) was closed without merging, or deleted. The non-issue-linked task is left open for a human rather than completed. |
+| `[LinkedIssueGone]` | `github-issue-push` (#69) | A task's linked GitHub issue was deleted (404). The Lithos→GH link is orphaned; a `metadata.github_issue_gone_url` marker suppresses further pushes to it until the task is re-linked. |
 
 ---
 

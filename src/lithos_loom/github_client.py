@@ -62,6 +62,22 @@ class GitHubRepoNotFoundError(GitHubError):
         self.repo = repo
 
 
+class GitHubIssueNotFoundError(GitHubError):
+    """Raised when an issue-level endpoint returns 404 (the issue is gone).
+
+    Distinct from :class:`GitHubRepoNotFoundError` (a *repo*-level 404, which
+    drops the whole repo from the watch list) — a deleted issue must NOT be
+    mistaken for a deleted repo. Deliberately *not* a subclass for exactly that
+    reason: an ``except GitHubRepoNotFoundError`` must never catch this. The push
+    handler treats it as "the linked issue was deleted" and self-heals the link.
+    """
+
+    def __init__(self, repo: str, number: int) -> None:
+        super().__init__(f"GitHub issue not found: {repo}#{number}")
+        self.repo = repo
+        self.number = number
+
+
 class GitHubRateLimitError(GitHubError):
     """Raised when a rate-limit retry exhausts (currently only on a second 403)."""
 
@@ -446,6 +462,11 @@ class GitHubClient:
         if not payload:
             return None
         response = await self._patch(f"/repos/{repo}/issues/{number}", json=payload)
+        if response.status_code == 404:
+            # Issue-level 404 → the issue was deleted (mirrors get_issue's 404
+            # short-circuit). Raise the issue-specific error so the push handler
+            # self-heals rather than mislabelling it a repo-not-found.
+            raise GitHubIssueNotFoundError(repo, number)
         _raise_for_status(response, repo=repo)
         parsed = _parse_issues_response([response.json()], repo=repo)
         return parsed[0] if parsed else None

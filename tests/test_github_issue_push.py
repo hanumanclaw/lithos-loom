@@ -20,9 +20,21 @@ from unittest.mock import AsyncMock
 import pytest
 
 from lithos_loom.bus import Event
-from lithos_loom.github_client import GitHubAuthError, GitHubError, Issue
+from lithos_loom.github_client import (
+    GitHubAuthError,
+    GitHubError,
+    GitHubIssueNotFoundError,
+    Issue,
+)
 from lithos_loom.subscriptions import SubscriptionContext
-from lithos_loom.subscriptions._github_issue_push import EVENT_TYPES, make_handler
+from lithos_loom.subscriptions._github_issue_push import (
+    EVENT_TYPES,
+    GH_ISSUE_GONE_KEY,
+    LINKED_ISSUE_GONE,
+    make_handler,
+)
+
+_ISSUE_URL = "https://github.com/agent-lore/lithos-loom/issues/42"
 
 # ── Builders ──────────────────────────────────────────────────────────
 
@@ -158,12 +170,21 @@ async def test_completed_event_without_github_metadata_is_skipped() -> None:
 
 @pytest.mark.asyncio
 async def test_completed_event_skips_when_gh_issue_deleted() -> None:
-    """Operator deleted the GH issue → get_issue returns None → no PATCH."""
+    """Operator deleted the GH issue → get_issue returns None → no PATCH, and
+    the orphaned link self-heals (#69): a [LinkedIssueGone] finding + the
+    github_issue_gone_url marker so later events skip without a GH round-trip."""
     github = _stub_github()
     github.get_issue = AsyncMock(return_value=None)
+    lithos = AsyncMock()
     handler = make_handler(github)
-    await handler(_event("lithos.task.completed", _payload()), _ctx())
+    await handler(_event("lithos.task.completed", _payload()), _ctx(lithos))
     github.update_issue_fields.assert_not_awaited()
+    assert lithos.finding_post.await_args.kwargs["summary"].startswith(
+        LINKED_ISSUE_GONE
+    )
+    lithos.task_update.assert_awaited_once_with(
+        task_id="task-123", metadata={GH_ISSUE_GONE_KEY: _ISSUE_URL}
+    )
 
 
 @pytest.mark.asyncio
@@ -239,12 +260,82 @@ async def test_updated_event_without_github_metadata_is_skipped() -> None:
 
 @pytest.mark.asyncio
 async def test_updated_event_handles_gh_404_gracefully() -> None:
-    """Issue deleted operator-side → no PATCH, no exception."""
+    """Issue deleted operator-side → no PATCH, no exception, link self-heals."""
     github = _stub_github()
     github.get_issue = AsyncMock(return_value=None)
+    lithos = AsyncMock()
     handler = make_handler(github)
-    await handler(_event("lithos.task.updated", _payload(title="renamed")), _ctx())
+    await handler(
+        _event("lithos.task.updated", _payload(title="renamed")), _ctx(lithos)
+    )
     github.update_issue_fields.assert_not_awaited()
+    lithos.task_update.assert_awaited_once_with(
+        task_id="task-123", metadata={GH_ISSUE_GONE_KEY: _ISSUE_URL}
+    )
+
+
+@pytest.mark.asyncio
+async def test_known_gone_link_skips_without_github_call() -> None:
+    """#69: once the github_issue_gone_url marker matches the link, the handler
+    returns early — no GH round-trip and no re-heal. This is the de-dup AND the
+    loop-break (the heal's own task_update re-enters here and stops)."""
+    github = _stub_github()
+    lithos = AsyncMock()
+    metadata = {
+        "github_issue_url": _ISSUE_URL,
+        "github_issue_number": 42,
+        GH_ISSUE_GONE_KEY: _ISSUE_URL,  # already healed
+    }
+    handler = make_handler(github)
+    await handler(
+        _event("lithos.task.updated", _payload(title="x", metadata=metadata)),
+        _ctx(lithos),
+    )
+    github.get_issue.assert_not_awaited()
+    github.update_issue_fields.assert_not_awaited()
+    lithos.task_update.assert_not_awaited()
+    lithos.finding_post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_gone_marker_for_other_url_re_evaluates() -> None:
+    """#69: the marker is scoped to its url. After re-linking to a NEW issue
+    (changed github_issue_url), the stale marker must NOT suppress the new link
+    — it's re-evaluated against the new issue."""
+    github = _stub_github(issue=_issue(number=99, title="same title"))
+    lithos = AsyncMock()
+    metadata = {
+        "github_issue_url": "https://github.com/agent-lore/lithos-loom/issues/99",
+        "github_issue_number": 99,
+        GH_ISSUE_GONE_KEY: _ISSUE_URL,  # stale: points at the OLD (deleted) issue
+    }
+    handler = make_handler(github)
+    await handler(
+        _event("lithos.task.updated", _payload(title="same title", metadata=metadata)),
+        _ctx(lithos),
+    )
+    github.get_issue.assert_awaited_once_with("agent-lore/lithos-loom", 99)
+    lithos.task_update.assert_not_awaited()  # issue exists → no re-heal
+
+
+@pytest.mark.asyncio
+async def test_patch_race_issue_deleted_heals_not_retries() -> None:
+    """#69: the issue is deleted between the GET and the PATCH → update_issue_fields
+    raises GitHubIssueNotFoundError → caught (NOT propagated to the retry loop) and
+    the link self-heals."""
+    github = _stub_github(issue=_issue(title="old title"))  # GET succeeds
+    github.update_issue_fields = AsyncMock(
+        side_effect=GitHubIssueNotFoundError("agent-lore/lithos-loom", 42)
+    )
+    lithos = AsyncMock()
+    handler = make_handler(github)
+    # Must NOT raise (a deleted issue is permanent, not a transient retry).
+    await handler(
+        _event("lithos.task.updated", _payload(title="new title")), _ctx(lithos)
+    )
+    lithos.task_update.assert_awaited_once_with(
+        task_id="task-123", metadata={GH_ISSUE_GONE_KEY: _ISSUE_URL}
+    )
 
 
 # ── Robustness ────────────────────────────────────────────────────────

@@ -28,16 +28,28 @@ from collections.abc import Mapping
 from typing import Any
 
 from lithos_loom.bus import Event
+from lithos_loom.errors import LithosClientError
 from lithos_loom.github_client import (
     GitHubAuthError,
     GitHubClient,
+    GitHubIssueNotFoundError,
     GitHubRepoNotFoundError,
 )
 from lithos_loom.subscriptions import Handler, SubscriptionContext
 
-__all__ = ["EVENT_TYPES", "make_handler"]
+__all__ = ["EVENT_TYPES", "GH_ISSUE_GONE_KEY", "LINKED_ISSUE_GONE", "make_handler"]
 
 logger = logging.getLogger(__name__)
+
+# Stable, machine-parseable finding prefix (see AGENTS.md): the GitHub issue a
+# task was linked to has been deleted, so the Lithos→GH link is now orphaned.
+LINKED_ISSUE_GONE = "[LinkedIssueGone]"
+
+# Task-metadata de-dup marker: the github_issue_url that was found deleted (404).
+# Scoped to that url (like _develop_pr_merge's marker) — the sweep/handler skips
+# a task only while the marker still matches the task's current github_issue_url,
+# so re-linking to a NEW issue (changed github_issue_url) re-evaluates the link.
+GH_ISSUE_GONE_KEY = "github_issue_gone_url"
 
 EVENT_TYPES: tuple[str, ...] = (
     "lithos.task.created",
@@ -87,11 +99,25 @@ def make_handler(github: GitHubClient) -> Handler:
             )
             return
 
+        issue_url = str(metadata.get("github_issue_url") or "")
+        if issue_url and metadata.get(GH_ISSUE_GONE_KEY) == issue_url:
+            # The linked issue is already known-deleted (self-healed). Skip the
+            # GH round-trip entirely. This also breaks the re-entry loop: the
+            # heal's own task_update fires a task.updated whose enriched payload
+            # carries this marker, so it lands right here and stops.
+            ctx.logger.debug(
+                "github-issue-push: %s link %s known-gone for task %s; skipping",
+                event.type,
+                issue_url,
+                payload.get("id"),
+            )
+            return
+
         if event.type in ("lithos.task.completed", "lithos.task.cancelled"):
-            await _mirror_close(event, payload, repo, number, github, ctx)
+            await _mirror_close(event, payload, repo, number, issue_url, github, ctx)
         elif event.type in ("lithos.task.updated", "lithos.task.created"):
             # ``created`` is bootstrap replay — same title-compare logic.
-            await _mirror_title(payload, repo, number, github, ctx)
+            await _mirror_title(payload, repo, number, issue_url, github, ctx)
 
     return handle
 
@@ -104,6 +130,7 @@ async def _mirror_close(
     payload: Mapping[str, Any],
     repo: str,
     number: int,
+    issue_url: str,
     github: GitHubClient,
     ctx: SubscriptionContext,
 ) -> None:
@@ -121,6 +148,7 @@ async def _mirror_close(
             repo,
             number,
         )
+        await _heal_orphan_link(payload.get("id"), issue_url, ctx)
         return
 
     if current.state == "closed" and current.state_reason == state_reason:
@@ -145,6 +173,8 @@ async def _mirror_close(
         repo,
         number,
         "close",
+        payload.get("id"),
+        issue_url,
         ctx,
         state="closed",
         state_reason=state_reason,
@@ -155,6 +185,7 @@ async def _mirror_title(
     payload: Mapping[str, Any],
     repo: str,
     number: int,
+    issue_url: str,
     github: GitHubClient,
     ctx: SubscriptionContext,
 ) -> None:
@@ -170,6 +201,7 @@ async def _mirror_title(
         ctx.logger.debug(
             "github-issue-push: %s/#%d gone; skipping title sync", repo, number
         )
+        await _heal_orphan_link(payload.get("id"), issue_url, ctx)
         return
 
     if current.title == lithos_title:
@@ -184,7 +216,16 @@ async def _mirror_title(
         lithos_title,
         payload.get("id"),
     )
-    await _patch_or_skip(github, repo, number, "title", ctx, title=lithos_title)
+    await _patch_or_skip(
+        github,
+        repo,
+        number,
+        "title",
+        payload.get("id"),
+        issue_url,
+        ctx,
+        title=lithos_title,
+    )
 
 
 # ── Error classification ──────────────────────────────────────────────
@@ -232,6 +273,8 @@ async def _patch_or_skip(
     repo: str,
     number: int,
     operation: str,
+    task_id: Any,
+    issue_url: str,
     ctx: SubscriptionContext,
     *,
     title: str | None = None,
@@ -253,6 +296,19 @@ async def _patch_or_skip(
         kwargs["state_reason"] = state_reason
     try:
         await github.update_issue_fields(repo, number, **kwargs)
+    except GitHubIssueNotFoundError as exc:
+        # The issue was deleted between the GET and this PATCH — self-heal the
+        # orphaned link so later task.* events skip it (vs. a permanent-error
+        # log per event forever).
+        ctx.logger.info(
+            "github-issue-push: %s PATCH for %s/#%d — issue deleted (%s); "
+            "self-healing link",
+            operation,
+            repo,
+            number,
+            exc,
+        )
+        await _heal_orphan_link(task_id, issue_url, ctx)
     except (GitHubAuthError, GitHubRepoNotFoundError) as exc:
         ctx.logger.warning(
             "[Friction] github-issue-push: %s PATCH for %s/#%d hit permanent "
@@ -263,6 +319,51 @@ async def _patch_or_skip(
             type(exc).__name__,
             exc,
         )
+
+
+async def _heal_orphan_link(
+    task_id: Any, issue_url: str, ctx: SubscriptionContext
+) -> None:
+    """Self-heal a task whose linked GH issue was deleted (one-shot).
+
+    Posts a ``[LinkedIssueGone]`` finding, then writes the
+    ``github_issue_gone_url`` marker so subsequent ``task.*`` events skip the GH
+    round-trip via the handler's entry check (vs. a permanent-error log per
+    event forever). Scoped to ``issue_url`` — re-linking the task to a new issue
+    re-evaluates. Mirrors ``_develop_pr_merge._friction_and_mark`` / ``_mark``:
+    finding-then-mark (a crash between costs at most one duplicate finding next
+    event); best-effort, swallowing ``task_not_found`` for a genuinely-deleted
+    task and warning on anything else (leaving the marker unset → retry).
+    """
+    if not task_id or not issue_url:
+        return
+    summary = (
+        f"{LINKED_ISSUE_GONE} github-issue-push: the linked GitHub issue "
+        f"{issue_url} no longer exists (deleted); the Lithos→GH link is "
+        f"orphaned and further pushes to it are suppressed."
+    )
+    try:
+        await ctx.lithos.finding_post(task_id=task_id, summary=summary)
+    except LithosClientError as exc:
+        if exc.code != "task_not_found":
+            ctx.logger.warning(
+                "[Friction] github-issue-push: posting LinkedIssueGone finding "
+                "for task %s failed (%s); will retry next event",
+                task_id,
+                exc,
+            )
+            return  # leave the marker unset → retry the heal next event
+    try:
+        await ctx.lithos.task_update(
+            task_id=task_id, metadata={GH_ISSUE_GONE_KEY: issue_url}
+        )
+    except LithosClientError as exc:
+        if exc.code != "task_not_found":
+            ctx.logger.warning(
+                "[Friction] github-issue-push: marking task %s issue-gone failed (%s)",
+                task_id,
+                exc,
+            )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
