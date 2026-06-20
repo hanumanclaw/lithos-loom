@@ -143,7 +143,7 @@ def parse_test_command(value: object, *, where: str) -> str | None:
     Mirrors :func:`parse_image`: a non-empty string (stripped), or ``None``
     (meaning "inherit the route-level ``--test-command`` / auto-detection").
     The command is **trusted as-is** by the gate (no parsing, no tool-probe —
-    see ``_resolve_gate_command``), so the only validation is non-empty-string;
+    see ``_resolve_test_command``), so the only validation is non-empty-string;
     a bad command surfaces when the gate container runs it. Shared by the
     project-metadata loader and the per-task override so both reject the same
     garbage identically. Raises :class:`ValueError`.
@@ -319,10 +319,13 @@ class DevelopConfig:
     reviewers: tuple[ReviewerSpec, ...] = ()
     # T3: how many implement→review→fix rounds before we stop unapproved.
     max_rounds: int = DEFAULT_MAX_ROUNDS
-    # T4: objective test gate per round commit (throwaway container).
-    test_gate: bool = True  # auto-skips when no test command is detected
-    test_command: str | None = None  # explicit override beats detection
-    block_on_red: bool = False  # red gate prevents approval + feeds the coder
+    # T4 / #131: deterministic gate per round commit — an ordered check-set run
+    # in throwaway containers; the default set is the single `test` check.
+    test_gate: bool = True  # #131/ADR §10: scopes the `test` check (False = exclude it)
+    test_command: str | None = None  # explicit `test`-check command; beats detection
+    block_on_red: bool = (
+        False  # ADR §10: the `test` check's block flag (RED blocks + feeds coder)
+    )
     test_timeout: int = DEFAULT_TEST_TIMEOUT
     # T5: usage-limit reaction. The pause budget is shared across the run;
     # the fallback chain lists ALTERNATE reviewer tools tried in order when

@@ -537,8 +537,8 @@ def deliver(
         _build_run_cmd,
         _render,
         _render_findings,
-        _resolve_gate_command,
-        _run_gate,
+        _run_check_set,
+        build_default_check_set,
     )
     from .findings import FindingLedger
     from .turns import run_turn
@@ -736,12 +736,14 @@ def deliver(
     fix_pushed = False
     gate_verdict: str | None = None
     if fix_committed:
-        gate_cmd = _resolve_gate_command(config, wt)
-        gate = (
-            _run_gate(config, wt, new_sha, fix_round, gate_cmd)
-            if gate_cmd is not None
-            else None
-        )
+        # Run the same default check-set on the fix commit; the `test` check's
+        # GateResult drives push/hold. Delivery holds the push on ANY red fix
+        # regardless of block_on_red, so read the test_gate view here (not
+        # blocking_passed, which would honour a non-blocking config and push a
+        # RED fix).
+        checks = build_default_check_set(config, wt)
+        cs = _run_check_set(config, wt, new_sha, fix_round, checks) if checks else None
+        gate = cs.test_gate if cs is not None else None
         gate_verdict = gate.verdict if gate else None
         if gate is None or gate.passed:
             push_branch(wt, result.branch)

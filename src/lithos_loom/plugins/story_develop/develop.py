@@ -43,6 +43,7 @@ from pathlib import Path
 
 from ...runner import detection, git, worktree
 from . import containers, handoff, limits, test_gate
+from .check_set import Check, CheckResult, CheckSetResult, classify_execution
 from .config import (
     CLAUDE_AUTH_FILES,
     CODEX_AUTH_FILES,
@@ -249,19 +250,19 @@ def _prior_review_text(config: DevelopConfig, round_no: int, reviewer: str) -> s
     return "(no prior review — the limit hit on the first review attempt)"
 
 
-# --- test gate (T4) ---------------------------------------------------------
+# --- deterministic gate (T4; #131: ordered multi-check check-set) -----------
 
 
-def _resolve_gate_command(config: DevelopConfig, wt: Path) -> str | None:
-    """Pick the test command the gate will run, or ``None`` to skip the gate.
+def _resolve_test_command(config: DevelopConfig, wt: Path) -> str | None:
+    """Pick the command the ``test`` check will run, or ``None`` when none is
+    runnable.
 
     An explicit ``test_command`` is trusted as-is; otherwise candidates are
     auto-detected from the worktree and the first one whose tool exists in the
     container image wins (the image may lack e.g. ``make`` — see
-    :mod:`...runner.detection`).
+    :mod:`...runner.detection`). #133 swaps in per-ecosystem resolution behind
+    this one call.
     """
-    if not config.test_gate:
-        return None
     if config.test_command:
         return config.test_command
     candidates = detection.detect_test_commands(wt)
@@ -286,50 +287,113 @@ def _resolve_gate_command(config: DevelopConfig, wt: Path) -> str | None:
     return chosen
 
 
-def _run_gate(
-    config: DevelopConfig, wt: Path, sha: str, round_no: int, command: str
-) -> GateResult | None:
-    """Run the gate for one round commit. Infra errors skip the gate (with a
-    warning) rather than failing the run — the gate is an independent check,
-    not a dependency."""
+def build_default_check_set(config: DevelopConfig, wt: Path) -> tuple[Check, ...]:
+    """The default check-set: today just the ``test`` check (#131).
+
+    ADR §10: ``develop_test_gate=false`` **excludes the ``test`` check** (with a
+    one-element default set this is observably "no gate"), and the legacy
+    ``block_on_red`` flag maps onto the check's ``state`` — ``required`` (a RED
+    run blocks approval) vs ``informational`` (recorded, non-blocking). Review
+    Profiles (#139) replace this constructor with a profile-selected set; the
+    runner/aggregates below are unchanged.
+    """
+    if not config.test_gate:
+        return ()
+    command = _resolve_test_command(config, wt)
+    if command is None:
+        return ()
+    state = "required" if config.block_on_red else "informational"
+    return (Check(name="test", command=command, state=state),)
+
+
+def _write_check_output(round_dir: Path, check: Check, gate: GateResult | None) -> None:
+    """Write a check's container output for operator inspection. The ``test``
+    check writes ``output.txt`` (back-compat path); any other check writes
+    ``output_<name>.txt``. Nothing is written when the check never ran."""
+    if gate is None:
+        return
+    fname = "output.txt" if check.name == "test" else f"output_{check.name}.txt"
+    (round_dir / fname).write_text(
+        f"$ {gate.command}\nexit: {gate.exit_code} ({gate.verdict})\n\n"
+        f"{gate.output_tail}\n",
+        encoding="utf-8",
+    )
+
+
+def _run_check_set(
+    config: DevelopConfig,
+    wt: Path,
+    sha: str,
+    round_no: int,
+    checks: tuple[Check, ...],
+) -> CheckSetResult | None:
+    """Run an ordered check-set against one round commit.
+
+    The committed tree is exported **once**; each check then runs in its own
+    throwaway container (no shell-chaining — each keeps its own verdict).
+    Infra errors skip rather than fail the run (the gate is an independent
+    check, not a dependency): an export failure returns ``None`` for the whole
+    set, and a per-check run failure yields a ``CheckResult`` with
+    ``execution_outcome="errored"`` and ``gate=None``. Returns ``None`` when
+    there are no checks.
+    """
+    if not checks:
+        return None
     round_dir = config.gate_dir / f"round_{round_no:02d}"
-    name = containers.container_name(config.run_id, f"gate-r{round_no}")
     try:
         test_gate.export_tree(wt, sha, round_dir / "tree")
         cache = config.gate_dir / "cache"
         cache.mkdir(parents=True, exist_ok=True)
-        gate_cmd = test_gate.build_gate_command(
-            name=name,
-            image=config.image,
-            tree=round_dir / "tree",
-            cache_dir=cache,
-            command=command,
-        )
-        result = test_gate.run_gate_container(
-            gate_cmd, name=name, command=command, timeout=config.test_timeout
-        )
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         logger.warning(
-            "story-develop %s: round %d test gate errored (skipping): %s",
+            "story-develop %s: round %d gate export errored (skipping): %s",
             config.run_id,
             round_no,
             exc,
         )
         return None
-    (round_dir / "output.txt").write_text(
-        f"$ {result.command}\nexit: {result.exit_code} ({result.verdict})\n\n"
-        f"{result.output_tail}\n",
-        encoding="utf-8",
-    )
-    logger.info(
-        "story-develop %s: round %d test gate %s (`%s`, exit %d)",
-        config.run_id,
-        round_no,
-        result.verdict,
-        result.command,
-        result.exit_code,
-    )
-    return result
+    results: list[CheckResult] = []
+    for check in checks:
+        name = containers.container_name(
+            config.run_id, f"gate-{check.name}-r{round_no}"
+        )
+        try:
+            gate_cmd = test_gate.build_gate_command(
+                name=name,
+                image=config.image,
+                tree=round_dir / "tree",
+                cache_dir=cache,
+                command=check.command,
+            )
+            gate = test_gate.run_gate_container(
+                gate_cmd, name=name, command=check.command, timeout=config.test_timeout
+            )
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning(
+                "story-develop %s: round %d %s check errored (skipping): %s",
+                config.run_id,
+                round_no,
+                check.name,
+                exc,
+            )
+            gate = None
+        _write_check_output(round_dir, check, gate)
+        if gate is not None:
+            logger.info(
+                "story-develop %s: round %d %s check %s (`%s`, exit %d)",
+                config.run_id,
+                round_no,
+                check.name,
+                gate.verdict,
+                gate.command,
+                gate.exit_code,
+            )
+        results.append(
+            CheckResult(
+                check=check, execution_outcome=classify_execution(gate), gate=gate
+            )
+        )
+    return CheckSetResult(results=tuple(results))
 
 
 def _gate_note(gate: GateResult | None) -> str:
@@ -955,8 +1019,12 @@ def develop(
     status = "failed"
     failure_reason = "no rounds ran"
     final_reviews: list[ReviewOutcome] = []
+    # The per-round gate is an ordered check-set (#131); ``gate`` stays the
+    # ``test`` check's back-compat view so the prompt/summary/result sites below
+    # are unchanged. ``checks`` is resolved once (detection probes the image).
     gate: GateResult | None = None
-    gate_command = _resolve_gate_command(config, wt)
+    check_set: CheckSetResult | None = None
+    checks = build_default_check_set(config, wt)
     rounds_completed = 0
     coder_cost = 0.0
     review_cost = 0.0
@@ -1122,14 +1190,15 @@ def develop(
                 status = "cost_exceeded"
                 break
 
-            # --- test gate (only when there is a new commit to gate) --------
-            if gate_command is not None and new_commit is not None:
+            # --- deterministic gate (only when there is a new commit to gate) -
+            if checks and new_commit is not None:
                 # Overwrite unconditionally: on a gate infra error this clears
                 # to None rather than letting a PRIOR commit's result (e.g. a
                 # stale RED under block_on_red) stand in for this commit. A
                 # round with no new commit keeps the prior result — the tree is
                 # unchanged, so it still describes HEAD.
-                gate = _run_gate(config, wt, new_commit, round_no, gate_command)
+                check_set = _run_check_set(config, wt, new_commit, round_no, checks)
+                gate = check_set.test_gate if check_set is not None else None
 
             # --- reviewer turns (panel order, sequential) -------------------
             round_reviews: list[ReviewOutcome] = []
@@ -1219,10 +1288,10 @@ def develop(
             # finished, approved run as cost_exceeded would discard a good
             # branch for no protective benefit.
             if all(r.passed for r in round_reviews):
-                if gate is not None and not gate.passed and config.block_on_red:
+                if check_set is not None and not check_set.blocking_passed:
                     logger.info(
-                        "story-develop %s: round %d reviews passed but test gate "
-                        "is RED and --block-on-red is set; continuing",
+                        "story-develop %s: round %d reviews passed but a blocking "
+                        "check is RED; continuing",
                         config.run_id,
                         round_no,
                     )
